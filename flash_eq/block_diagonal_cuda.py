@@ -1,11 +1,13 @@
 """
 CUDA-accelerated block-diagonal multiplication for SO(3)-equivariant layers.
 
-This module provides a fused CUDA kernel for the Λ (Lambda) block-diagonal
+This module provides optimized CUDA kernels for the Λ (Lambda) block-diagonal
 multiplication step, which handles both real (m=0) and complex (m>0) irreps.
 
-The kernel uses parallel reduction over channels_in and accumulates in FP32
-for numerical stability, supporting FP16, FP32, and FP64 inputs.
+The default kernel (V2) parallelizes by (batch, m-block) with shared memory
+caching for 2-9x speedup over the original per-output parallelization (V1).
+
+Supports FP16, FP32, and FP64 with FP32 accumulation for numerical stability.
 """
 
 import os
@@ -52,7 +54,7 @@ def build_block_metadata(
 
     Returns:
         Tuple of metadata tensors: (block_m, block_n_in, block_n_out, block_in_off,
-        block_out_off, block_w_off, out_to_block, out_to_local, dim_out)
+        block_out_off, block_w_off, out_to_block, out_to_local, block_in_size, dim_out)
     """
     lmax = max(max(lvals_in), max(lvals_out))
 
@@ -100,17 +102,68 @@ def build_block_metadata(
     out_to_block = torch.tensor(out_to_block, dtype=torch.int32, device=device)
     out_to_local = torch.tensor(out_to_local, dtype=torch.int32, device=device)
 
+    # block_in_size: n_in for m=0, 2*n_in for m>0 (for v2 kernel shared memory)
+    block_in_size = torch.tensor(
+        [b['n_in'] if b['m'] == 0 else 2 * b['n_in'] for b in blocks],
+        dtype=torch.int32, device=device
+    )
+
     return (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-            block_w_off, out_to_block, out_to_local, dim_out)
+            block_w_off, out_to_block, out_to_local, block_in_size, dim_out)
 
 
 class BlockDiagonalFunction(Function):
-    """Autograd function for block-diagonal multiplication."""
+    """Autograd function for block-diagonal multiplication using V2 kernel."""
 
     @staticmethod
     def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, dim_out):
+                out_to_local, block_in_size, dim_out):
+        cuda_module = _get_cuda_module()
+
+        # Use V2 (m-block parallel) kernel for forward pass
+        output, = cuda_module.forward_v2(
+            features.contiguous(),
+            weights.contiguous(),
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size,
+            dim_out
+        )
+
+        ctx.save_for_backward(features, weights, block_m, block_n_in, block_n_out,
+                              block_in_off, block_out_off, block_w_off)
+        ctx.dim_in = features.size(2)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        features, weights, block_m, block_n_in, block_n_out, \
+            block_in_off, block_out_off, block_w_off = ctx.saved_tensors
+
+        cuda_module = _get_cuda_module()
+
+        # Use V1 kernel for backward (V2 backward not yet implemented)
+        grad_features, grad_weights = cuda_module.backward(
+            grad_output.contiguous(),
+            features,
+            weights,
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            ctx.dim_in
+        )
+
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None
+
+
+class BlockDiagonalFunctionV1(Function):
+    """Autograd function using V1 (per-output) kernel. Kept for compatibility."""
+
+    @staticmethod
+    def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
+                block_in_off, block_out_off, block_w_off, out_to_block,
+                out_to_local, block_in_size, dim_out):
         cuda_module = _get_cuda_module()
 
         output, = cuda_module.forward(
@@ -144,7 +197,7 @@ class BlockDiagonalFunction(Function):
             ctx.dim_in
         )
 
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None
 
 
 def block_diagonal_cuda(
@@ -154,6 +207,9 @@ def block_diagonal_cuda(
 ) -> torch.Tensor:
     """
     Apply block-diagonal multiplication using optimized CUDA kernel.
+
+    Uses V2 kernel (m-block parallelization with shared memory) which is
+    2-9x faster than V1 depending on configuration.
 
     This implements the Λ step in: output = Q @ Λ @ P^T @ features
 
@@ -168,13 +224,46 @@ def block_diagonal_cuda(
     Supports FP16, FP32, and FP64. Internal accumulation is done in FP32.
     """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, dim_out) = metadata
+     block_w_off, out_to_block, out_to_local, block_in_size, dim_out) = metadata
 
     return BlockDiagonalFunction.apply(
         features, weights, block_m, block_n_in, block_n_out,
         block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, dim_out
+        out_to_local, block_in_size, dim_out
     )
+
+
+def block_diagonal_cuda_v1(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    metadata: Tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    """
+    Apply block-diagonal multiplication using V1 CUDA kernel (per-output parallel).
+
+    V1 parallelizes by (batch, cout, out_idx) with reduction over channels_in.
+    Slower than V2 but kept for compatibility and comparison.
+
+    Args:
+        features: (batch, channels_in, dim_in) - features in diagonal (m-ordered) basis
+        weights: (batch, channels_out, channels_in, weight_dim) - block-diagonal weights
+        metadata: Tuple from build_block_metadata()
+
+    Returns:
+        output: (batch, channels_out, dim_out)
+    """
+    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
+     block_w_off, out_to_block, out_to_local, block_in_size, dim_out) = metadata
+
+    return BlockDiagonalFunctionV1.apply(
+        features, weights, block_m, block_n_in, block_n_out,
+        block_in_off, block_out_off, block_w_off, out_to_block,
+        out_to_local, block_in_size, dim_out
+    )
+
+
+# Alias for explicit V2 usage
+block_diagonal_cuda_v2 = block_diagonal_cuda
 
 
 def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:

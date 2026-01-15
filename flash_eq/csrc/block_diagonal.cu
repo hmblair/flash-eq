@@ -20,6 +20,10 @@
 #define THREADS_PER_BLOCK 128
 
 
+/*
+ * Forward kernel: Each thread block handles one output element (b, co, out_idx).
+ * Threads within the block cooperatively reduce over channels_in.
+ */
 template <typename scalar_t>
 __global__ void block_diagonal_forward_kernel(
     const scalar_t* __restrict__ features,  // (B, Cin, Din)
@@ -35,10 +39,6 @@ __global__ void block_diagonal_forward_kernel(
     const int* __restrict__ out_to_local,
     int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
-    /*
-     * Parallelization: Each thread block handles one output element (b, co, out_idx).
-     * Threads within the block cooperatively reduce over channels_in.
-     */
     extern __shared__ char shared_mem[];
     float* sdata = reinterpret_cast<float*>(shared_mem);
 
@@ -135,6 +135,113 @@ __global__ void block_diagonal_forward_kernel(
             if (m > 0) {
                 output[out_base + n_out + o_local] = static_cast<scalar_t>(acc_im);
             }
+        }
+    }
+}
+
+
+/*
+ * V2 Forward kernel: Process by m-block instead of by output element.
+ *
+ * Grid: B × num_m_blocks thread blocks
+ * Each block: Loads features for that m-block into shared memory, then
+ *             threads compute (cout, out_local) pairs in parallel.
+ *
+ * This reduces thread block count from B×Cout×Dout to B×num_m_blocks,
+ * and improves data reuse by caching features in shared memory.
+ */
+template <typename scalar_t>
+__global__ void block_diagonal_forward_v2_kernel(
+    const scalar_t* __restrict__ features,  // (B, Cin, Din)
+    const scalar_t* __restrict__ weights,   // (B, Cout, Cin, Wdim)
+    scalar_t* __restrict__ output,          // (B, Cout, Dout)
+    const int* __restrict__ block_m,
+    const int* __restrict__ block_n_in,
+    const int* __restrict__ block_n_out,
+    const int* __restrict__ block_in_off,
+    const int* __restrict__ block_out_off,
+    const int* __restrict__ block_w_off,
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+) {
+    // Each block handles one (batch, m-block) pair
+    const int blk = blockIdx.x % num_blocks;
+    const int64_t b = blockIdx.x / num_blocks;
+
+    if (b >= B) return;
+
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // Get m-block parameters
+    const int m = block_m[blk];
+    const int n_in = block_n_in[blk];
+    const int n_out = block_n_out[blk];
+    const int in_off = block_in_off[blk];
+    const int out_off = block_out_off[blk];
+    const int w_off = block_w_off[blk];
+
+    const int in_size = (m == 0) ? n_in : 2 * n_in;
+
+    // Shared memory layout: features for all Cin channels
+    // feat_shared[ci * in_size + local_idx]
+    extern __shared__ float feat_shared[];
+
+    // Cooperatively load features into shared memory
+    const int64_t feat_base = b * Cin * Din;
+    const int total_feat_elems = Cin * in_size;
+
+    for (int i = tid; i < total_feat_elems; i += num_threads) {
+        const int ci = i / in_size;
+        const int local_idx = i % in_size;
+        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
+    }
+    __syncthreads();
+
+    // Each thread computes a subset of (cout, out_local) pairs
+    // Total outputs for this m-block: Cout × n_out (each produces real, and imag if m>0)
+    const int total_outputs = Cout * n_out;
+
+    for (int out_idx = tid; out_idx < total_outputs; out_idx += num_threads) {
+        const int co = out_idx / n_out;
+        const int o_local = out_idx % n_out;
+
+        float acc = 0.0f;
+        float acc_im = 0.0f;
+
+        // Weight base for (b, co)
+        const scalar_t* w_base = weights + b * Cout * Cin * Wdim + co * Cin * Wdim;
+
+        // Sum over all input channels (using cached features)
+        for (int64_t ci = 0; ci < Cin; ci++) {
+            const float* f_ptr = feat_shared + ci * in_size;
+            const scalar_t* w_ptr = w_base + ci * Wdim + w_off;
+
+            if (m == 0) {
+                // Real block: dot product
+                for (int i = 0; i < n_in; i++) {
+                    acc += static_cast<float>(w_ptr[o_local * n_in + i]) * f_ptr[i];
+                }
+            } else {
+                // Complex block: [a, b; -b, a] @ [f_re; f_im]
+                for (int i = 0; i < n_in; i++) {
+                    const float f_re = f_ptr[i];
+                    const float f_im = f_ptr[n_in + i];
+
+                    const int w_idx = (o_local * n_in + i) * 2;
+                    const float a = static_cast<float>(w_ptr[w_idx]);
+                    const float bv = static_cast<float>(w_ptr[w_idx + 1]);
+
+                    acc += a * f_re + bv * f_im;
+                    acc_im += a * f_im - bv * f_re;
+                }
+            }
+        }
+
+        // Write output
+        const int64_t out_base = b * Cout * Dout + co * Dout + out_off;
+        output[out_base + o_local] = static_cast<scalar_t>(acc);
+        if (m > 0) {
+            output[out_base + n_out + o_local] = static_cast<scalar_t>(acc_im);
         }
     }
 }
@@ -423,7 +530,57 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
 }
 
 
+std::vector<torch::Tensor> block_diagonal_forward_v2_cuda(
+    torch::Tensor features,
+    torch::Tensor weights,
+    torch::Tensor block_m,
+    torch::Tensor block_n_in,
+    torch::Tensor block_n_out,
+    torch::Tensor block_in_off,
+    torch::Tensor block_out_off,
+    torch::Tensor block_w_off,
+    torch::Tensor block_in_size,  // precomputed: n_in for m=0, 2*n_in for m>0
+    int dim_out
+) {
+    const int64_t B = features.size(0);
+    const int64_t Cin = features.size(1);
+    const int64_t Din = features.size(2);
+    const int64_t Cout = weights.size(1);
+    const int64_t Wdim = weights.size(3);
+    const int num_blocks = block_m.size(0);
+
+    auto output = torch::zeros({B, Cout, dim_out}, features.options());
+
+    // Grid: B × num_m_blocks
+    const int64_t grid_size = B * num_blocks;
+    const int threads = 256;
+
+    // Shared memory: Cin × max_in_size floats
+    // We compute max_in_size from block_in_size tensor
+    const int max_in_size = block_in_size.max().item<int>();
+    const size_t shared_size = Cin * max_in_size * sizeof(float);
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_forward_v2", ([&] {
+        block_diagonal_forward_v2_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
+            features.data_ptr<scalar_t>(),
+            weights.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            block_m.data_ptr<int>(),
+            block_n_in.data_ptr<int>(),
+            block_n_out.data_ptr<int>(),
+            block_in_off.data_ptr<int>(),
+            block_out_off.data_ptr<int>(),
+            block_w_off.data_ptr<int>(),
+            B, Cin, Cout, Din, dim_out, Wdim, num_blocks
+        );
+    }));
+
+    return {output};
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &block_diagonal_forward_cuda, "Block diagonal forward (CUDA)");
+    m.def("forward_v2", &block_diagonal_forward_v2_cuda, "Block diagonal forward V2 - m-block parallel (CUDA)");
     m.def("backward", &block_diagonal_backward_cuda, "Block diagonal backward (CUDA)");
 }

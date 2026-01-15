@@ -18,6 +18,7 @@ from typing import List, Tuple
 from flash_eq.block_diagonal_cuda import (
     build_block_metadata,
     block_diagonal_cuda,
+    block_diagonal_cuda_v2,
     get_weight_dim,
 )
 
@@ -51,13 +52,16 @@ def _build_m_order_permutation(lvals: List[int], device: torch.device):
     return torch.tensor(perm, dtype=torch.long, device=device)
 
 
-def _lowrank_forward(features, weights, P, Q, perm, metadata):
+def _lowrank_forward(features, weights, P, Q, perm, metadata, use_v2=True):
     """Low-rank pipeline: P^T @ features -> CUDA kernel -> Q @ result."""
     P_perm = P[:, :, perm]
     Q_perm = Q[:, :, perm]
 
     f_diag = torch.bmm(P_perm.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
-    out_diag = block_diagonal_cuda(f_diag, weights, metadata)
+    if use_v2:
+        out_diag = block_diagonal_cuda_v2(f_diag, weights, metadata)
+    else:
+        out_diag = block_diagonal_cuda(f_diag, weights, metadata)
     return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
 
 

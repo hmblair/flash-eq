@@ -11,7 +11,7 @@ Reference: docs/theory.tex, Theorem 2.1
 import torch
 import torch.nn as nn
 
-from ciffy.nn.geometric.representations import Repr
+from .representations import Repr
 
 # Import CUDA kernel (optional - falls back to Python if unavailable)
 try:

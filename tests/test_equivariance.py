@@ -4,15 +4,14 @@ import torch
 import pytest
 from scipy.spatial.transform import Rotation
 
-from ciffy.nn.geometric.representations import Repr
-from flash_eq import EquivariantLinear
+from flash_eq import Repr, EquivariantLinear
 
 # Check if CUDA is available for testing
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 
-def _std_to_ciffy_axis(axis: torch.Tensor) -> torch.Tensor:
-    """Convert standard axis to ciffy ordering."""
+def _reorder_axis(axis: torch.Tensor) -> torch.Tensor:
+    """Reorder axis from standard (x,y,z) to generator ordering (y,z,x)."""
     return torch.stack([axis[..., 1], axis[..., 2], axis[..., 0]], dim=-1)
 
 
@@ -53,9 +52,9 @@ class TestEquivariantLinear:
         axis_std = axis_std / axis_std.norm()
         angle = torch.tensor(0.7)
 
-        axis_ciffy = _std_to_ciffy_axis(axis_std)
-        D_in = layer.repr_in.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
-        D_out = layer.repr_out.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
+        axis_reordered = _reorder_axis(axis_std)
+        D_in = layer.repr_in.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
+        D_out = layer.repr_out.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
 
         R = torch.from_numpy(
             Rotation.from_rotvec((axis_std * angle).numpy()).as_matrix()
@@ -94,9 +93,9 @@ class TestEquivariantLinear:
         axis_std = axis_std / axis_std.norm()
         angle = torch.tensor(0.7)
 
-        axis_ciffy = _std_to_ciffy_axis(axis_std)
-        D_in = layer.repr_in.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
-        D_out = layer.repr_out.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
+        axis_reordered = _reorder_axis(axis_std)
+        D_in = layer.repr_in.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
+        D_out = layer.repr_out.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
 
         R = torch.from_numpy(
             Rotation.from_rotvec((axis_std * angle).numpy()).as_matrix()

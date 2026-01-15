@@ -13,6 +13,13 @@ import torch.nn as nn
 
 from ciffy.nn.geometric.representations import Repr
 
+# Import CUDA kernel (optional - falls back to Python if unavailable)
+try:
+    from .block_diagonal_cuda import build_block_metadata, block_diagonal_cuda
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
+
 
 def _direction_to_rotation(direction: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute axis and angle to rotate e_z to direction."""
@@ -55,9 +62,15 @@ class EquivariantLinear(nn.Module):
 
     Uses Wigner-D diagonalization: output = Q @ Λ @ P^T @ features
     where Λ is block-diagonal with 1×1 real blocks (m=0) and 2×2 real blocks (m>0).
+
+    Args:
+        repr_in: Input representation
+        repr_out: Output representation
+        use_cuda: Whether to use CUDA kernel for block-diagonal multiplication.
+            If None (default), uses CUDA when available and input is on GPU.
     """
 
-    def __init__(self, repr_in: Repr, repr_out: Repr):
+    def __init__(self, repr_in: Repr, repr_out: Repr, use_cuda: bool = None):
         super().__init__()
         self.repr_in = repr_in
         self.repr_out = repr_out
@@ -67,6 +80,8 @@ class EquivariantLinear(nn.Module):
         self.lmax = max(max(repr_in.lvals), max(repr_out.lvals))
         self.dim_in = repr_in.dim()
         self.dim_out = repr_out.dim()
+        self._use_cuda = use_cuda
+        self._cuda_metadata = None
 
         self.register_buffer('_perm_in', _build_m_order_permutation(repr_in.lvals))
         self.register_buffer('_perm_out', _build_m_order_permutation(repr_out.lvals))
@@ -96,27 +111,25 @@ class EquivariantLinear(nn.Module):
     def weight_dim(self) -> int:
         return self._weight_dim
 
-    def forward(self, features: torch.Tensor, directions: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """Apply equivariant linear transformation.
+    def _should_use_cuda(self, features: torch.Tensor) -> bool:
+        """Determine whether to use CUDA kernel."""
+        if self._use_cuda is not None:
+            return self._use_cuda
+        return CUDA_AVAILABLE and features.is_cuda
 
-        Args:
-            features: (batch, channels_in, dim_in)
-            directions: (batch, 3)
-            weights: (batch, channels_out, channels_in, weight_dim)
-        """
-        batch, channels_in, _ = features.shape
+    def _get_cuda_metadata(self, device: torch.device):
+        """Get or build CUDA metadata for the given device."""
+        if self._cuda_metadata is None or self._cuda_metadata[0].device != device:
+            self._cuda_metadata = build_block_metadata(
+                self.repr_in.lvals, self.repr_out.lvals, device
+            )
+        return self._cuda_metadata
+
+    def _block_diagonal_python(self, f_diag: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Apply block-diagonal weights using Python/einsum."""
+        batch, channels_in, _ = f_diag.shape
         channels_out = weights.shape[1]
-
-        # Compute Wigner-D matrices and permute to m-first order
-        axis, angle = _direction_to_rotation(directions)
-        P = self.repr_in.rot(axis, angle, perm=False)[:, :, self._perm_in]
-        Q = self.repr_out.rot(axis, angle, perm=False)[:, :, self._perm_out]
-
-        # Transform to diagonal basis
-        f_diag = torch.bmm(P.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
-
-        # Apply block-diagonal weights
-        out_diag = torch.zeros(batch, channels_out, self.dim_out, device=features.device, dtype=features.dtype)
+        out_diag = torch.zeros(batch, channels_out, self.dim_out, device=f_diag.device, dtype=f_diag.dtype)
 
         for m, n_in, n_out, in_s, out_s, w_off in self._blocks:
             if m == 0:
@@ -133,6 +146,31 @@ class EquivariantLinear(nn.Module):
 
                 out_diag[:, :, out_s:out_s + n_out] = torch.einsum('bocji,bci->boj', a, f_re).add_(torch.einsum('bocji,bci->boj', b, f_im))
                 out_diag[:, :, out_s + n_out:out_s + 2*n_out] = torch.einsum('bocji,bci->boj', a, f_im).sub_(torch.einsum('bocji,bci->boj', b, f_re))
+
+        return out_diag
+
+    def forward(self, features: torch.Tensor, directions: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Apply equivariant linear transformation.
+
+        Args:
+            features: (batch, channels_in, dim_in)
+            directions: (batch, 3)
+            weights: (batch, channels_out, channels_in, weight_dim)
+        """
+        # Compute Wigner-D matrices and permute to m-first order
+        axis, angle = _direction_to_rotation(directions)
+        P = self.repr_in.rot(axis, angle, perm=False)[:, :, self._perm_in]
+        Q = self.repr_out.rot(axis, angle, perm=False)[:, :, self._perm_out]
+
+        # Transform to diagonal basis
+        f_diag = torch.bmm(P.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
+
+        # Apply block-diagonal weights
+        if self._should_use_cuda(features):
+            metadata = self._get_cuda_metadata(features.device)
+            out_diag = block_diagonal_cuda(f_diag, weights, metadata)
+        else:
+            out_diag = self._block_diagonal_python(f_diag, weights)
 
         # Transform back
         return torch.bmm(Q, out_diag.transpose(-1, -2)).transpose(-1, -2)

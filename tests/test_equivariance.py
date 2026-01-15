@@ -7,6 +7,9 @@ from scipy.spatial.transform import Rotation
 from ciffy.nn.geometric.representations import Repr
 from flash_eq import EquivariantLinear
 
+# Check if CUDA is available for testing
+CUDA_AVAILABLE = torch.cuda.is_available()
+
 
 def _std_to_ciffy_axis(axis: torch.Tensor) -> torch.Tensor:
     """Convert standard axis to ciffy ordering."""
@@ -70,6 +73,71 @@ class TestEquivariantLinear:
         # Should match
         diff = (out1_rot - out2).abs().max().item()
         assert diff < 1e-5, f"Equivariance failed: max diff = {diff:.2e}"
+
+    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    def test_equivariance_cuda(self):
+        """Test SO(3) equivariance with CUDA kernel: f(D@x, D@d) = D @ f(x, d)."""
+        torch.manual_seed(42)
+
+        repr_in = Repr(lvals=[0, 1, 2])
+        repr_out = Repr(lvals=[0, 1, 2])
+        layer = EquivariantLinear(repr_in, repr_out, use_cuda=True).cuda()
+
+        batch, channels_in, channels_out = 8, 4, 4
+        features = torch.randn(batch, channels_in, layer.repr_in.dim(), device='cuda')
+        directions = torch.randn(batch, 3, device='cuda')
+        directions = directions / directions.norm(dim=-1, keepdim=True)
+        weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim, device='cuda') * 0.1
+
+        # Random rotation
+        axis_std = torch.randn(3)
+        axis_std = axis_std / axis_std.norm()
+        angle = torch.tensor(0.7)
+
+        axis_ciffy = _std_to_ciffy_axis(axis_std)
+        D_in = layer.repr_in.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
+        D_out = layer.repr_out.rot(axis_ciffy.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
+
+        R = torch.from_numpy(
+            Rotation.from_rotvec((axis_std * angle).numpy()).as_matrix()
+        ).float().cuda()
+
+        # Method 1: Compute output, then rotate
+        out1 = layer(features, directions, weights)
+        out1_rot = torch.einsum('ij,bcj->bci', D_out, out1)
+
+        # Method 2: Rotate inputs, then compute
+        features_rot = torch.einsum('ij,bcj->bci', D_in, features)
+        directions_rot = directions @ R.T
+        out2 = layer(features_rot, directions_rot, weights)
+
+        # Should match
+        diff = (out1_rot - out2).abs().max().item()
+        assert diff < 1e-4, f"CUDA equivariance failed: max diff = {diff:.2e}"
+
+    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    def test_cuda_matches_python(self):
+        """Test that CUDA kernel produces same output as Python implementation."""
+        torch.manual_seed(123)
+
+        repr_in = Repr(lvals=[0, 1, 2])
+        repr_out = Repr(lvals=[0, 1, 2])
+
+        layer_python = EquivariantLinear(repr_in, repr_out, use_cuda=False).cuda()
+        layer_cuda = EquivariantLinear(repr_in, repr_out, use_cuda=True).cuda()
+
+        batch, channels_in, channels_out = 8, 4, 4
+        features = torch.randn(batch, channels_in, repr_in.dim(), device='cuda')
+        directions = torch.randn(batch, 3, device='cuda')
+        directions = directions / directions.norm(dim=-1, keepdim=True)
+        weights = torch.randn(batch, channels_out, channels_in, layer_python.weight_dim, device='cuda')
+
+        out_python = layer_python(features, directions, weights)
+        out_cuda = layer_cuda(features, directions, weights)
+
+        diff = (out_python - out_cuda).abs().max().item()
+        rel_diff = diff / (out_python.abs().max().item() + 1e-8)
+        assert rel_diff < 1e-5, f"CUDA vs Python mismatch: rel_diff = {rel_diff:.2e}"
 
     def test_weight_dim(self, layer):
         """Test that weight_dim matches expected formula."""

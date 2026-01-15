@@ -108,8 +108,14 @@ def build_block_metadata(
         dtype=torch.int32, device=device
     )
 
+    # block_out_size: n_out for m=0, 2*n_out for m>0 (for v2 backward kernel)
+    block_out_size = torch.tensor(
+        [b['n_out'] if b['m'] == 0 else 2 * b['n_out'] for b in blocks],
+        dtype=torch.int32, device=device
+    )
+
     return (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-            block_w_off, out_to_block, out_to_local, block_in_size, dim_out)
+            block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out)
 
 
 class BlockDiagonalFunction(Function):
@@ -118,7 +124,7 @@ class BlockDiagonalFunction(Function):
     @staticmethod
     def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, dim_out):
+                out_to_local, block_in_size, block_out_size, dim_out):
         cuda_module = _get_cuda_module()
 
         # Use V2 (m-block parallel) kernel for forward pass
@@ -132,7 +138,8 @@ class BlockDiagonalFunction(Function):
         )
 
         ctx.save_for_backward(features, weights, block_m, block_n_in, block_n_out,
-                              block_in_off, block_out_off, block_w_off)
+                              block_in_off, block_out_off, block_w_off,
+                              block_in_size, block_out_size)
         ctx.dim_in = features.size(2)
 
         return output
@@ -140,21 +147,23 @@ class BlockDiagonalFunction(Function):
     @staticmethod
     def backward(ctx, grad_output):
         features, weights, block_m, block_n_in, block_n_out, \
-            block_in_off, block_out_off, block_w_off = ctx.saved_tensors
+            block_in_off, block_out_off, block_w_off, \
+            block_in_size, block_out_size = ctx.saved_tensors
 
         cuda_module = _get_cuda_module()
 
-        # Use V1 kernel for backward (V2 backward not yet implemented)
-        grad_features, grad_weights = cuda_module.backward(
+        # Use V2 (m-block parallel) kernel for backward pass
+        grad_features, grad_weights = cuda_module.backward_v2(
             grad_output.contiguous(),
             features,
             weights,
             block_m, block_n_in, block_n_out,
             block_in_off, block_out_off, block_w_off,
+            block_in_size, block_out_size,
             ctx.dim_in
         )
 
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None
 
 
 class BlockDiagonalFunctionV1(Function):
@@ -163,7 +172,7 @@ class BlockDiagonalFunctionV1(Function):
     @staticmethod
     def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, dim_out):
+                out_to_local, block_in_size, block_out_size, dim_out):
         cuda_module = _get_cuda_module()
 
         output, = cuda_module.forward(
@@ -197,7 +206,7 @@ class BlockDiagonalFunctionV1(Function):
             ctx.dim_in
         )
 
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None
 
 
 def block_diagonal_cuda(
@@ -224,12 +233,12 @@ def block_diagonal_cuda(
     Supports FP16, FP32, and FP64. Internal accumulation is done in FP32.
     """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, dim_out) = metadata
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out) = metadata
 
     return BlockDiagonalFunction.apply(
         features, weights, block_m, block_n_in, block_n_out,
         block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, dim_out
+        out_to_local, block_in_size, block_out_size, dim_out
     )
 
 
@@ -253,12 +262,12 @@ def block_diagonal_cuda_v1(
         output: (batch, channels_out, dim_out)
     """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, dim_out) = metadata
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out) = metadata
 
     return BlockDiagonalFunctionV1.apply(
         features, weights, block_m, block_n_in, block_n_out,
         block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, dim_out
+        out_to_local, block_in_size, block_out_size, dim_out
     )
 
 

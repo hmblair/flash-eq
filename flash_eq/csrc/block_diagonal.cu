@@ -247,6 +247,234 @@ __global__ void block_diagonal_forward_v2_kernel(
 }
 
 
+/*
+ * V2 Backward Features kernel: Process by m-block instead of by input element.
+ *
+ * Grid: B × num_m_blocks thread blocks
+ * Each block: Loads grad_output for that m-block into shared memory, then
+ *             threads compute (cin, in_local) pairs in parallel.
+ *
+ * This reduces thread block count and improves data reuse.
+ */
+template <typename scalar_t>
+__global__ void block_diagonal_backward_features_v2_kernel(
+    const scalar_t* __restrict__ grad_output,  // (B, Cout, Dout)
+    const scalar_t* __restrict__ weights,      // (B, Cout, Cin, Wdim)
+    scalar_t* __restrict__ grad_features,      // (B, Cin, Din)
+    const int* __restrict__ block_m,
+    const int* __restrict__ block_n_in,
+    const int* __restrict__ block_n_out,
+    const int* __restrict__ block_in_off,
+    const int* __restrict__ block_out_off,
+    const int* __restrict__ block_w_off,
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+) {
+    // Each block handles one (batch, m-block) pair
+    const int blk = blockIdx.x % num_blocks;
+    const int64_t b = blockIdx.x / num_blocks;
+
+    if (b >= B) return;
+
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // Get m-block parameters
+    const int m = block_m[blk];
+    const int n_in = block_n_in[blk];
+    const int n_out = block_n_out[blk];
+    const int in_off = block_in_off[blk];
+    const int out_off = block_out_off[blk];
+    const int w_off = block_w_off[blk];
+
+    const int out_size = (m == 0) ? n_out : 2 * n_out;
+    const int in_size = (m == 0) ? n_in : 2 * n_in;
+
+    // Shared memory: grad_output for all Cout channels
+    // grad_shared[co * out_size + local_idx]
+    extern __shared__ float grad_shared[];
+
+    // Cooperatively load grad_output into shared memory
+    const int64_t grad_base = b * Cout * Dout;
+    const int total_grad_elems = Cout * out_size;
+
+    for (int i = tid; i < total_grad_elems; i += num_threads) {
+        const int co = i / out_size;
+        const int local_idx = i % out_size;
+        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
+    }
+    __syncthreads();
+
+    // Each thread computes a subset of (cin, in_local) pairs
+    // Total inputs for this m-block: Cin × in_size
+    const int total_inputs = Cin * in_size;
+
+    for (int in_idx = tid; in_idx < total_inputs; in_idx += num_threads) {
+        const int ci = in_idx / in_size;
+        const int i_local = in_idx % in_size;
+
+        float grad = 0.0f;
+
+        if (m == 0) {
+            // Real block: grad_f[i] = sum_o W[o,i] * grad_out[o]
+            for (int64_t co = 0; co < Cout; co++) {
+                const float* go_ptr = grad_shared + co * out_size;
+                const scalar_t* w_ptr = weights + b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off;
+
+                for (int o = 0; o < n_out; o++) {
+                    grad += static_cast<float>(w_ptr[o * n_in + i_local]) * go_ptr[o];
+                }
+            }
+        } else {
+            // Complex block: transpose of [a, b; -b, a] is [a, -b; b, a]
+            // grad_f_re = a*grad_out_re - b*grad_out_im
+            // grad_f_im = b*grad_out_re + a*grad_out_im
+            bool is_real_input = (i_local < n_in);
+            int i_idx = is_real_input ? i_local : (i_local - n_in);
+
+            for (int64_t co = 0; co < Cout; co++) {
+                const float* go_ptr = grad_shared + co * out_size;
+                const scalar_t* w_ptr = weights + b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off;
+
+                for (int o = 0; o < n_out; o++) {
+                    float go_re = go_ptr[o];
+                    float go_im = go_ptr[n_out + o];
+
+                    int w_idx = (o * n_in + i_idx) * 2;
+                    float a = static_cast<float>(w_ptr[w_idx]);
+                    float bv = static_cast<float>(w_ptr[w_idx + 1]);
+
+                    if (is_real_input) {
+                        grad += a * go_re - bv * go_im;
+                    } else {
+                        grad += bv * go_re + a * go_im;
+                    }
+                }
+            }
+        }
+
+        // Write gradient
+        const int64_t feat_idx = b * Cin * Din + ci * Din + in_off + i_local;
+        grad_features[feat_idx] = static_cast<scalar_t>(grad);
+    }
+}
+
+
+/*
+ * V2 Backward Weights kernel: Process by m-block instead of by weight element.
+ *
+ * Grid: B × num_m_blocks thread blocks
+ * Each block: Loads features and grad_output for that m-block into shared memory,
+ *             then threads compute (cout, cin, w_local) tuples in parallel.
+ */
+template <typename scalar_t>
+__global__ void block_diagonal_backward_weights_v2_kernel(
+    const scalar_t* __restrict__ grad_output,  // (B, Cout, Dout)
+    const scalar_t* __restrict__ features,     // (B, Cin, Din)
+    scalar_t* __restrict__ grad_weights,       // (B, Cout, Cin, Wdim)
+    const int* __restrict__ block_m,
+    const int* __restrict__ block_n_in,
+    const int* __restrict__ block_n_out,
+    const int* __restrict__ block_in_off,
+    const int* __restrict__ block_out_off,
+    const int* __restrict__ block_w_off,
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+) {
+    // Each block handles one (batch, m-block) pair
+    const int blk = blockIdx.x % num_blocks;
+    const int64_t b = blockIdx.x / num_blocks;
+
+    if (b >= B) return;
+
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // Get m-block parameters
+    const int m = block_m[blk];
+    const int n_in = block_n_in[blk];
+    const int n_out = block_n_out[blk];
+    const int in_off = block_in_off[blk];
+    const int out_off = block_out_off[blk];
+    const int w_off = block_w_off[blk];
+
+    const int in_size = (m == 0) ? n_in : 2 * n_in;
+    const int out_size = (m == 0) ? n_out : 2 * n_out;
+    const int w_block_size = (m == 0) ? (n_out * n_in) : (2 * n_out * n_in);
+
+    // Shared memory layout:
+    // [0, Cin * in_size): features
+    // [Cin * in_size, Cin * in_size + Cout * out_size): grad_output
+    extern __shared__ float shared[];
+    float* feat_shared = shared;
+    float* grad_shared = shared + Cin * in_size;
+
+    // Cooperatively load features into shared memory
+    const int64_t feat_base = b * Cin * Din;
+    const int total_feat_elems = Cin * in_size;
+
+    for (int i = tid; i < total_feat_elems; i += num_threads) {
+        const int ci = i / in_size;
+        const int local_idx = i % in_size;
+        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
+    }
+
+    // Cooperatively load grad_output into shared memory
+    const int64_t grad_base = b * Cout * Dout;
+    const int total_grad_elems = Cout * out_size;
+
+    for (int i = tid; i < total_grad_elems; i += num_threads) {
+        const int co = i / out_size;
+        const int local_idx = i % out_size;
+        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
+    }
+    __syncthreads();
+
+    // Each thread computes a subset of (cout, cin, w_local) tuples
+    // Total weights for this m-block: Cout × Cin × w_block_size
+    const int64_t total_weights = Cout * Cin * w_block_size;
+
+    for (int64_t w_idx = tid; w_idx < total_weights; w_idx += num_threads) {
+        const int64_t co = w_idx / (Cin * w_block_size);
+        const int64_t ci = (w_idx / w_block_size) % Cin;
+        const int w_local = w_idx % w_block_size;
+
+        const float* f_ptr = feat_shared + ci * in_size;
+        const float* go_ptr = grad_shared + co * out_size;
+
+        float grad = 0.0f;
+
+        if (m == 0) {
+            // Real block: grad_W[o,i] = f[i] * grad_out[o]
+            int o = w_local / n_in;
+            int i = w_local % n_in;
+            grad = f_ptr[i] * go_ptr[o];
+        } else {
+            // Complex block: grad for (a, b) in [a, b; -b, a]
+            // grad_a = f_re * grad_out_re + f_im * grad_out_im
+            // grad_b = f_im * grad_out_re - f_re * grad_out_im
+            int temp = w_local / 2;
+            int ab = w_local % 2;
+            int o = temp / n_in;
+            int i = temp % n_in;
+
+            float f_re = f_ptr[i];
+            float f_im = f_ptr[n_in + i];
+            float go_re = go_ptr[o];
+            float go_im = go_ptr[n_out + o];
+
+            if (ab == 0) {
+                grad = f_re * go_re + f_im * go_im;
+            } else {
+                grad = f_im * go_re - f_re * go_im;
+            }
+        }
+
+        // Write gradient
+        const int64_t weight_idx = b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off + w_local;
+        grad_weights[weight_idx] = static_cast<scalar_t>(grad);
+    }
+}
+
+
 template <typename scalar_t>
 __global__ void block_diagonal_backward_features_kernel(
     const scalar_t* __restrict__ grad_output,  // (B, Cout, Dout)
@@ -530,6 +758,82 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
 }
 
 
+std::vector<torch::Tensor> block_diagonal_backward_v2_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor features,
+    torch::Tensor weights,
+    torch::Tensor block_m,
+    torch::Tensor block_n_in,
+    torch::Tensor block_n_out,
+    torch::Tensor block_in_off,
+    torch::Tensor block_out_off,
+    torch::Tensor block_w_off,
+    torch::Tensor block_in_size,  // precomputed: n_in for m=0, 2*n_in for m>0
+    torch::Tensor block_out_size, // precomputed: n_out for m=0, 2*n_out for m>0
+    int dim_in
+) {
+    const int64_t B = features.size(0);
+    const int64_t Cin = features.size(1);
+    const int64_t Din = features.size(2);
+    const int64_t Cout = weights.size(1);
+    const int64_t Wdim = weights.size(3);
+    const int64_t Dout = grad_output.size(2);
+    const int num_blocks = block_m.size(0);
+
+    auto grad_features = torch::zeros_like(features);
+    auto grad_weights = torch::zeros_like(weights);
+
+    const int64_t grid_size = B * num_blocks;
+    const int threads = 256;
+
+    // Compute max sizes for shared memory
+    const int max_in_size = block_in_size.max().item<int>();
+    const int max_out_size = block_out_size.max().item<int>();
+
+    // Features backward: shared memory for Cout × max_out_size floats
+    {
+        const size_t shared_size = Cout * max_out_size * sizeof(float);
+
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_backward_features_v2", ([&] {
+            block_diagonal_backward_features_v2_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
+                grad_output.data_ptr<scalar_t>(),
+                weights.data_ptr<scalar_t>(),
+                grad_features.data_ptr<scalar_t>(),
+                block_m.data_ptr<int>(),
+                block_n_in.data_ptr<int>(),
+                block_n_out.data_ptr<int>(),
+                block_in_off.data_ptr<int>(),
+                block_out_off.data_ptr<int>(),
+                block_w_off.data_ptr<int>(),
+                B, Cin, Cout, Din, Dout, Wdim, num_blocks
+            );
+        }));
+    }
+
+    // Weights backward: shared memory for Cin × max_in_size + Cout × max_out_size floats
+    {
+        const size_t shared_size = (Cin * max_in_size + Cout * max_out_size) * sizeof(float);
+
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_backward_weights_v2", ([&] {
+            block_diagonal_backward_weights_v2_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
+                grad_output.data_ptr<scalar_t>(),
+                features.data_ptr<scalar_t>(),
+                grad_weights.data_ptr<scalar_t>(),
+                block_m.data_ptr<int>(),
+                block_n_in.data_ptr<int>(),
+                block_n_out.data_ptr<int>(),
+                block_in_off.data_ptr<int>(),
+                block_out_off.data_ptr<int>(),
+                block_w_off.data_ptr<int>(),
+                B, Cin, Cout, Din, Dout, Wdim, num_blocks
+            );
+        }));
+    }
+
+    return {grad_features, grad_weights};
+}
+
+
 std::vector<torch::Tensor> block_diagonal_forward_v2_cuda(
     torch::Tensor features,
     torch::Tensor weights,
@@ -583,4 +887,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &block_diagonal_forward_cuda, "Block diagonal forward (CUDA)");
     m.def("forward_v2", &block_diagonal_forward_v2_cuda, "Block diagonal forward V2 - m-block parallel (CUDA)");
     m.def("backward", &block_diagonal_backward_cuda, "Block diagonal backward (CUDA)");
+    m.def("backward_v2", &block_diagonal_backward_v2_cuda, "Block diagonal backward V2 - m-block parallel (CUDA)");
 }

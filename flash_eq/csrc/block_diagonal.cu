@@ -9,6 +9,7 @@
  *   - m>0 blocks: 2×2 complex-type matrices [a, b; -b, a]
  *
  * Optimized with parallel reduction over channels_in for better throughput.
+ * Uses int64_t for all index calculations to avoid overflow with large tensors.
  */
 
 #include <torch/extension.h>
@@ -32,7 +33,7 @@ __global__ void block_diagonal_forward_kernel(
     const int* __restrict__ block_w_off,
     const int* __restrict__ out_to_block,
     const int* __restrict__ out_to_local,
-    int B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
     /*
      * Parallelization: Each thread block handles one output element (b, co, out_idx).
@@ -41,9 +42,10 @@ __global__ void block_diagonal_forward_kernel(
     extern __shared__ char shared_mem[];
     float* sdata = reinterpret_cast<float*>(shared_mem);
 
-    const int out_idx = blockIdx.x % Dout;
-    const int co = (blockIdx.x / Dout) % Cout;
-    const int b = blockIdx.x / (Dout * Cout);
+    const int64_t global_idx = blockIdx.x;
+    const int64_t out_idx = global_idx % Dout;
+    const int64_t co = (global_idx / Dout) % Cout;
+    const int64_t b = global_idx / (Dout * Cout);
 
     if (b >= B) return;
 
@@ -66,7 +68,7 @@ __global__ void block_diagonal_forward_kernel(
     float acc_im = 0.0f;
 
     // Each thread handles a subset of channels_in
-    for (int ci = tid; ci < Cin; ci += blockDim.x) {
+    for (int64_t ci = tid; ci < Cin; ci += blockDim.x) {
         const scalar_t* f_ptr = features + b * Cin * Din + ci * Din + in_off;
         const scalar_t* w_ptr = weights + b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off;
 
@@ -128,7 +130,7 @@ __global__ void block_diagonal_forward_kernel(
         }
 
         if (tid == 0) {
-            const int out_base = b * Cout * Dout + co * Dout + out_off;
+            const int64_t out_base = b * Cout * Dout + co * Dout + out_off;
             output[out_base + o_local] = static_cast<scalar_t>(acc);
             if (m > 0) {
                 output[out_base + n_out + o_local] = static_cast<scalar_t>(acc_im);
@@ -149,14 +151,14 @@ __global__ void block_diagonal_backward_features_kernel(
     const int* __restrict__ block_in_off,
     const int* __restrict__ block_out_off,
     const int* __restrict__ block_w_off,
-    int B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = B * Cin * Din;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = B * Cin * Din;
     if (idx >= total) return;
 
-    const int b = idx / (Cin * Din);
-    const int ci = (idx / Din) % Cin;
+    const int64_t b = idx / (Cin * Din);
+    const int64_t ci = (idx / Din) % Cin;
     const int i_global = idx % Din;
 
     // Find which block this input belongs to
@@ -184,7 +186,7 @@ __global__ void block_diagonal_backward_features_kernel(
     float grad = 0.0f;
 
     if (m == 0) {
-        for (int co = 0; co < Cout; co++) {
+        for (int64_t co = 0; co < Cout; co++) {
             const scalar_t* go_ptr = grad_output + b * Cout * Dout + co * Dout + out_off;
             const scalar_t* w_ptr = weights + b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off;
 
@@ -197,7 +199,7 @@ __global__ void block_diagonal_backward_features_kernel(
         bool is_real_input = (i_local < n_in);
         int i_idx = is_real_input ? i_local : (i_local - n_in);
 
-        for (int co = 0; co < Cout; co++) {
+        for (int64_t co = 0; co < Cout; co++) {
             const scalar_t* go_ptr = grad_output + b * Cout * Dout + co * Dout + out_off;
             const scalar_t* w_ptr = weights + b * Cout * Cin * Wdim + co * Cin * Wdim + ci * Wdim + w_off;
 
@@ -233,15 +235,17 @@ __global__ void block_diagonal_backward_weights_kernel(
     const int* __restrict__ block_in_off,
     const int* __restrict__ block_out_off,
     const int* __restrict__ block_w_off,
-    int B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = B * Cout * Cin * Wdim;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = B * Cout * Cin * Wdim;
     if (idx >= total) return;
 
-    const int b = idx / (Cout * Cin * Wdim);
-    const int co = (idx / (Cin * Wdim)) % Cout;
-    const int ci = (idx / Wdim) % Cin;
+    const int64_t CoutCinWdim = Cout * Cin * Wdim;
+    const int64_t CinWdim = Cin * Wdim;
+    const int64_t b = idx / CoutCinWdim;
+    const int64_t co = (idx / CinWdim) % Cout;
+    const int64_t ci = (idx / Wdim) % Cin;
     const int w_idx = idx % Wdim;
 
     // Find which block this weight belongs to
@@ -313,16 +317,16 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     torch::Tensor out_to_local,
     int dim_out
 ) {
-    const int B = features.size(0);
-    const int Cin = features.size(1);
-    const int Din = features.size(2);
-    const int Cout = weights.size(1);
-    const int Wdim = weights.size(3);
+    const int64_t B = features.size(0);
+    const int64_t Cin = features.size(1);
+    const int64_t Din = features.size(2);
+    const int64_t Cout = weights.size(1);
+    const int64_t Wdim = weights.size(3);
     const int num_blocks = block_m.size(0);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
 
-    const int total_outputs = B * Cout * dim_out;
+    const int64_t total_outputs = B * Cout * dim_out;
     const int threads = THREADS_PER_BLOCK;
     const int num_warps = threads / 32;
     const size_t shared_size = num_warps * 2 * sizeof(float);
@@ -360,12 +364,12 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     torch::Tensor block_w_off,
     int dim_in
 ) {
-    const int B = features.size(0);
-    const int Cin = features.size(1);
-    const int Din = features.size(2);
-    const int Cout = weights.size(1);
-    const int Wdim = weights.size(3);
-    const int Dout = grad_output.size(2);
+    const int64_t B = features.size(0);
+    const int64_t Cin = features.size(1);
+    const int64_t Din = features.size(2);
+    const int64_t Cout = weights.size(1);
+    const int64_t Wdim = weights.size(3);
+    const int64_t Dout = grad_output.size(2);
     const int num_blocks = block_m.size(0);
 
     auto grad_features = torch::zeros_like(features);
@@ -375,8 +379,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
 
     // Features gradient
     {
-        const int total = B * Cin * Din;
-        const int blocks = (total + threads - 1) / threads;
+        const int64_t total = B * Cin * Din;
+        const int64_t blocks = (total + threads - 1) / threads;
 
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_backward_features", ([&] {
             block_diagonal_backward_features_kernel<scalar_t><<<blocks, threads>>>(
@@ -396,8 +400,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
 
     // Weights gradient
     {
-        const int total = B * Cout * Cin * Wdim;
-        const int blocks = (total + threads - 1) / threads;
+        const int64_t total = B * Cout * Cin * Wdim;
+        const int64_t blocks = (total + threads - 1) / threads;
 
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_backward_weights", ([&] {
             block_diagonal_backward_weights_kernel<scalar_t><<<blocks, threads>>>(

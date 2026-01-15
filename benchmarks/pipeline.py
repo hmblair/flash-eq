@@ -1,16 +1,14 @@
 """
-Benchmark full equivariant pipeline: Low-rank vs Dense approaches.
+Benchmark full equivariant pipeline: Low-rank vs Dense (VersatileConvSE3-style).
 
 Low-rank pipeline:
     output = Q @ Λ @ P^T @ features
     Where P, Q are Wigner-D matrices and Λ is block-diagonal with O(L²) parameters.
 
-Dense pipeline:
-    output = W @ features
-    Where W is a dense weight matrix with O(L⁴) parameters.
-
-This benchmark measures the theoretical maximum benefit of the low-rank representation,
-not a comparison against a specific CG-basis implementation.
+Dense pipeline (mimics VersatileConvSE3):
+    tmp = features @ basis
+    output = radial_weights @ tmp
+    Two matmuls matching the SE3-Transformer's fused convolution.
 """
 
 import torch
@@ -63,9 +61,33 @@ def _lowrank_forward(features, weights, P, Q, perm, metadata):
     return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
 
 
-def _dense_forward(features, weights):
-    """Dense pipeline: einsum contraction with O(L⁴) weights."""
-    return torch.einsum("bocij,bcj->boi", weights, features)
+def _dense_forward(features, basis, radial_weights, out_dim):
+    """
+    Dense pipeline mimicking VersatileConvSE3.
+
+    Two matmuls:
+    1. features @ basis_view -> tmp
+    2. radial_weights @ tmp -> output
+
+    This matches the einsum: n i l, n o i f, n l f k -> n o k
+    where basis has shape [batch, in_dim, freq, out_dim].
+    """
+    # features: [batch, channels_in, in_dim]
+    # basis: [batch, in_dim, freq, out_dim] -> viewed as [batch, in_dim, freq * out_dim]
+    # radial_weights: [batch, channels_out, channels_in * freq]
+    batch, channels_in, in_dim = features.shape
+
+    # View basis as [batch, in_dim, freq * out_dim]
+    basis_view = basis.view(batch, in_dim, -1)
+
+    # First matmul: features @ basis_view -> [batch, channels_in, freq * out_dim]
+    tmp = features @ basis_view
+
+    # Reshape for second matmul: [batch, channels_in * freq, out_dim]
+    tmp = tmp.view(batch, -1, out_dim)
+
+    # Second matmul: radial_weights @ tmp -> [batch, channels_out, out_dim]
+    return radial_weights @ tmp
 
 
 def benchmark_pipeline(
@@ -99,15 +121,23 @@ def benchmark_pipeline(
     metadata = build_block_metadata(lvals, lvals, device)
     perm = _build_m_order_permutation(lvals, device)
 
+    # Compute freq_sum for dense baseline (matches VersatileConvSE3 fully fused)
+    lmax = max(lvals)
+    degrees = list(range(lmax + 1))
+    freq_sum = sum((2 * min(d_in, d_out) + 1) for d_in in degrees for d_out in degrees)
+
     # Low-rank tensors
     features_lr = torch.randn(batch, channels_in, dim, device=device, dtype=dtype)
     weights_lr = torch.randn(batch, channels_out, channels_in, weight_dim, device=device, dtype=dtype)
     P = _build_random_orthogonal(batch, dim, device, dtype)
     Q = _build_random_orthogonal(batch, dim, device, dtype)
 
-    # Dense tensors
+    # Dense tensors (mimicking VersatileConvSE3)
+    # basis: [batch, in_dim, freq_sum, out_dim]
+    # radial_weights: [batch, channels_out, channels_in * freq_sum]
     features_dense = torch.randn(batch, channels_in, dim, device=device, dtype=dtype)
-    weights_dense = torch.randn(batch, channels_out, channels_in, dim, dim, device=device, dtype=dtype)
+    basis_dense = torch.randn(batch, dim, freq_sum, dim, device=device, dtype=dtype)
+    radial_weights_dense = torch.randn(batch, channels_out, channels_in * freq_sum, device=device, dtype=dtype)
 
     # Warmup low-rank
     for _ in range(n_warmup):
@@ -126,7 +156,7 @@ def benchmark_pipeline(
 
     # Warmup dense
     for _ in range(n_warmup):
-        _ = _dense_forward(features_dense, weights_dense)
+        _ = _dense_forward(features_dense, basis_dense, radial_weights_dense, dim)
     torch.cuda.synchronize()
 
     # Benchmark dense
@@ -134,7 +164,7 @@ def benchmark_pipeline(
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(n_iter):
-        _ = _dense_forward(features_dense, weights_dense)
+        _ = _dense_forward(features_dense, basis_dense, radial_weights_dense, dim)
     torch.cuda.synchronize()
     dense_time = (time.perf_counter() - start) / n_iter * 1000
     dense_mem = torch.cuda.max_memory_allocated() / 1024**2
@@ -164,21 +194,27 @@ def run_pipeline_benchmark(
     """
     if configs is None:
         configs = [
-            ([0, 1, 2], 1000, 64, 64),
+            # Original configs
             ([0, 1, 2, 3], 1000, 64, 64),
-            ([0, 1, 2, 3], 1000, 128, 128),
-            ([0, 1, 2, 3, 4], 500, 128, 128),
+            ([0, 1, 2, 3, 4], 1000, 64, 64),
+            # Higher L values
+            ([0, 1, 2, 3, 4, 5, 6], 1000, 64, 64),
+            ([0, 1, 2, 3, 4, 5, 6], 2000, 64, 64),
+            ([0, 1, 2, 3, 4, 5, 6], 5000, 64, 64),
+            # Higher edge counts with moderate channels
+            ([0, 1, 2, 3, 4, 5, 6], 10000, 32, 32),
+            ([0, 1, 2, 3, 4, 5, 6], 20000, 32, 32),
         ]
 
     if dtypes is None:
         dtypes = [torch.float32, torch.float16]
 
     print("=" * 95)
-    print("Full Pipeline Benchmark: Low-Rank (Wigner-D + CUDA) vs Dense")
+    print("Full Pipeline Benchmark: Low-Rank (Wigner-D + CUDA) vs Dense (VersatileConvSE3-style)")
     print("=" * 95)
     print(f"\nDevice: {torch.cuda.get_device_name(0)}")
     print("\nLow-rank: P^T @ features -> CUDA block-diag kernel -> Q @ result")
-    print("Dense: einsum contraction with O(dim²) weight parameters per channel pair")
+    print("Dense: features @ basis -> radial_weights @ tmp (two matmuls, mimics SE3-Transformer)")
 
     for dtype in dtypes:
         dtype_name = "FP32" if dtype == torch.float32 else "FP16"
@@ -199,8 +235,7 @@ def run_pipeline_benchmark(
                 print(f"{config:<35} ERROR: {e}")
 
     print("\n" + "=" * 95)
-    print("Note: Dense weights are O(dim²) per channel pair vs O(L²) for low-rank.")
-    print("This measures theoretical maximum benefit of the low-rank representation.")
+    print("Note: Dense baseline mimics VersatileConvSE3 (two matmuls with basis and radial weights).")
     print("=" * 95)
 
 

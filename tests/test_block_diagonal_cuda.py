@@ -68,8 +68,8 @@ def block_diagonal_python(features, weights, lvals_in, lvals_out):
     return out
 
 
-def test_correctness(lvals, batch, cin, cout, dtype=torch.float32):
-    """Test CUDA kernel matches Python reference."""
+def check_correctness(lvals, batch, cin, cout, dtype=torch.float32):
+    """Check CUDA kernel matches Python reference."""
     device = torch.device('cuda')
 
     dim = sum(2*l + 1 for l in lvals)
@@ -91,8 +91,8 @@ def test_correctness(lvals, batch, cin, cout, dtype=torch.float32):
     return max_diff, rel_diff
 
 
-def test_backward(lvals, batch, cin, cout, dtype=torch.float32):
-    """Test backward pass gradients."""
+def check_backward(lvals, batch, cin, cout, dtype=torch.float32):
+    """Check backward pass gradients."""
     device = torch.device('cuda')
 
     dim = sum(2*l + 1 for l in lvals)
@@ -170,7 +170,7 @@ def main():
     print("-" * 70)
 
     for lvals, batch, cin, cout in configs:
-        max_diff, rel_diff = test_correctness(lvals, batch, cin, cout, torch.float32)
+        max_diff, rel_diff = check_correctness(lvals, batch, cin, cout, torch.float32)
         status = "PASS" if rel_diff < 1e-5 else "FAIL"
         if status == "FAIL":
             all_passed = False
@@ -182,7 +182,7 @@ def main():
     print("-" * 70)
 
     for lvals, batch, cin, cout in configs:
-        max_diff, rel_diff = test_correctness(lvals, batch, cin, cout, torch.float16)
+        max_diff, rel_diff = check_correctness(lvals, batch, cin, cout, torch.float16)
         status = "PASS" if rel_diff < 1e-2 else "FAIL"  # Looser tolerance for FP16
         if status == "FAIL":
             all_passed = False
@@ -196,7 +196,7 @@ def main():
     for lvals, batch, cin, cout in configs[:2]:
         for dtype, name in [(torch.float32, "FP32"), (torch.float16, "FP16")]:
             try:
-                test_backward(lvals, batch, cin, cout, dtype)
+                check_backward(lvals, batch, cin, cout, dtype)
                 print(f"L={lvals}, {name}: PASS")
             except Exception as e:
                 print(f"L={lvals}, {name}: FAIL - {e}")

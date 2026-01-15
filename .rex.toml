@@ -1,0 +1,11 @@
+host = "hmblair@login.sherlock.stanford.edu"
+code_dir = "/home/groups/rhiju/hmblair/flash-eq"
+run_dir = "/scratch/users/hmblair/flash-eq"
+
+modules = ["system", "git/2.45.1", "cmake/3.24.2", "gcc/12.4.0", "ncurses/6.4", "python/3.12", "cuda/12.4.0", "hdf5/1.14.4", "openblas/0.3.28"]
+
+cpu_partition = "biochem"
+gpu_partition = "rhiju"
+gres = "gpu:1"
+time = "8:00:00"
+prefer = "GPU_SKU:H100_SXM5"

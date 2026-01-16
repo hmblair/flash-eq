@@ -318,36 +318,20 @@ class BlockDiagonalBinnedInterpFunction(Function):
          block_in_size, block_out_size) = ctx.saved_tensors
 
         cuda_module = _get_cuda_module()
-        batch = features.size(0)
 
-        # Interpolate weights from radial_table (need full weights for backward)
-        # weights[b] = (1 - t[b]) * radial_table[lo[b]] + t[b] * radial_table[hi[b]]
-        t = interp_weight.view(-1, 1, 1, 1)
-        weights = (1 - t) * radial_table[bin_lo] + t * radial_table[bin_hi]
-
-        # Use existing backward kernel to get grad_features and grad_weights
-        grad_features, grad_weights = cuda_module.backward_v2(
+        # Use fused backward kernel that avoids materializing full weights tensor
+        grad_features, grad_radial_table, grad_interp_weight = cuda_module.backward_binned_interp(
             grad_output.contiguous(),
             features,
-            weights,
+            radial_table,
+            bin_lo.int(),
+            bin_hi.int(),
+            interp_weight,
             block_m, block_n_in, block_n_out,
             block_in_off, block_out_off, block_w_off,
             block_in_size, block_out_size,
             ctx.dim_in
         )
-
-        # Scatter grad_weights to grad_radial_table
-        # grad_radial_table[lo[b]] += (1 - t[b]) * grad_weights[b]
-        # grad_radial_table[hi[b]] += t[b] * grad_weights[b]
-        grad_radial_table = torch.zeros_like(radial_table)
-        grad_radial_table.index_add_(0, bin_lo, (1 - t) * grad_weights)
-        grad_radial_table.index_add_(0, bin_hi, t * grad_weights)
-
-        # grad_interp_weight for force computation (optional, but we compute it)
-        # d/dt [(1-t)*w_lo + t*w_hi] = w_hi - w_lo
-        # grad_t = (w_hi - w_lo) · grad_weights (dot product over cout, cin, wdim)
-        weight_diff = radial_table[bin_hi] - radial_table[bin_lo]
-        grad_interp_weight = (weight_diff * grad_weights).sum(dim=(1, 2, 3))
 
         # Return gradients for all inputs (None for non-differentiable ones)
         return (grad_features, grad_radial_table, None, None, grad_interp_weight,

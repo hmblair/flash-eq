@@ -1,11 +1,12 @@
 """
 CUDA-accelerated block-diagonal multiplication for SO(3)-equivariant layers.
 
-This module provides optimized CUDA kernels for the Λ (Lambda) block-diagonal
-multiplication step, which handles both real (m=0) and complex (m>0) irreps.
+This module provides two implementations:
+  - Binned (production): Memory-efficient with 5-13x reduction, 1.2-1.8x faster
+  - Reference: Standard per-edge weights for baseline comparisons
 
-The default kernel (V2) parallelizes by (batch, m-block) with shared memory
-caching for 2-9x speedup over the original per-output parallelization (V1).
+The binned approach precomputes weights at K bin edges and interpolates at
+runtime, avoiding the O(B * Cout * Cin * Wdim) memory bottleneck.
 
 Supports FP16, FP32, and FP64 with FP32 accumulation for numerical stability.
 """
@@ -17,25 +18,40 @@ from torch.utils.cpp_extension import load
 from pathlib import Path
 from typing import List, Tuple
 
-# Set CUDA_HOME to 12.6 if available
+# Set CUDA_HOME if available
 if os.path.exists("/usr/local/cuda-12.6"):
     os.environ["CUDA_HOME"] = "/usr/local/cuda-12.6"
 
-_cuda_module = None
+_binned_module = None
+_reference_module = None
 
 
-def _get_cuda_module():
-    """JIT compile and load the CUDA extension."""
-    global _cuda_module
-    if _cuda_module is None:
+def _get_binned_module():
+    """JIT compile and load the binned CUDA extension."""
+    global _binned_module
+    if _binned_module is None:
         csrc_dir = Path(__file__).parent / "csrc"
-        _cuda_module = load(
-            name="block_diagonal_cuda",
-            sources=[str(csrc_dir / "block_diagonal.cu")],
+        _binned_module = load(
+            name="block_diagonal_binned",
+            sources=[str(csrc_dir / "block_diagonal_binned.cu")],
             verbose=False,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
-    return _cuda_module
+    return _binned_module
+
+
+def _get_reference_module():
+    """JIT compile and load the reference CUDA extension."""
+    global _reference_module
+    if _reference_module is None:
+        csrc_dir = Path(__file__).parent / "csrc"
+        _reference_module = load(
+            name="block_diagonal_reference",
+            sources=[str(csrc_dir / "block_diagonal_reference.cu")],
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+    return _reference_module
 
 
 def build_block_metadata(
@@ -52,8 +68,7 @@ def build_block_metadata(
         device: Target device for metadata tensors
 
     Returns:
-        Tuple of metadata tensors: (block_m, block_n_in, block_n_out, block_in_off,
-        block_out_off, block_w_off, out_to_block, out_to_local, block_in_size, dim_out)
+        Tuple of metadata tensors for block structure
     """
     lmax = max(max(lvals_in), max(lvals_out))
 
@@ -101,19 +116,14 @@ def build_block_metadata(
     out_to_block = torch.tensor(out_to_block, dtype=torch.int32, device=device)
     out_to_local = torch.tensor(out_to_local, dtype=torch.int32, device=device)
 
-    # block_in_size: n_in for m=0, 2*n_in for m>0 (for v2 kernel shared memory)
     block_in_size = torch.tensor(
         [b['n_in'] if b['m'] == 0 else 2 * b['n_in'] for b in blocks],
         dtype=torch.int32, device=device
     )
-
-    # block_out_size: n_out for m=0, 2*n_out for m>0 (for v2 backward kernel)
     block_out_size = torch.tensor(
         [b['n_out'] if b['m'] == 0 else 2 * b['n_out'] for b in blocks],
         dtype=torch.int32, device=device
     )
-
-    # block_w_size: weight block size for each m-block (for binned kernel)
     block_w_size = torch.tensor(
         [b['n_out'] * b['n_in'] if b['m'] == 0 else 2 * b['n_out'] * b['n_in'] for b in blocks],
         dtype=torch.int32, device=device
@@ -122,88 +132,6 @@ def build_block_metadata(
     return (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
             block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
             block_w_size, dim_out)
-
-
-class BlockDiagonalFunction(Function):
-    """Autograd function for block-diagonal multiplication using V2 kernel."""
-
-    @staticmethod
-    def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
-                block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, block_out_size, block_w_size, dim_out):
-        cuda_module = _get_cuda_module()
-
-        # Use V2 (m-block parallel) kernel for forward pass
-        output, = cuda_module.forward_v2(
-            features.contiguous(),
-            weights.contiguous(),
-            block_m, block_n_in, block_n_out,
-            block_in_off, block_out_off, block_w_off,
-            block_in_size,
-            dim_out
-        )
-
-        ctx.save_for_backward(features, weights, block_m, block_n_in, block_n_out,
-                              block_in_off, block_out_off, block_w_off,
-                              block_in_size, block_out_size)
-        ctx.dim_in = features.size(2)
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        features, weights, block_m, block_n_in, block_n_out, \
-            block_in_off, block_out_off, block_w_off, \
-            block_in_size, block_out_size = ctx.saved_tensors
-
-        cuda_module = _get_cuda_module()
-
-        # Use V2 (m-block parallel) kernel for backward pass
-        grad_features, grad_weights = cuda_module.backward_v2(
-            grad_output.contiguous(),
-            features,
-            weights,
-            block_m, block_n_in, block_n_out,
-            block_in_off, block_out_off, block_w_off,
-            block_in_size, block_out_size,
-            ctx.dim_in
-        )
-
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
-
-
-def block_diagonal_cuda(
-    features: torch.Tensor,
-    weights: torch.Tensor,
-    metadata: Tuple[torch.Tensor, ...]
-) -> torch.Tensor:
-    """
-    Apply block-diagonal multiplication using optimized CUDA kernel.
-
-    Uses V2 kernel (m-block parallelization with shared memory) which is
-    2-9x faster than V1 depending on configuration.
-
-    This implements the Λ step in: output = Q @ Λ @ P^T @ features
-
-    Args:
-        features: (batch, channels_in, dim_in) - features in diagonal (m-ordered) basis
-        weights: (batch, channels_out, channels_in, weight_dim) - block-diagonal weights
-        metadata: Tuple from build_block_metadata()
-
-    Returns:
-        output: (batch, channels_out, dim_out)
-
-    Supports FP16, FP32, and FP64. Internal accumulation is done in FP32.
-    """
-    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
-     block_w_size, dim_out) = metadata
-
-    return BlockDiagonalFunction.apply(
-        features, weights, block_m, block_n_in, block_n_out,
-        block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, block_out_size, block_w_size, dim_out
-    )
 
 
 def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
@@ -232,6 +160,91 @@ def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
     return weight_dim
 
 
+# =============================================================================
+# Reference Implementation (per-edge weights)
+# =============================================================================
+
+class BlockDiagonalFunction(Function):
+    """Autograd function for standard block-diagonal multiplication."""
+
+    @staticmethod
+    def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
+                block_in_off, block_out_off, block_w_off, out_to_block,
+                out_to_local, block_in_size, block_out_size, block_w_size, dim_out):
+        cuda_module = _get_reference_module()
+
+        output, = cuda_module.forward_v2(
+            features.contiguous(),
+            weights.contiguous(),
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size,
+            dim_out
+        )
+
+        ctx.save_for_backward(features, weights, block_m, block_n_in, block_n_out,
+                              block_in_off, block_out_off, block_w_off,
+                              block_in_size, block_out_size)
+        ctx.dim_in = features.size(2)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        features, weights, block_m, block_n_in, block_n_out, \
+            block_in_off, block_out_off, block_w_off, \
+            block_in_size, block_out_size = ctx.saved_tensors
+
+        cuda_module = _get_reference_module()
+
+        grad_features, grad_weights = cuda_module.backward_v2(
+            grad_output.contiguous(),
+            features,
+            weights,
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_out_size,
+            ctx.dim_in
+        )
+
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+def block_diagonal_cuda(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    metadata: Tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    """
+    Apply block-diagonal multiplication with per-edge weights.
+
+    This is the reference implementation. For production use with radial MLPs,
+    prefer block_diagonal_binned_interp_cuda() which provides significant
+    memory and speed improvements.
+
+    Args:
+        features: (batch, channels_in, dim_in) - features in diagonal basis
+        weights: (batch, channels_out, channels_in, weight_dim) - per-edge weights
+        metadata: Tuple from build_block_metadata()
+
+    Returns:
+        output: (batch, channels_out, dim_out)
+    """
+    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
+
+    return BlockDiagonalFunction.apply(
+        features, weights, block_m, block_n_in, block_n_out,
+        block_in_off, block_out_off, block_w_off, out_to_block,
+        out_to_local, block_in_size, block_out_size, block_w_size, dim_out
+    )
+
+
+# =============================================================================
+# Binned Implementation (production)
+# =============================================================================
+
 class BlockDiagonalBinnedInterpFunction(Function):
     """Autograd function for binned interpolated block-diagonal multiplication."""
 
@@ -240,7 +253,7 @@ class BlockDiagonalBinnedInterpFunction(Function):
                 channels_out, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off,
                 block_in_size, block_out_size, block_w_size, dim_out):
-        cuda_module = _get_cuda_module()
+        cuda_module = _get_binned_module()
 
         output, = cuda_module.forward_binned_interp(
             features.contiguous(),
@@ -273,9 +286,8 @@ class BlockDiagonalBinnedInterpFunction(Function):
          block_in_off, block_out_off, block_w_off,
          block_in_size, block_out_size) = ctx.saved_tensors
 
-        cuda_module = _get_cuda_module()
+        cuda_module = _get_binned_module()
 
-        # Use fused backward kernel that avoids materializing full weights tensor
         grad_features, grad_radial_table, grad_interp_weight = cuda_module.backward_binned_interp(
             grad_output.contiguous(),
             features,
@@ -289,7 +301,6 @@ class BlockDiagonalBinnedInterpFunction(Function):
             ctx.dim_in
         )
 
-        # Return gradients for all inputs (None for non-differentiable ones)
         return (grad_features, grad_radial_table, None, None, grad_interp_weight,
                 None, None, None, None, None, None, None, None, None, None, None)
 
@@ -305,17 +316,19 @@ def block_diagonal_binned_interp_cuda(
     enable_grad: bool = True,
 ) -> torch.Tensor:
     """
-    Apply block-diagonal multiplication with interpolated binned weights.
+    Apply block-diagonal multiplication with binned interpolated weights.
 
-    Linear interpolation between adjacent bins for smoother results.
-    Supports autograd for training when enable_grad=True.
+    This is the production implementation providing:
+      - 5-13x memory reduction vs standard approach
+      - 1.2-1.8x speedup during training
+      - ~0.1% interpolation error at 100 bins
 
     Args:
         features: (batch, channels_in, dim_in) - features in diagonal basis
         radial_table: (num_bins + 1, channels_out, channels_in, weight_dim) - weights at bin edges
         bin_lo: (batch,) - lower bin index for each edge
         bin_hi: (batch,) - upper bin index for each edge
-        interp_weight: (batch,) - interpolation weight (0 to 1)
+        interp_weight: (batch,) - interpolation weight t in [0, 1]
         channels_out: Number of output channels
         metadata: Tuple from build_block_metadata()
         enable_grad: If True, use autograd Function (default). If False, use raw kernel.
@@ -340,8 +353,7 @@ def block_diagonal_binned_interp_cuda(
             block_in_size, block_out_size, block_w_size, dim_out
         )
     else:
-        # No grad needed, use raw kernel
-        cuda_module = _get_cuda_module()
+        cuda_module = _get_binned_module()
         output, = cuda_module.forward_binned_interp(
             features.contiguous(),
             radial_table.contiguous(),

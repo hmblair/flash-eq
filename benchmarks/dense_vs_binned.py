@@ -1,5 +1,5 @@
 """
-Benchmark training loop: Binned (with gradients) vs Standard approach.
+Benchmark training loop: Dense vs Binned vs Gathered (bin-sorted).
 
 Compares memory usage and runtime for forward + backward pass.
 """
@@ -11,6 +11,7 @@ from flash_eq.block_diagonal_cuda import (
     build_block_metadata,
     block_diagonal_cuda,
     block_diagonal_binned_interp_cuda,
+    block_diagonal_gathered_cuda,
     get_weight_dim,
 )
 from flash_eq.binned_weights import RadialBinning
@@ -152,101 +153,200 @@ def benchmark_binned_training(lmax, batch, cin, cout, num_bins, dtype, n_warmup=
     }
 
 
+def benchmark_gathered_training(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, n_warmup=3, n_iter=10):
+    """Benchmark gathered (bin-sorted) approach with gradients."""
+    clear_memory()
+    device = torch.device("cuda")
+
+    lvals = list(range(lmax + 1))
+    dim = sum(2 * l + 1 for l in lvals)
+    weight_dim = get_weight_dim(lvals, lvals)
+    metadata = build_block_metadata(lvals, lvals, device)
+
+    # Model and optimizer
+    mlp = RadialMLP(cout, cin, weight_dim).to(device).to(dtype)
+    optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+
+    binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
+
+    # Fixed inputs for benchmarking
+    # Node features (smaller than edge features)
+    node_features = torch.randn(num_nodes, cin, dim, device=device, dtype=dtype, requires_grad=True)
+    # Edge structure
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device, dtype=dtype) * 10.0
+    distances.requires_grad_(True)
+    target = torch.randn(num_edges, cout, dim, device=device, dtype=dtype)
+
+    def train_step():
+        optimizer.zero_grad()
+
+        # Gathered approach: MLP at bin edges, kernel handles gather + interpolation
+        radial_table = mlp(binning.bin_edges)
+
+        output, unsort_indices = block_diagonal_gathered_cuda(
+            node_features, src_indices, radial_table, distances, metadata, sort_by_bin=True
+        )
+        # Unsort to match target order
+        output = output[unsort_indices]
+
+        loss = ((output - target) ** 2).mean()
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+
+    # Warmup
+    for _ in range(n_warmup):
+        train_step()
+    torch.cuda.synchronize()
+
+    # Benchmark
+    clear_memory()
+    torch.cuda.reset_peak_memory_stats()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(n_iter):
+        train_step()
+    end.record()
+    torch.cuda.synchronize()
+
+    return {
+        'time_ms': start.elapsed_time(end) / n_iter,
+        'peak_mem_mb': torch.cuda.max_memory_allocated() / 1024**2,
+    }
+
+
 def main():
-    print("=" * 100)
-    print("Training Benchmark: Standard vs Binned (with gradients)")
-    print("=" * 100)
+    print("=" * 120)
+    print("Training Benchmark: Dense vs Binned vs Gathered (bin-sorted)")
+    print("=" * 120)
     print(f"\nDevice: {torch.cuda.get_device_name()}")
     print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     dtype = torch.float32
     num_bins = 100
 
+    # Configs: (lmax, num_nodes, num_edges, cin, cout)
+    # For dense/binned, we use num_edges as "batch" (edge features pre-expanded)
     configs = [
-        # (lmax, batch, cin, cout)
-        (2, 16000, 32, 32),
-        (4, 2000, 32, 32),
-        (4, 5000, 32, 32),
-        (6, 2000, 32, 32),
-        (6, 5000, 32, 32),
-        (6, 2000, 64, 64),
-        (6, 5000, 64, 64),
-        # Large-scale: 64*2000 = 128k edges
-        (2, 128000, 32, 32),
-        (4, 128000, 32, 32),
-        (6, 128000, 32, 32),
+        # Small scale
+        (4, 1000, 5000, 32, 32),
+        (6, 1000, 5000, 32, 32),
+        # Medium scale
+        (4, 2000, 20000, 32, 32),
+        (6, 2000, 20000, 32, 32),
+        # Large scale (typical GNN)
+        (4, 5000, 128000, 32, 32),
+        (6, 5000, 128000, 32, 32),
+        # Very large
+        (6, 10000, 256000, 32, 32),
     ]
 
     print(f"\nSettings: num_bins={num_bins}, dtype=float32")
-    print(f"\n{'Config':<30} {'Standard':>20} {'Binned':>20} {'Mem Ratio':>12} {'Speed Ratio':>12}")
-    print("-" * 100)
+    print(f"\n{'Config':<35} {'Dense':>22} {'Binned':>22} {'Gathered':>22}")
+    print("-" * 120)
 
-    for lmax, batch, cin, cout in configs:
-        config_str = f"L={lmax}, B={batch}, C={cin}x{cout}"
+    results = []
 
-        # Standard approach
+    for lmax, num_nodes, num_edges, cin, cout in configs:
+        config_str = f"L={lmax}, N={num_nodes}, E={num_edges}, C={cin}"
+
+        # Dense approach (per-edge weights)
         try:
-            r_std = benchmark_standard_training(lmax, batch, cin, cout, dtype)
-            std_str = f"{r_std['time_ms']:.1f}ms / {r_std['peak_mem_mb']:.0f}MB"
+            r_dense = benchmark_standard_training(lmax, num_edges, cin, cout, dtype)
+            dense_str = f"{r_dense['time_ms']:.1f}ms / {r_dense['peak_mem_mb']:.0f}MB"
         except torch.cuda.OutOfMemoryError:
-            r_std = None
-            std_str = "OOM"
+            r_dense = None
+            dense_str = "OOM"
         clear_memory()
 
-        # Binned approach
+        # Binned approach (pre-expanded edge features)
         try:
-            r_bin = benchmark_binned_training(lmax, batch, cin, cout, num_bins, dtype)
-            bin_str = f"{r_bin['time_ms']:.1f}ms / {r_bin['peak_mem_mb']:.0f}MB"
+            r_binned = benchmark_binned_training(lmax, num_edges, cin, cout, num_bins, dtype)
+            binned_str = f"{r_binned['time_ms']:.1f}ms / {r_binned['peak_mem_mb']:.0f}MB"
         except torch.cuda.OutOfMemoryError:
-            r_bin = None
-            bin_str = "OOM"
+            r_binned = None
+            binned_str = "OOM"
         clear_memory()
 
-        # Compute ratios
-        if r_std and r_bin:
-            mem_ratio = r_std['peak_mem_mb'] / r_bin['peak_mem_mb']
-            speed_ratio = r_std['time_ms'] / r_bin['time_ms']
-            ratio_str = f"{mem_ratio:.1f}x"
-            speed_str = f"{speed_ratio:.2f}x"
+        # Gathered approach (bin-sorted, no pre-expansion)
+        try:
+            r_gathered = benchmark_gathered_training(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype)
+            gathered_str = f"{r_gathered['time_ms']:.1f}ms / {r_gathered['peak_mem_mb']:.0f}MB"
+        except torch.cuda.OutOfMemoryError:
+            r_gathered = None
+            gathered_str = "OOM"
+        clear_memory()
+
+        print(f"{config_str:<35} {dense_str:>22} {binned_str:>22} {gathered_str:>22}")
+        results.append((config_str, r_dense, r_binned, r_gathered))
+
+    # Summary table with ratios
+    print(f"\n{'='*120}")
+    print("Summary: Memory and Speed Ratios (vs Dense baseline)")
+    print("=" * 120)
+    print(f"\n{'Config':<35} {'Binned Mem':>12} {'Binned Speed':>14} {'Gathered Mem':>14} {'Gathered Speed':>14}")
+    print("-" * 120)
+
+    for config_str, r_dense, r_binned, r_gathered in results:
+        if r_dense and r_binned:
+            binned_mem = f"{r_dense['peak_mem_mb'] / r_binned['peak_mem_mb']:.1f}x"
+            binned_speed = f"{r_dense['time_ms'] / r_binned['time_ms']:.2f}x"
         else:
-            ratio_str = "N/A"
-            speed_str = "N/A"
+            binned_mem = "N/A"
+            binned_speed = "N/A"
 
-        print(f"{config_str:<30} {std_str:>20} {bin_str:>20} {ratio_str:>12} {speed_str:>12}")
+        if r_dense and r_gathered:
+            gathered_mem = f"{r_dense['peak_mem_mb'] / r_gathered['peak_mem_mb']:.1f}x"
+            gathered_speed = f"{r_dense['time_ms'] / r_gathered['time_ms']:.2f}x"
+        else:
+            gathered_mem = "N/A"
+            gathered_speed = "N/A"
 
-    # Detailed breakdown for one config
-    print(f"\n{'='*100}")
-    print("Detailed Analysis: L=6, B=5000, C=32x32")
-    print("=" * 100)
+        print(f"{config_str:<35} {binned_mem:>12} {binned_speed:>14} {gathered_mem:>14} {gathered_speed:>14}")
 
-    lmax, batch, cin, cout = 6, 5000, 32, 32
+    # Detailed breakdown
+    print(f"\n{'='*120}")
+    print("Detailed Analysis: L=6, N=5000, E=128000, C=32x32")
+    print("=" * 120)
+
+    lmax, num_nodes, num_edges, cin, cout = 6, 5000, 128000, 32, 32
     lvals = list(range(lmax + 1))
+    dim = sum(2 * l + 1 for l in lvals)
     weight_dim = get_weight_dim(lvals, lvals)
 
-    # Theoretical memory for weights tensor
-    weight_tensor_bytes = batch * cout * cin * weight_dim * 4  # float32
-    weight_tensor_mb = weight_tensor_bytes / 1024**2
+    # Memory breakdown
+    print(f"\nTheoretical memory usage:")
+    print(f"  Weight dimension: {weight_dim}")
+    print(f"  Feature dimension: {dim}")
 
-    # For binned: table size
-    table_bytes = (num_bins + 1) * cout * cin * weight_dim * 4
-    table_mb = table_bytes / 1024**2
+    # Dense weights
+    dense_weights_mb = num_edges * cout * cin * weight_dim * 4 / 1024**2
+    print(f"\n  Dense weights: ({num_edges}, {cout}, {cin}, {weight_dim}) = {dense_weights_mb:.1f} MB")
 
-    print(f"\nWeight tensor sizes:")
-    print(f"  Standard: (B, Cout, Cin, Wdim) = ({batch}, {cout}, {cin}, {weight_dim})")
-    print(f"            = {weight_tensor_mb:.1f} MB per forward/backward")
-    print(f"  Binned:   (bins+1, Cout, Cin, Wdim) = ({num_bins+1}, {cout}, {cin}, {weight_dim})")
-    print(f"            = {table_mb:.1f} MB (shared across all edges)")
-    print(f"  Theoretical reduction: {weight_tensor_mb / table_mb:.1f}x")
+    # Binned table
+    binned_table_mb = (num_bins + 1) * cout * cin * weight_dim * 4 / 1024**2
+    print(f"  Binned table:  ({num_bins+1}, {cout}, {cin}, {weight_dim}) = {binned_table_mb:.1f} MB")
 
-    print(f"\nNote: Fused backward kernel avoids materializing full weights tensor.")
-    print(f"      Memory scales with num_bins, not batch_size.")
+    # Edge features (binned needs this, gathered doesn't)
+    edge_features_mb = num_edges * cin * dim * 4 / 1024**2
+    print(f"\n  Edge features (binned): ({num_edges}, {cin}, {dim}) = {edge_features_mb:.1f} MB")
 
-    print("\n" + "=" * 100)
+    # Node features (gathered uses this instead)
+    node_features_mb = num_nodes * cin * dim * 4 / 1024**2
+    print(f"  Node features (gathered): ({num_nodes}, {cin}, {dim}) = {node_features_mb:.1f} MB")
+    print(f"  Feature memory savings: {edge_features_mb / node_features_mb:.1f}x")
+
+    print("\n" + "=" * 120)
     print("Summary:")
-    print("  - Binned training uses significantly less memory than standard")
-    print("  - Binned is faster due to MLP evaluating at num_bins+1 points vs B points")
-    print("  - Trade-off: ~0.1% interpolation error at 100 bins (acceptable for most uses)")
-    print("=" * 100)
+    print("  - Dense: O(E * Cout * Cin * Wdim) memory for weights - scales poorly")
+    print("  - Binned: O(bins * Cout * Cin * Wdim) weights + O(E * Cin * dim) features")
+    print("  - Gathered: O(bins * Cout * Cin * Wdim) weights + O(N * Cin * dim) features")
+    print("  - Gathered wins when E >> N (typical in molecular graphs)")
+    print("=" * 120)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,8 @@ def benchmark_pipeline(lmax, batch, cin, cout, num_bins=100, dtype=torch.float32
 
     # Binned weights setup
     bin_edges = create_bin_edges(0.0, 10.0, num_bins, device)
-    radial_table = torch.randn(num_bins + 1, weight_dim, device=device, dtype=dtype)
+    # Table shape: (num_bins + 1, cout, cin, weight_dim)
+    radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device, dtype=dtype)
     bin_lo, bin_hi, interp_weight = compute_bin_interpolation(edge_lengths, bin_edges)
     interp_weight = interp_weight.to(dtype)
 

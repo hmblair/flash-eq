@@ -4,10 +4,11 @@ Benchmark binned radial weights vs full weights.
 Compares:
 1. Memory usage: binned table vs full (batch, cout, cin, weight_dim) tensor
 2. Speed: lookup + kernel vs full tensor kernel
+
+With per-channel weights, memory reduction factor is batch_size / num_bins.
 """
 
 import torch
-import torch.nn as nn
 from flash_eq.block_diagonal_cuda import (
     build_block_metadata,
     block_diagonal_cuda,
@@ -17,43 +18,22 @@ from flash_eq.block_diagonal_cuda import (
 )
 from flash_eq.binned_weights import (
     create_bin_edges,
-    create_radial_table,
     compute_bin_indices,
     compute_bin_interpolation,
-    BinnedRadialWeights,
 )
-
-
-class SimpleRadialMLP(nn.Module):
-    """Simple MLP that maps distance -> weight_dim outputs."""
-
-    def __init__(self, weight_dim: int, hidden_dim: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, weight_dim),
-        )
-
-    def forward(self, distances: torch.Tensor) -> torch.Tensor:
-        # distances: (N,) -> (N, weight_dim)
-        return self.net(distances.unsqueeze(-1))
 
 
 def benchmark_memory(lmax, batch, cin, cout, num_bins=100, dtype=torch.float32):
     """Compare memory usage of binned vs full weights."""
-    device = torch.device("cuda")
     lvals = list(range(lmax + 1))
     weight_dim = get_weight_dim(lvals, lvals)
 
-    # Full weights memory
+    # Full weights memory: (batch, cout, cin, weight_dim)
     full_elements = batch * cout * cin * weight_dim
     full_bytes = full_elements * (2 if dtype == torch.float16 else 4)
 
-    # Binned table memory
-    table_elements = num_bins * weight_dim
+    # Binned table memory: (num_bins, cout, cin, weight_dim)
+    table_elements = num_bins * cout * cin * weight_dim
     table_bytes = table_elements * (2 if dtype == torch.float16 else 4)
 
     # Bin indices memory (int32)
@@ -79,27 +59,19 @@ def benchmark_speed(lmax, batch, cin, cout, num_bins=100, dtype=torch.float32,
     weight_dim = get_weight_dim(lvals, lvals)
     metadata = build_block_metadata(lvals, lvals, device)
 
-    # Create radial MLP
-    radial_mlp = SimpleRadialMLP(weight_dim).to(device).to(dtype)
-
     # Generate random edge lengths (0 to 10 Angstroms)
     edge_lengths = torch.rand(batch, device=device) * 10.0
 
-    # Create binned lookup table
+    # Create binned lookup table: (num_bins + 1, cout, cin, weight_dim)
     bin_edges = create_bin_edges(0.0, 10.0, num_bins, device)
-    radial_table = create_radial_table(
-        lambda d: radial_mlp(d.to(dtype)),
-        bin_edges,
-        eval_at="edges"  # For interpolation
-    )
+    radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device, dtype=dtype)
     bin_lo, bin_hi, interp_weight = compute_bin_interpolation(edge_lengths, bin_edges)
     interp_weight = interp_weight.to(dtype)
 
     # Also create nearest-neighbor indices
     bin_indices = compute_bin_indices(edge_lengths, bin_edges)
 
-    # Create full weights (simulating what you'd have without binning)
-    # In practice, this would be: radial_mlp(edge_lengths) expanded to (batch, cout, cin, weight_dim)
+    # Create full weights: (batch, cout, cin, weight_dim)
     full_weights = torch.randn(batch, cout, cin, weight_dim, device=device, dtype=dtype)
 
     # Features
@@ -167,6 +139,7 @@ def main():
     print("Binned Radial Weights Benchmark")
     print("=" * 100)
     print(f"\nDevice: {torch.cuda.get_device_name()}")
+    print("\nNote: With per-channel weights, memory reduction = batch / num_bins")
 
     configs = [
         # (lmax, batch, cin, cout, num_bins)
@@ -188,8 +161,8 @@ def main():
     for lmax, batch, cin, cout, num_bins in configs:
         mem = benchmark_memory(lmax, batch, cin, cout, num_bins)
         config_str = f"L={lmax}, B={batch}, C={cin}x{cout}"
-        print(f"{config_str:<35} {mem['full_mb']:>10.1f}MB {mem['binned_total_mb']:>10.3f}MB "
-              f"{mem['reduction']:>11.0f}x")
+        print(f"{config_str:<35} {mem['full_mb']:>10.1f}MB {mem['binned_total_mb']:>10.1f}MB "
+              f"{mem['reduction']:>11.1f}x")
 
     # Speed comparison
     print("\n" + "-" * 100)
@@ -212,9 +185,9 @@ def main():
     print("\n" + "=" * 100)
     print("Notes:")
     print("- Full: stores (batch, cout, cin, weight_dim) tensor")
-    print("- Binned: stores (num_bins, weight_dim) table + (batch,) indices")
+    print("- Binned: stores (num_bins, cout, cin, weight_dim) table + (batch,) indices")
+    print("- Memory reduction factor = batch / num_bins")
     print("- Interp: linear interpolation between adjacent bins")
-    print("- Binned kernel also benefits from weight sharing across channels")
     print("=" * 100)
 
 

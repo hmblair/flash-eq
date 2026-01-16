@@ -251,18 +251,20 @@ __global__ void block_diagonal_forward_v2_kernel(
  * Binned Forward kernel: Uses lookup table for radial weights.
  *
  * Instead of storing weights per edge (B, Cout, Cin, Wdim), we store:
- *   - radial_table: (num_bins, Wdim) - weights per distance bin
+ *   - radial_table: (num_bins, Cout, Cin, Wdim) - weights per distance bin
  *   - bin_indices: (B,) - which bin each edge belongs to
  *
- * The weights are SHARED across all (cout, cin) pairs for a given edge.
- * This reduces memory from O(B * Cout * Cin * Wdim) to O(num_bins * Wdim).
+ * This reduces memory from O(B * Cout * Cin * Wdim) to O(num_bins * Cout * Cin * Wdim).
+ * Memory reduction factor is batch_size / num_bins (e.g., 50x for batch=5000, bins=100).
  *
- * Grid: B × num_m_blocks thread blocks (same as V2)
+ * Identical to V2 kernel, but indexes weights by bin_indices[b] instead of b.
+ *
+ * Grid: B × num_m_blocks thread blocks
  */
 template <typename scalar_t>
 __global__ void block_diagonal_forward_binned_kernel(
     const scalar_t* __restrict__ features,      // (B, Cin, Din)
-    const scalar_t* __restrict__ radial_table,  // (num_bins, Wdim)
+    const scalar_t* __restrict__ radial_table,  // (num_bins, Cout, Cin, Wdim)
     const int* __restrict__ bin_indices,        // (B,)
     scalar_t* __restrict__ output,              // (B, Cout, Dout)
     const int* __restrict__ block_m,
@@ -291,14 +293,9 @@ __global__ void block_diagonal_forward_binned_kernel(
     const int w_off = block_w_off[blk];
 
     const int in_size = (m == 0) ? n_in : 2 * n_in;
-    const int w_block_size = (m == 0) ? (n_out * n_in) : (2 * n_out * n_in);
 
-    // Shared memory layout:
-    // [0, Cin * in_size): features
-    // [Cin * in_size, Cin * in_size + w_block_size): weights for this m-block
-    extern __shared__ float shared[];
-    float* feat_shared = shared;
-    float* weight_shared = shared + Cin * in_size;
+    // Shared memory layout: features for all Cin channels
+    extern __shared__ float feat_shared[];
 
     // Cooperatively load features into shared memory
     const int64_t feat_base = b * Cin * Din;
@@ -309,19 +306,13 @@ __global__ void block_diagonal_forward_binned_kernel(
         const int local_idx = i % in_size;
         feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
     }
-
-    // Load weights from radial table (same for all channels!)
-    const int bin_idx = bin_indices[b];
-    const scalar_t* w_ptr = radial_table + bin_idx * Wdim + w_off;
-
-    for (int i = tid; i < w_block_size; i += num_threads) {
-        weight_shared[i] = static_cast<float>(w_ptr[i]);
-    }
     __syncthreads();
 
-    // Each thread computes a subset of (cout, cin, out_local) tuples
-    // With shared weights, we sum over cin for each (cout, out_local) pair
+    // Each thread computes a subset of (cout, out_local) pairs
     const int total_outputs = Cout * n_out;
+
+    // Get bin index for this batch element - only difference from V2!
+    const int bin_idx = bin_indices[b];
 
     for (int out_idx = tid; out_idx < total_outputs; out_idx += num_threads) {
         const int co = out_idx / n_out;
@@ -330,14 +321,18 @@ __global__ void block_diagonal_forward_binned_kernel(
         float acc = 0.0f;
         float acc_im = 0.0f;
 
-        // Sum over all input channels (using cached features and shared weights)
+        // Weight base: radial_table[bin_idx, co, :, :]
+        const scalar_t* w_base = radial_table + bin_idx * Cout * Cin * Wdim + co * Cin * Wdim;
+
+        // Sum over all input channels (using cached features)
         for (int64_t ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * in_size;
+            const scalar_t* w_ptr = w_base + ci * Wdim + w_off;
 
             if (m == 0) {
-                // Real block: dot product with shared weights
+                // Real block: dot product
                 for (int i = 0; i < n_in; i++) {
-                    acc += weight_shared[o_local * n_in + i] * f_ptr[i];
+                    acc += static_cast<float>(w_ptr[o_local * n_in + i]) * f_ptr[i];
                 }
             } else {
                 // Complex block: [a, b; -b, a] @ [f_re; f_im]
@@ -346,8 +341,8 @@ __global__ void block_diagonal_forward_binned_kernel(
                     const float f_im = f_ptr[n_in + i];
 
                     const int w_idx = (o_local * n_in + i) * 2;
-                    const float a = weight_shared[w_idx];
-                    const float bv = weight_shared[w_idx + 1];
+                    const float a = static_cast<float>(w_ptr[w_idx]);
+                    const float bv = static_cast<float>(w_ptr[w_idx + 1]);
 
                     acc += a * f_re + bv * f_im;
                     acc_im += a * f_im - bv * f_re;
@@ -371,12 +366,15 @@ __global__ void block_diagonal_forward_binned_kernel(
  * Uses two adjacent bin entries and interpolates:
  *   weight = (1 - t) * table[bin_lo] + t * table[bin_hi]
  *
+ * Table shape: (num_bins + 1, Cout, Cin, Wdim) - evaluated at bin edges for interpolation.
  * This provides smoother gradients for training.
+ *
+ * Identical to V2 kernel structure, but interpolates weights from two bin entries.
  */
 template <typename scalar_t>
 __global__ void block_diagonal_forward_binned_interp_kernel(
     const scalar_t* __restrict__ features,      // (B, Cin, Din)
-    const scalar_t* __restrict__ radial_table,  // (num_bins + 1, Wdim)
+    const scalar_t* __restrict__ radial_table,  // (num_bins + 1, Cout, Cin, Wdim)
     const int* __restrict__ bin_lo,             // (B,)
     const int* __restrict__ bin_hi,             // (B,)
     const scalar_t* __restrict__ interp_weight, // (B,)
@@ -407,16 +405,11 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
     const int w_off = block_w_off[blk];
 
     const int in_size = (m == 0) ? n_in : 2 * n_in;
-    const int w_block_size = (m == 0) ? (n_out * n_in) : (2 * n_out * n_in);
 
-    // Shared memory layout:
-    // [0, Cin * in_size): features
-    // [Cin * in_size, Cin * in_size + w_block_size): interpolated weights
-    extern __shared__ float shared[];
-    float* feat_shared = shared;
-    float* weight_shared = shared + Cin * in_size;
+    // Shared memory layout: features for all Cin channels
+    extern __shared__ float feat_shared[];
 
-    // Cooperatively load features
+    // Cooperatively load features into shared memory
     const int64_t feat_base = b * Cin * Din;
     const int total_feat_elems = Cin * in_size;
 
@@ -425,23 +418,18 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
         const int local_idx = i % in_size;
         feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
     }
+    __syncthreads();
 
-    // Load and interpolate weights
+    // Interpolation parameters for this batch element
     const int idx_lo = bin_lo[b];
     const int idx_hi = bin_hi[b];
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
 
-    const scalar_t* w_lo = radial_table + idx_lo * Wdim + w_off;
-    const scalar_t* w_hi = radial_table + idx_hi * Wdim + w_off;
+    // Table stride: Cout * Cin * Wdim elements per bin entry
+    const int64_t table_stride = Cout * Cin * Wdim;
 
-    for (int i = tid; i < w_block_size; i += num_threads) {
-        weight_shared[i] = one_minus_t * static_cast<float>(w_lo[i]) +
-                           t * static_cast<float>(w_hi[i]);
-    }
-    __syncthreads();
-
-    // Compute outputs (same as non-interpolated version)
+    // Each thread computes a subset of (cout, out_local) pairs
     const int total_outputs = Cout * n_out;
 
     for (int out_idx = tid; out_idx < total_outputs; out_idx += num_threads) {
@@ -451,21 +439,38 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
         float acc = 0.0f;
         float acc_im = 0.0f;
 
+        // Weight bases for low and high bin entries: table[idx, co, :, :]
+        const scalar_t* w_base_lo = radial_table + idx_lo * table_stride + co * Cin * Wdim;
+        const scalar_t* w_base_hi = radial_table + idx_hi * table_stride + co * Cin * Wdim;
+
+        // Sum over all input channels (using cached features)
         for (int64_t ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * in_size;
+            const scalar_t* w_ptr_lo = w_base_lo + ci * Wdim + w_off;
+            const scalar_t* w_ptr_hi = w_base_hi + ci * Wdim + w_off;
 
             if (m == 0) {
+                // Real block: dot product with interpolated weights
                 for (int i = 0; i < n_in; i++) {
-                    acc += weight_shared[o_local * n_in + i] * f_ptr[i];
+                    const float w_lo = static_cast<float>(w_ptr_lo[o_local * n_in + i]);
+                    const float w_hi = static_cast<float>(w_ptr_hi[o_local * n_in + i]);
+                    const float w = one_minus_t * w_lo + t * w_hi;
+                    acc += w * f_ptr[i];
                 }
             } else {
+                // Complex block: [a, b; -b, a] @ [f_re; f_im] with interpolated weights
                 for (int i = 0; i < n_in; i++) {
                     const float f_re = f_ptr[i];
                     const float f_im = f_ptr[n_in + i];
 
                     const int w_idx = (o_local * n_in + i) * 2;
-                    const float a = weight_shared[w_idx];
-                    const float bv = weight_shared[w_idx + 1];
+                    const float a_lo = static_cast<float>(w_ptr_lo[w_idx]);
+                    const float b_lo = static_cast<float>(w_ptr_lo[w_idx + 1]);
+                    const float a_hi = static_cast<float>(w_ptr_hi[w_idx]);
+                    const float b_hi = static_cast<float>(w_ptr_hi[w_idx + 1]);
+
+                    const float a = one_minus_t * a_lo + t * a_hi;
+                    const float bv = one_minus_t * b_lo + t * b_hi;
 
                     acc += a * f_re + bv * f_im;
                     acc_im += a * f_im - bv * f_re;
@@ -473,6 +478,7 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
             }
         }
 
+        // Write output
         const int64_t out_base = b * Cout * Dout + co * Dout + out_off;
         output[out_base + o_local] = static_cast<scalar_t>(acc);
         if (m > 0) {
@@ -1129,14 +1135,15 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_cuda(
     torch::Tensor block_out_off,
     torch::Tensor block_w_off,
     torch::Tensor block_in_size,
-    torch::Tensor block_w_size,  // weight block size for each m-block
+    torch::Tensor block_w_size,
     int64_t Cout,
     int dim_out
 ) {
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
     const int64_t Din = features.size(2);
-    const int64_t Wdim = radial_table.size(1);
+    // radial_table shape: (num_bins, Cout, Cin, Wdim)
+    const int64_t Wdim = radial_table.size(3);
     const int num_blocks = block_m.size(0);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
@@ -1145,10 +1152,9 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_cuda(
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
 
-    // Shared memory: Cin × max_in_size + max_w_size floats
+    // Shared memory: Cin × max_in_size floats (same as V2)
     const int max_in_size = block_in_size.max().item<int>();
-    const int max_w_size = block_w_size.max().item<int>();
-    const size_t shared_size = (Cin * max_in_size + max_w_size) * sizeof(float);
+    const size_t shared_size = Cin * max_in_size * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_forward_binned", ([&] {
         block_diagonal_forward_binned_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
@@ -1190,7 +1196,8 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
     const int64_t Din = features.size(2);
-    const int64_t Wdim = radial_table.size(1);
+    // radial_table shape: (num_bins + 1, Cout, Cin, Wdim)
+    const int64_t Wdim = radial_table.size(3);
     const int num_blocks = block_m.size(0);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
@@ -1199,10 +1206,9 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
 
-    // Shared memory: Cin × max_in_size + max_w_size floats
+    // Shared memory: Cin × max_in_size floats (same as V2)
     const int max_in_size = block_in_size.max().item<int>();
-    const int max_w_size = block_w_size.max().item<int>();
-    const size_t shared_size = (Cin * max_in_size + max_w_size) * sizeof(float);
+    const size_t shared_size = Cin * max_in_size * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_forward_binned_interp", ([&] {
         block_diagonal_forward_binned_interp_kernel<scalar_t><<<grid_size, threads, shared_size>>>(

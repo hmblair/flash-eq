@@ -321,11 +321,11 @@ def block_diagonal_binned_cuda(
     Apply block-diagonal multiplication with binned radial weights (no grad).
 
     This is a memory-efficient version where weights are stored per distance bin
-    instead of per edge. Memory reduction: O(num_bins) vs O(batch).
+    instead of per edge. Memory reduction factor: batch_size / num_bins.
 
     Args:
         features: (batch, channels_in, dim_in) - features in diagonal basis
-        radial_table: (num_bins, weight_dim) - lookup table of weights per bin
+        radial_table: (num_bins, channels_out, channels_in, weight_dim) - weights per bin
         bin_indices: (batch,) - bin index for each edge
         channels_out: Number of output channels
         metadata: Tuple from build_block_metadata()
@@ -369,7 +369,7 @@ def block_diagonal_binned_interp_cuda(
 
     Args:
         features: (batch, channels_in, dim_in) - features in diagonal basis
-        radial_table: (num_bins + 1, weight_dim) - lookup table evaluated at bin edges
+        radial_table: (num_bins + 1, channels_out, channels_in, weight_dim) - weights at bin edges
         bin_lo: (batch,) - lower bin index for each edge
         bin_hi: (batch,) - upper bin index for each edge
         interp_weight: (batch,) - interpolation weight (0 to 1)

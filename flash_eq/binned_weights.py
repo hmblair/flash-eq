@@ -178,11 +178,11 @@ class RadialBinning:
         Create lookup table by evaluating radial function at bin edges.
 
         Args:
-            radial_fn: Function mapping (N,) distances -> (N, weight_dim) weights
+            radial_fn: Function mapping (N,) distances -> (N, cout, cin, weight_dim) weights
             dtype: Output dtype (default: infer from radial_fn output)
 
         Returns:
-            (num_bins + 1, weight_dim) lookup table for interpolation
+            (num_bins + 1, cout, cin, weight_dim) lookup table for interpolation
         """
         table = radial_fn(self._bin_edges)
         if dtype is not None and table.dtype != dtype:
@@ -198,28 +198,30 @@ class BinnedRadialEmbedding(nn.Module):
     automatically when parameters change (checked via hash).
 
     Args:
-        radial_net: nn.Module mapping (N, 1) -> (N, weight_dim)
-        weight_dim: Output dimension of radial_net
+        radial_net: nn.Module mapping (N, 1) -> (N, cout, cin, weight_dim)
+        cout: Number of output channels
+        cin: Number of input channels
+        weight_dim: Weight dimension per channel pair
         num_bins: Number of distance bins
         min_dist: Minimum distance
         max_dist: Maximum distance
 
     Example:
-        radial_net = nn.Sequential(
-            nn.Linear(1, 64), nn.SiLU(),
-            nn.Linear(64, 64), nn.SiLU(),
-            nn.Linear(64, weight_dim)
-        )
-        embedding = BinnedRadialEmbedding(radial_net, weight_dim, num_bins=100)
+        # radial_net outputs (N, cout, cin, weight_dim) for N distances
+        radial_net = MyRadialNetwork(cout=64, cin=64, weight_dim=441)
+        embedding = BinnedRadialEmbedding(radial_net, cout=64, cin=64,
+                                          weight_dim=441, num_bins=100)
 
         # In forward pass:
-        radial_table = embedding.get_table()
+        radial_table = embedding.get_table()  # (num_bins+1, cout, cin, weight_dim)
         bin_data = embedding.binning.compute_bins(edge_lengths)
     """
 
     def __init__(
         self,
         radial_net: nn.Module,
+        cout: int,
+        cin: int,
         weight_dim: int,
         num_bins: int = 100,
         min_dist: float = 0.0,
@@ -227,6 +229,8 @@ class BinnedRadialEmbedding(nn.Module):
     ):
         super().__init__()
         self.radial_net = radial_net
+        self.cout = cout
+        self.cin = cin
         self.weight_dim = weight_dim
         self.binning = RadialBinning(num_bins, min_dist, max_dist)
 
@@ -254,7 +258,7 @@ class BinnedRadialEmbedding(nn.Module):
             device: Device for the table (default: same as radial_net)
 
         Returns:
-            (num_bins + 1, weight_dim) lookup table
+            (num_bins + 1, cout, cin, weight_dim) lookup table
         """
         if device is None:
             device = next(self.radial_net.parameters()).device
@@ -275,7 +279,7 @@ class BinnedRadialEmbedding(nn.Module):
             force_update: If True, always recompute table
 
         Returns:
-            (num_bins + 1, weight_dim) lookup table
+            (num_bins + 1, cout, cin, weight_dim) lookup table
         """
         current_hash = self._compute_param_hash()
 
@@ -292,7 +296,7 @@ class BinnedRadialEmbedding(nn.Module):
             distances: (batch,) tensor of edge lengths
 
         Returns:
-            radial_table: (num_bins + 1, weight_dim) lookup table
+            radial_table: (num_bins + 1, cout, cin, weight_dim) lookup table
             bin_data: BinData with indices and interpolation weights
         """
         radial_table = self.get_table()
@@ -312,15 +316,16 @@ def interpolate_weights(
     with the block-diagonal multiplication.
 
     Args:
-        table: (num_bins + 1, weight_dim) lookup table
+        table: (num_bins + 1, cout, cin, weight_dim) lookup table
         bin_data: BinData with lo, hi, weight
 
     Returns:
-        (batch, weight_dim) interpolated weights
+        (batch, cout, cin, weight_dim) interpolated weights
     """
-    w_lo = table[bin_data.lo]
-    w_hi = table[bin_data.hi]
-    t = bin_data.weight.unsqueeze(-1)
+    w_lo = table[bin_data.lo]  # (batch, cout, cin, weight_dim)
+    w_hi = table[bin_data.hi]  # (batch, cout, cin, weight_dim)
+    # Reshape weight for broadcasting: (batch,) -> (batch, 1, 1, 1)
+    t = bin_data.weight.view(-1, 1, 1, 1)
     return torch.lerp(w_lo, w_hi, t)
 
 

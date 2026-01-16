@@ -129,28 +129,52 @@ def test_validation():
     print("  test_validation: PASS")
 
 
+class SimpleRadialNet(nn.Module):
+    """Simple radial net that outputs (N, cout, cin, weight_dim) for testing."""
+    def __init__(self, cout, cin, weight_dim, hidden=32):
+        super().__init__()
+        self.cout = cout
+        self.cin = cin
+        self.weight_dim = weight_dim
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, cout * cin * weight_dim)
+        )
+
+    def forward(self, distances):
+        # distances: (N,) -> (N, cout, cin, weight_dim)
+        out = self.net(distances.unsqueeze(-1))
+        return out.view(-1, self.cout, self.cin, self.weight_dim)
+
+
 def test_embedding_creation():
     """Test BinnedRadialEmbedding creation."""
-    radial_net = nn.Sequential(nn.Linear(1, 32), nn.SiLU(), nn.Linear(32, 64))
-    embedding = BinnedRadialEmbedding(radial_net, weight_dim=64, num_bins=50)
-    assert embedding.weight_dim == 64
+    cout, cin, weight_dim = 4, 4, 16
+    radial_net = SimpleRadialNet(cout, cin, weight_dim)
+    embedding = BinnedRadialEmbedding(radial_net, cout=cout, cin=cin, weight_dim=weight_dim, num_bins=50)
+    assert embedding.weight_dim == weight_dim
+    assert embedding.cout == cout
+    assert embedding.cin == cin
     assert embedding.binning.num_bins == 50
     print("  test_embedding_creation: PASS")
 
 
 def test_embedding_get_table():
     """Test lookup table retrieval."""
-    radial_net = nn.Linear(1, 32)
-    embedding = BinnedRadialEmbedding(radial_net, weight_dim=32, num_bins=10)
+    cout, cin, weight_dim = 4, 4, 16
+    radial_net = SimpleRadialNet(cout, cin, weight_dim)
+    embedding = BinnedRadialEmbedding(radial_net, cout=cout, cin=cin, weight_dim=weight_dim, num_bins=10)
     table = embedding.get_table()
-    assert table.shape == (11, 32)
+    assert table.shape == (11, cout, cin, weight_dim)
     print("  test_embedding_get_table: PASS")
 
 
 def test_embedding_caching():
     """Test table caching."""
-    radial_net = nn.Linear(1, 32)
-    embedding = BinnedRadialEmbedding(radial_net, weight_dim=32, num_bins=10)
+    cout, cin, weight_dim = 4, 4, 16
+    radial_net = SimpleRadialNet(cout, cin, weight_dim)
+    embedding = BinnedRadialEmbedding(radial_net, cout=cout, cin=cin, weight_dim=weight_dim, num_bins=10)
     table1 = embedding.get_table()
     table2 = embedding.get_table()
     assert table1 is table2
@@ -159,15 +183,21 @@ def test_embedding_caching():
 
 def test_interpolate_weights():
     """Test Python weight interpolation."""
-    table = torch.arange(10).float().unsqueeze(-1).expand(-1, 5)
+    # table shape: (num_bins, cout, cin, weight_dim) = (10, 2, 2, 3)
+    num_bins, cout, cin, weight_dim = 10, 2, 2, 3
+    # Create table where values increase with bin index for easy verification
+    table = torch.arange(num_bins).float().view(num_bins, 1, 1, 1).expand(num_bins, cout, cin, weight_dim)
     bin_data = BinData(
         lo=torch.tensor([0, 2, 4]),
         hi=torch.tensor([1, 3, 5]),
         weight=torch.tensor([0.5, 0.5, 0.5]),
     )
     result = interpolate_weights(table, bin_data)
-    expected = torch.tensor([[0.5], [2.5], [4.5]]).expand(-1, 5)
-    assert torch.allclose(result, expected)
+    # Expected: interpolation gives 0.5, 2.5, 4.5 for all (cout, cin, weight_dim)
+    assert result.shape == (3, cout, cin, weight_dim)
+    assert torch.allclose(result[0], torch.full((cout, cin, weight_dim), 0.5))
+    assert torch.allclose(result[1], torch.full((cout, cin, weight_dim), 2.5))
+    assert torch.allclose(result[2], torch.full((cout, cin, weight_dim), 4.5))
     print("  test_interpolate_weights: PASS")
 
 
@@ -178,6 +208,7 @@ def test_binned_vs_full_correctness():
     dim = sum(2 * l + 1 for l in lvals)
     weight_dim = get_weight_dim(lvals, lvals)
     batch, cin, cout = 32, 16, 16
+    num_bins = 50
 
     metadata = build_block_metadata(lvals, lvals, device)
 
@@ -185,9 +216,10 @@ def test_binned_vs_full_correctness():
     torch.manual_seed(42)
     features = torch.randn(batch, cin, dim, device=device)
 
-    binning = RadialBinning(num_bins=50, max_dist=10.0, device=device)
+    binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
     distances = torch.rand(batch, device=device) * 10.0
-    radial_table = torch.randn(51, weight_dim, device=device)
+    # Table shape: (num_bins + 1, cout, cin, weight_dim)
+    radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device)
     bin_data = binning.compute_bins(distances)
 
     # Binned kernel
@@ -198,9 +230,9 @@ def test_binned_vs_full_correctness():
     )
 
     # Full kernel with expanded weights
+    # interpolate_weights returns (batch, cout, cin, weight_dim)
     weights_interp = interpolate_weights(radial_table, bin_data)
-    weights_full = weights_interp[:, None, None, :].expand(batch, cout, cin, weight_dim).contiguous()
-    output_full = block_diagonal_cuda(features, weights_full, metadata)
+    output_full = block_diagonal_cuda(features, weights_interp, metadata)
 
     assert_close(output_binned, output_full)
     print("  test_binned_vs_full_correctness: PASS")
@@ -213,12 +245,14 @@ def test_binned_output_shape():
     dim = sum(2 * l + 1 for l in lvals)
     weight_dim = get_weight_dim(lvals, lvals)
     batch, cin, cout = 64, 32, 32
+    num_bins = 100
 
     metadata = build_block_metadata(lvals, lvals, device)
     features = torch.randn(batch, cin, dim, device=device)
 
-    binning = RadialBinning(num_bins=100, device=device)
-    radial_table = torch.randn(101, weight_dim, device=device)
+    binning = RadialBinning(num_bins=num_bins, device=device)
+    # Table shape: (num_bins + 1, cout, cin, weight_dim)
+    radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device)
     bin_data = binning.compute_bins(torch.rand(batch, device=device) * 10.0)
 
     output = block_diagonal_binned_interp_cuda(
@@ -238,13 +272,15 @@ def test_binned_dtypes():
     dim = sum(2 * l + 1 for l in lvals)
     weight_dim = get_weight_dim(lvals, lvals)
     batch, cin, cout = 32, 16, 16
+    num_bins = 50
 
     metadata = build_block_metadata(lvals, lvals, device)
-    binning = RadialBinning(num_bins=50, device=device)
+    binning = RadialBinning(num_bins=num_bins, device=device)
 
     for dtype in [torch.float32, torch.float16]:
         features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
-        radial_table = torch.randn(51, weight_dim, device=device, dtype=dtype)
+        # Table shape: (num_bins + 1, cout, cin, weight_dim)
+        radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device, dtype=dtype)
         bin_data = binning.compute_bins(torch.rand(batch, device=device) * 10.0)
         bin_data.weight = bin_data.weight.to(dtype)
 

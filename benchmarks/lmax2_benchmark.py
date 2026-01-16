@@ -1,8 +1,7 @@
 """
-Benchmark full pipeline with ISOLATED memory measurement.
+Benchmark at various Lmax: LR-Binned vs LR-Full vs Dense.
 
-Each approach is measured in a separate function with full cleanup between them.
-Includes MLP forward pass time for fair comparison.
+Compares performance across different angular momentum values.
 """
 
 import torch
@@ -11,12 +10,11 @@ import gc
 from flash_eq.block_diagonal_cuda import (
     build_block_metadata,
     block_diagonal_cuda,
+    block_diagonal_binned_cuda,
     block_diagonal_binned_interp_cuda,
     get_weight_dim,
 )
-from flash_eq.binned_weights import (
-    RadialBinning,
-)
+from flash_eq.binned_weights import RadialBinning
 
 
 class RadialMLP(nn.Module):
@@ -36,7 +34,6 @@ class RadialMLP(nn.Module):
         )
 
     def forward(self, distances):
-        # distances: (N,) -> (N, cout, cin, weight_dim)
         out = self.net(distances.unsqueeze(-1))
         return out.view(-1, self.cout, self.cin, self.weight_dim)
 
@@ -65,14 +62,13 @@ def _build_m_order_permutation(lvals, device):
 
 
 def clear_memory():
-    """Aggressively clear GPU memory."""
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
 
-def benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_iter):
-    """Benchmark LR + Binned in isolation (includes MLP forward)."""
+def benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_iter, interp=False):
+    """Benchmark LR + Binned (includes MLP forward)."""
     clear_memory()
 
     device = torch.device("cuda")
@@ -82,42 +78,40 @@ def benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_ite
     metadata = build_block_metadata(lvals, lvals, device)
     perm = _build_m_order_permutation(lvals, device)
 
-    # Allocate only what binned approach needs
     P = _build_random_orthogonal(batch, dim, device, dtype)
     Q = _build_random_orthogonal(batch, dim, device, dtype)
     P_perm = P[:, :, perm]
     Q_perm = Q[:, :, perm]
 
-    # Radial MLP and binning
     radial_mlp = RadialMLP(cout, cin, weight_dim).to(device).to(dtype)
     binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
     edge_lengths = torch.rand(batch, device=device) * 10.0
 
-    # Print tensor sizes
-    print(f"    P,Q: 2 x {list(P.shape)} = {2 * P.numel() * P.element_size() / 1024**2:.1f} MB")
-    print(f"    radial_table: [{num_bins + 1}, {cout}, {cin}, {weight_dim}] = "
-          f"{(num_bins + 1) * cout * cin * weight_dim * (2 if dtype == torch.float16 else 4) / 1024**2:.1f} MB")
-    print(f"    MLP evals: {num_bins + 1} (vs {batch} for full)")
+    if interp:
+        def forward():
+            radial_table = radial_mlp(binning.bin_edges)
+            bin_data = binning.compute_bins(edge_lengths)
+            features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
+            f_diag = torch.bmm(P_perm.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
+            out_diag = block_diagonal_binned_interp_cuda(
+                f_diag, radial_table, bin_data.lo, bin_data.hi, bin_data.weight.to(dtype), cout, metadata
+            )
+            return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
+    else:
+        def forward():
+            radial_table = radial_mlp(binning.bin_edges)
+            bin_indices = binning.compute_indices(edge_lengths)
+            features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
+            f_diag = torch.bmm(P_perm.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
+            out_diag = block_diagonal_binned_cuda(
+                f_diag, radial_table, bin_indices, cout, metadata
+            )
+            return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
 
-    def forward():
-        # 1. Compute radial table from MLP (only num_bins+1 evaluations!)
-        radial_table = radial_mlp(binning.bin_edges)
-        # 2. Compute bin indices
-        bin_data = binning.compute_bins(edge_lengths)
-        # 3. Forward pass
-        features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
-        f_diag = torch.bmm(P_perm.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
-        out_diag = block_diagonal_binned_interp_cuda(
-            f_diag, radial_table, bin_data.lo, bin_data.hi, bin_data.weight.to(dtype), cout, metadata
-        )
-        return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
-
-    # Warmup
     for _ in range(n_warmup):
         forward()
     torch.cuda.synchronize()
 
-    # Measure
     torch.cuda.reset_peak_memory_stats()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -134,7 +128,7 @@ def benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_ite
 
 
 def benchmark_lr_full(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
-    """Benchmark LR + Full weights in isolation (includes MLP forward)."""
+    """Benchmark LR + Full weights (includes MLP forward)."""
     clear_memory()
 
     device = torch.device("cuda")
@@ -149,30 +143,20 @@ def benchmark_lr_full(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
     P_perm = P[:, :, perm]
     Q_perm = Q[:, :, perm]
 
-    # Radial MLP - must evaluate at ALL batch edge lengths
     radial_mlp = RadialMLP(cout, cin, weight_dim).to(device).to(dtype)
     edge_lengths = torch.rand(batch, device=device) * 10.0
 
-    print(f"    P,Q: 2 x {list(P.shape)} = {2 * P.numel() * P.element_size() / 1024**2:.1f} MB")
-    print(f"    full_weights: [{batch}, {cout}, {cin}, {weight_dim}] = "
-          f"{batch * cout * cin * weight_dim * (2 if dtype == torch.float16 else 4) / 1024**2:.1f} MB")
-    print(f"    MLP evals: {batch}")
-
     def forward():
-        # 1. Compute weights from MLP (batch evaluations - expensive!)
         full_weights = radial_mlp(edge_lengths)
-        # 2. Forward pass
         features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
         f_diag = torch.bmm(P_perm.transpose(-1, -2), features.transpose(-1, -2)).transpose(-1, -2)
         out_diag = block_diagonal_cuda(f_diag, full_weights, metadata)
         return torch.bmm(Q_perm, out_diag.transpose(-1, -2)).transpose(-1, -2)
 
-    # Warmup
     for _ in range(n_warmup):
         forward()
     torch.cuda.synchronize()
 
-    # Measure
     torch.cuda.reset_peak_memory_stats()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -189,7 +173,7 @@ def benchmark_lr_full(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
 
 
 def benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
-    """Benchmark Dense baseline in isolation."""
+    """Benchmark Dense baseline."""
     clear_memory()
 
     device = torch.device("cuda")
@@ -202,9 +186,6 @@ def benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
     basis = torch.randn(batch, dim, freq_sum, dim, device=device, dtype=dtype)
     radial = torch.randn(batch, cout, cin * freq_sum, device=device, dtype=dtype)
 
-    print(f"    basis: {list(basis.shape)} = {basis.numel() * basis.element_size() / 1024**2:.1f} MB")
-    print(f"    radial: {list(radial.shape)} = {radial.numel() * radial.element_size() / 1024**2:.1f} MB")
-
     def forward():
         features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
         basis_view = basis.view(batch, dim, -1)
@@ -212,12 +193,10 @@ def benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
         tmp = tmp.view(batch, -1, dim)
         return radial @ tmp
 
-    # Warmup
     for _ in range(n_warmup):
         forward()
     torch.cuda.synchronize()
 
-    # Measure
     torch.cuda.reset_peak_memory_stats()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -235,67 +214,63 @@ def benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter):
 
 def main():
     print("=" * 100)
-    print("Full Pipeline Benchmark (Isolated Memory Measurement)")
+    print("Binned Weights Benchmark: LR-Binned vs LR-Full vs Dense")
     print("=" * 100)
     print(f"\nDevice: {torch.cuda.get_device_name()}")
     print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-
-    configs = [
-        # (lmax, batch, cin, cout)
-        (6, 1000, 64, 64),
-        (6, 5000, 64, 64),
-        (6, 5000, 32, 32),
-        (6, 10000, 32, 32),
-    ]
 
     num_bins = 100
     dtype = torch.float32
     n_warmup = 5
     n_iter = 20
 
-    for lmax, batch, cin, cout in configs:
+    for lmax in [2, 4, 6]:
+        lvals = list(range(lmax + 1))
+        dim = sum(2 * l + 1 for l in lvals)
+        weight_dim = get_weight_dim(lvals, lvals)
+
         print(f"\n{'='*100}")
-        print(f"Config: L={lmax}, B={batch}, C={cin}x{cout}")
+        print(f"Lmax={lmax}: dim={dim}, weight_dim={weight_dim}")
         print("=" * 100)
 
-        # LR + Binned
-        print("\n[LR-Binned] Allocating tensors:")
-        try:
-            r_binned = benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_iter)
-            print(f"  -> Time: {r_binned['time_ms']:.2f} ms, Peak Memory: {r_binned['peak_mem_mb']:.1f} MB")
-        except Exception as e:
-            print(f"  -> FAILED: {e}")
-            r_binned = None
-        clear_memory()
+        configs = [
+            (5000, 32, 32),
+            (5000, 64, 64),
+            (10000, 32, 32),
+        ]
 
-        # LR + Full
-        print("\n[LR-Full] Allocating tensors:")
-        try:
-            r_full = benchmark_lr_full(lmax, batch, cin, cout, dtype, n_warmup, n_iter)
-            print(f"  -> Time: {r_full['time_ms']:.2f} ms, Peak Memory: {r_full['peak_mem_mb']:.1f} MB")
-        except Exception as e:
-            print(f"  -> FAILED: {e}")
-            r_full = None
-        clear_memory()
+        print(f"\n{'Config':<25} {'Binned(NN)':>12} {'LR-Full':>12} {'Dense':>12} {'vs Full':>10} {'vs Dense':>10}")
+        print("-" * 90)
 
-        # Dense
-        print("\n[Dense] Allocating tensors:")
-        try:
-            r_dense = benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter)
-            print(f"  -> Time: {r_dense['time_ms']:.2f} ms, Peak Memory: {r_dense['peak_mem_mb']:.1f} MB")
-        except Exception as e:
-            print(f"  -> FAILED: {e}")
-            r_dense = None
-        clear_memory()
+        for batch, cin, cout in configs:
+            config_str = f"B={batch}, C={cin}x{cout}"
 
-        # Summary
-        print(f"\n--- Summary for L={lmax}, B={batch}, C={cin}x{cout} ---")
-        if r_binned and r_full:
-            print(f"  Speedup vs LR-Full: {r_full['time_ms']/r_binned['time_ms']:.2f}x")
-            print(f"  Memory reduction vs LR-Full: {r_full['peak_mem_mb']/r_binned['peak_mem_mb']:.2f}x")
-        if r_binned and r_dense:
-            print(f"  Speedup vs Dense: {r_dense['time_ms']/r_binned['time_ms']:.2f}x")
-            print(f"  Memory reduction vs Dense: {r_dense['peak_mem_mb']/r_binned['peak_mem_mb']:.2f}x")
+            try:
+                r_binned = benchmark_lr_binned(lmax, batch, cin, cout, num_bins, dtype, n_warmup, n_iter, interp=False)
+            except Exception as e:
+                print(f"{config_str:<25} BINNED FAILED: {e}")
+                r_binned = None
+            clear_memory()
+
+            try:
+                r_full = benchmark_lr_full(lmax, batch, cin, cout, dtype, n_warmup, n_iter)
+            except Exception as e:
+                print(f"{config_str:<25} FULL FAILED: {e}")
+                r_full = None
+            clear_memory()
+
+            try:
+                r_dense = benchmark_dense(lmax, batch, cin, cout, dtype, n_warmup, n_iter)
+            except Exception as e:
+                print(f"{config_str:<25} DENSE FAILED: {e}")
+                r_dense = None
+            clear_memory()
+
+            if r_binned and r_full and r_dense:
+                speedup_full = r_full['time_ms'] / r_binned['time_ms']
+                speedup_dense = r_dense['time_ms'] / r_binned['time_ms']
+                print(f"{config_str:<25} {r_binned['time_ms']:>10.2f}ms {r_full['time_ms']:>10.2f}ms "
+                      f"{r_dense['time_ms']:>10.2f}ms {speedup_full:>9.2f}x {speedup_dense:>9.2f}x")
 
     print("\n" + "=" * 100)
 

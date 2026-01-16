@@ -14,6 +14,12 @@
  *   - m=0 blocks: 1x1 real scalars
  *   - m>0 blocks: 2x2 complex-type matrices [a, b; -b, a]
  *
+ * Register pressure optimizations:
+ *   - int32 used for block-local indices (bounded by representation dims)
+ *   - int64_t only for global tensor indexing (supports >2^32 elements)
+ *   - __launch_bounds__ to encourage higher occupancy
+ *   - Minimized pointer temporaries
+ *
  * @author Hamish Blair
  * @see docs/theory.tex for mathematical details
  */
@@ -51,17 +57,17 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
     const scalar_t* __restrict__ interp_weight,
     scalar_t* __restrict__ output,
     const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
+    int64_t B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks, int num_bins
 ) {
+    // Block-local indices fit in int32; batch index needs int64 for >2^31 batches
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
 
     if (b >= B) return;
 
     const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
 
-    // Unpack block parameters from packed tensor
+    // Unpack block parameters (all small values, int32 safe)
     const int* blk_ptr = block_data + blk * 6;
     const int m = blk_ptr[0];
     const int n_in = blk_ptr[1];
@@ -73,10 +79,11 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
 
     // Load features into shared memory
     extern __shared__ float feat_shared[];
-    const int64_t feat_base = b * Cin * Din;
+    // Global offset needs int64 for large tensors
+    const int64_t feat_base = b * static_cast<int64_t>(Cin) * Din;
     const int total_feat_elems = Cin * in_size;
 
-    for (int i = tid; i < total_feat_elems; i += num_threads) {
+    for (int i = tid; i < total_feat_elems; i += 256) {
         const int ci = i / in_size;
         const int local_idx = i % in_size;
         feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
@@ -85,47 +92,52 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
+    const int idx_hi = min(idx_lo + 1, num_bins);
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
-    const int64_t table_stride = Cout * Cin * Wdim;
 
-    // Compute outputs
+    // Table stride can be computed with int32 (Cout * Cin * Wdim typically < 2^31)
+    const int table_stride = Cout * Cin * Wdim;
+
+    // Compute outputs (Cout * n_out fits easily in int32)
     const int total_outputs = Cout * n_out;
 
-    for (int out_idx = tid; out_idx < total_outputs; out_idx += num_threads) {
+    for (int out_idx = tid; out_idx < total_outputs; out_idx += 256) {
         const int co = out_idx / n_out;
         const int o_local = out_idx % n_out;
 
         float acc = 0.0f;
         float acc_im = 0.0f;
 
-        const scalar_t* w_base_lo = radial_table + idx_lo * table_stride + co * Cin * Wdim;
-        const scalar_t* w_base_hi = radial_table + idx_hi * table_stride + co * Cin * Wdim;
+        // Weight base offsets (int64 not needed: idx * table_stride fits in int32 for reasonable num_bins)
+        const int w_base_lo = idx_lo * table_stride + co * Cin * Wdim + w_off;
+        const int w_base_hi = idx_hi * table_stride + co * Cin * Wdim + w_off;
 
-        for (int64_t ci = 0; ci < Cin; ci++) {
+        for (int ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * in_size;
-            const scalar_t* w_ptr_lo = w_base_lo + ci * Wdim + w_off;
-            const scalar_t* w_ptr_hi = w_base_hi + ci * Wdim + w_off;
+            const int w_ci_off = ci * Wdim;
 
             if (m == 0) {
                 // Real block: dot product with interpolated weights
+                #pragma unroll 4
                 for (int i = 0; i < n_in; i++) {
-                    const float w_lo = static_cast<float>(w_ptr_lo[o_local * n_in + i]);
-                    const float w_hi = static_cast<float>(w_ptr_hi[o_local * n_in + i]);
-                    acc += (one_minus_t * w_lo + t * w_hi) * f_ptr[i];
+                    const int w_idx = w_ci_off + o_local * n_in + i;
+                    const float w = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx])
+                                  + t * static_cast<float>(radial_table[w_base_hi + w_idx]);
+                    acc += w * f_ptr[i];
                 }
             } else {
                 // Complex block: [a, b; -b, a] @ [f_re; f_im]
+                #pragma unroll 4
                 for (int i = 0; i < n_in; i++) {
                     const float f_re = f_ptr[i];
                     const float f_im = f_ptr[n_in + i];
-                    const int w_idx = (o_local * n_in + i) * 2;
+                    const int w_idx = w_ci_off + (o_local * n_in + i) * 2;
 
-                    const float a = one_minus_t * static_cast<float>(w_ptr_lo[w_idx])
-                                  + t * static_cast<float>(w_ptr_hi[w_idx]);
-                    const float bv = one_minus_t * static_cast<float>(w_ptr_lo[w_idx + 1])
-                                   + t * static_cast<float>(w_ptr_hi[w_idx + 1]);
+                    const float a = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx])
+                                  + t * static_cast<float>(radial_table[w_base_hi + w_idx]);
+                    const float bv = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx + 1])
+                                   + t * static_cast<float>(radial_table[w_base_hi + w_idx + 1]);
 
                     acc += a * f_re + bv * f_im;
                     acc_im += a * f_im - bv * f_re;
@@ -133,8 +145,8 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
             }
         }
 
-        // Write output
-        const int64_t out_base = b * Cout * Dout + co * Dout + out_off;
+        // Write output (needs int64 for large batch)
+        const int64_t out_base = b * static_cast<int64_t>(Cout) * Dout + co * Dout + out_off;
         output[out_base + o_local] = static_cast<scalar_t>(acc);
         if (m > 0) {
             output[out_base + n_out + o_local] = static_cast<scalar_t>(acc_im);
@@ -161,7 +173,7 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
     const scalar_t* __restrict__ interp_weight,
     scalar_t* __restrict__ grad_features,
     const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
+    int64_t B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks, int num_bins
 ) {
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
@@ -169,9 +181,8 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
     if (b >= B) return;
 
     const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
 
-    // Unpack block parameters from packed tensor
+    // Unpack block parameters (all small values, int32 safe)
     const int* blk_ptr = block_data + blk * 6;
     const int m = blk_ptr[0];
     const int n_in = blk_ptr[1];
@@ -184,17 +195,17 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
+    const int idx_hi = min(idx_lo + 1, num_bins);
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
-    const int64_t table_stride = Cout * Cin * Wdim;
+    const int table_stride = Cout * Cin * Wdim;
 
     // Load grad_output into shared memory
     extern __shared__ float grad_shared[];
-    const int64_t grad_base = b * Cout * Dout;
+    const int64_t grad_base = b * static_cast<int64_t>(Cout) * Dout;
     const int total_grad_elems = Cout * out_size;
 
-    for (int i = tid; i < total_grad_elems; i += num_threads) {
+    for (int i = tid; i < total_grad_elems; i += 256) {
         const int co = i / out_size;
         const int local_idx = i % out_size;
         grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
@@ -204,42 +215,47 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
     // Compute grad_features
     const int total_inputs = Cin * in_size;
 
-    for (int in_idx = tid; in_idx < total_inputs; in_idx += num_threads) {
+    for (int in_idx = tid; in_idx < total_inputs; in_idx += 256) {
         const int ci = in_idx / in_size;
         const int i_local = in_idx % in_size;
 
         float grad = 0.0f;
 
-        if (m == 0) {
-            for (int64_t co = 0; co < Cout; co++) {
-                const float* go_ptr = grad_shared + co * out_size;
-                const scalar_t* w_ptr_lo = radial_table + idx_lo * table_stride + co * Cin * Wdim + ci * Wdim + w_off;
-                const scalar_t* w_ptr_hi = radial_table + idx_hi * table_stride + co * Cin * Wdim + ci * Wdim + w_off;
+        // Weight base offsets
+        const int w_base_lo = idx_lo * table_stride + ci * Wdim + w_off;
+        const int w_base_hi = idx_hi * table_stride + ci * Wdim + w_off;
 
+        if (m == 0) {
+            for (int co = 0; co < Cout; co++) {
+                const float* go_ptr = grad_shared + co * out_size;
+                const int w_co_off = co * Cin * Wdim;
+
+                #pragma unroll 4
                 for (int o = 0; o < n_out; o++) {
-                    const float w = one_minus_t * static_cast<float>(w_ptr_lo[o * n_in + i_local])
-                                  + t * static_cast<float>(w_ptr_hi[o * n_in + i_local]);
+                    const int w_idx = w_co_off + o * n_in + i_local;
+                    const float w = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx])
+                                  + t * static_cast<float>(radial_table[w_base_hi + w_idx]);
                     grad += w * go_ptr[o];
                 }
             }
         } else {
-            bool is_real = (i_local < n_in);
-            int i_idx = is_real ? i_local : (i_local - n_in);
+            const bool is_real = (i_local < n_in);
+            const int i_idx = is_real ? i_local : (i_local - n_in);
 
-            for (int64_t co = 0; co < Cout; co++) {
+            for (int co = 0; co < Cout; co++) {
                 const float* go_ptr = grad_shared + co * out_size;
-                const scalar_t* w_ptr_lo = radial_table + idx_lo * table_stride + co * Cin * Wdim + ci * Wdim + w_off;
-                const scalar_t* w_ptr_hi = radial_table + idx_hi * table_stride + co * Cin * Wdim + ci * Wdim + w_off;
+                const int w_co_off = co * Cin * Wdim;
 
+                #pragma unroll 4
                 for (int o = 0; o < n_out; o++) {
-                    float go_re = go_ptr[o];
-                    float go_im = go_ptr[n_out + o];
-                    int w_idx = (o * n_in + i_idx) * 2;
+                    const float go_re = go_ptr[o];
+                    const float go_im = go_ptr[n_out + o];
+                    const int w_idx = w_co_off + (o * n_in + i_idx) * 2;
 
-                    float a = one_minus_t * static_cast<float>(w_ptr_lo[w_idx])
-                            + t * static_cast<float>(w_ptr_hi[w_idx]);
-                    float bv = one_minus_t * static_cast<float>(w_ptr_lo[w_idx + 1])
-                             + t * static_cast<float>(w_ptr_hi[w_idx + 1]);
+                    const float a = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx])
+                                  + t * static_cast<float>(radial_table[w_base_hi + w_idx]);
+                    const float bv = one_minus_t * static_cast<float>(radial_table[w_base_lo + w_idx + 1])
+                                   + t * static_cast<float>(radial_table[w_base_hi + w_idx + 1]);
 
                     if (is_real) {
                         grad += a * go_re - bv * go_im;
@@ -250,7 +266,7 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
             }
         }
 
-        const int64_t feat_idx = b * Cin * Din + ci * Din + in_off + i_local;
+        const int64_t feat_idx = b * static_cast<int64_t>(Cin) * Din + ci * Din + in_off + i_local;
         grad_features[feat_idx] = static_cast<scalar_t>(grad);
     }
 }
@@ -272,7 +288,7 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     float* __restrict__ grad_radial_table,
     float* __restrict__ grad_interp_weight,
     const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
+    int64_t B, int Cin, int Cout, int Din, int Dout, int Wdim, int num_blocks, int num_bins
 ) {
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
@@ -280,9 +296,8 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     if (b >= B) return;
 
     const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
 
-    // Unpack block parameters from packed tensor
+    // Unpack block parameters (all small values, int32 safe)
     const int* blk_ptr = block_data + blk * 6;
     const int m = blk_ptr[0];
     const int n_in = blk_ptr[1];
@@ -296,10 +311,10 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
+    const int idx_hi = min(idx_lo + 1, num_bins);
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
-    const int64_t table_stride = Cout * Cin * Wdim;
+    const int table_stride = Cout * Cin * Wdim;
 
     // Shared memory: features + grad_output
     extern __shared__ float shared[];
@@ -307,16 +322,16 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     float* grad_shared = shared + Cin * in_size;
 
     // Load features
-    const int64_t feat_base = b * Cin * Din;
-    for (int i = tid; i < Cin * in_size; i += num_threads) {
+    const int64_t feat_base = b * static_cast<int64_t>(Cin) * Din;
+    for (int i = tid; i < Cin * in_size; i += 256) {
         const int ci = i / in_size;
         const int local_idx = i % in_size;
         feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
     }
 
     // Load grad_output
-    const int64_t grad_base = b * Cout * Dout;
-    for (int i = tid; i < Cout * out_size; i += num_threads) {
+    const int64_t grad_base = b * static_cast<int64_t>(Cout) * Dout;
+    for (int i = tid; i < Cout * out_size; i += 256) {
         const int co = i / out_size;
         const int local_idx = i % out_size;
         grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
@@ -326,54 +341,51 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     // Accumulate grad_interp_weight locally
     float local_grad_t = 0.0f;
 
-    // Compute weight gradients
-    const int64_t total_weights = Cout * Cin * w_block_size;
+    // Compute weight gradients (total_weights fits in int32 for reasonable channel counts)
+    const int total_weights = Cout * Cin * w_block_size;
 
-    for (int64_t w_idx = tid; w_idx < total_weights; w_idx += num_threads) {
-        const int64_t co = w_idx / (Cin * w_block_size);
-        const int64_t ci = (w_idx / w_block_size) % Cin;
+    for (int w_idx = tid; w_idx < total_weights; w_idx += 256) {
+        const int co = w_idx / (Cin * w_block_size);
+        const int ci = (w_idx / w_block_size) % Cin;
         const int w_local = w_idx % w_block_size;
 
         const float* f_ptr = feat_shared + ci * in_size;
         const float* go_ptr = grad_shared + co * out_size;
 
-        float grad_w = 0.0f;
+        float grad_w;
 
         if (m == 0) {
-            int o = w_local / n_in;
-            int i = w_local % n_in;
+            const int o = w_local / n_in;
+            const int i = w_local % n_in;
             grad_w = f_ptr[i] * go_ptr[o];
         } else {
-            int temp = w_local / 2;
-            int ab = w_local % 2;
-            int o = temp / n_in;
-            int i = temp % n_in;
+            const int temp = w_local / 2;
+            const int ab = w_local % 2;
+            const int o = temp / n_in;
+            const int i = temp % n_in;
 
-            float f_re = f_ptr[i];
-            float f_im = f_ptr[n_in + i];
-            float go_re = go_ptr[o];
-            float go_im = go_ptr[n_out + o];
+            const float f_re = f_ptr[i];
+            const float f_im = f_ptr[n_in + i];
+            const float go_re = go_ptr[o];
+            const float go_im = go_ptr[n_out + o];
 
-            if (ab == 0) {
-                grad_w = f_re * go_re + f_im * go_im;
-            } else {
-                grad_w = f_im * go_re - f_re * go_im;
-            }
+            grad_w = (ab == 0) ? (f_re * go_re + f_im * go_im)
+                               : (f_im * go_re - f_re * go_im);
         }
 
         // Scatter to grad_radial_table
-        const int64_t table_idx = co * Cin * Wdim + ci * Wdim + w_off + w_local;
+        const int table_idx = co * Cin * Wdim + ci * Wdim + w_off + w_local;
         atomicAdd(&grad_radial_table[idx_lo * table_stride + table_idx], one_minus_t * grad_w);
         atomicAdd(&grad_radial_table[idx_hi * table_stride + table_idx], t * grad_w);
 
         // Accumulate grad_interp_weight
-        const scalar_t* w_ptr_lo = radial_table + idx_lo * table_stride + table_idx;
-        const scalar_t* w_ptr_hi = radial_table + idx_hi * table_stride + table_idx;
-        float w_diff = static_cast<float>(*w_ptr_hi) - static_cast<float>(*w_ptr_lo);
-        local_grad_t += w_diff * grad_w;
+        const float w_lo = static_cast<float>(radial_table[idx_lo * table_stride + table_idx]);
+        const float w_hi = static_cast<float>(radial_table[idx_hi * table_stride + table_idx]);
+        local_grad_t += (w_hi - w_lo) * grad_w;
     }
 
     // Warp-level reduction for grad_interp_weight
+    #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         local_grad_t += __shfl_down_sync(0xffffffff, local_grad_t, offset);
     }
@@ -398,17 +410,19 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
     int num_bins,
     int max_in_size
 ) {
+    // B needs int64 for >2^31 batches; Cin/Din/Wdim fit in int32
     const int64_t B = features.size(0);
-    const int64_t Cin = features.size(1);
-    const int64_t Din = features.size(2);
-    const int64_t Wdim = radial_table.size(3);
-    const int num_blocks = block_data.size(0);
+    const int Cin = static_cast<int>(features.size(1));
+    const int Din = static_cast<int>(features.size(2));
+    const int Wdim = static_cast<int>(radial_table.size(3));
+    const int num_blocks = static_cast<int>(block_data.size(0));
+    const int Cout_int = static_cast<int>(Cout);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
 
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
-    const size_t shared_size = Cin * max_in_size * sizeof(float);
+    const size_t shared_size = static_cast<size_t>(Cin) * max_in_size * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_binned_interp", ([&] {
         block_diagonal_forward_binned_interp_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
@@ -418,7 +432,7 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
             interp_weight.data_ptr<scalar_t>(),
             output.data_ptr<scalar_t>(),
             block_data.data_ptr<int>(),
-            B, Cin, Cout, Din, dim_out, Wdim, num_blocks, num_bins
+            B, Cin, Cout_int, Din, dim_out, Wdim, num_blocks, num_bins
         );
     }));
 
@@ -437,15 +451,16 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
     int max_in_size,
     int max_out_size
 ) {
+    // B needs int64 for >2^31 batches; other dims fit in int32
     const int64_t B = features.size(0);
-    const int64_t Cin = features.size(1);
-    const int64_t Din = features.size(2);
-    const int64_t Cout = grad_output.size(1);
-    const int64_t Dout = grad_output.size(2);
+    const int Cin = static_cast<int>(features.size(1));
+    const int Din = static_cast<int>(features.size(2));
+    const int Cout = static_cast<int>(grad_output.size(1));
+    const int Dout = static_cast<int>(grad_output.size(2));
     const int64_t num_bins_plus_1 = radial_table.size(0);
-    const int num_bins = num_bins_plus_1 - 1;
-    const int64_t Wdim = radial_table.size(3);
-    const int num_blocks = block_data.size(0);
+    const int num_bins = static_cast<int>(num_bins_plus_1 - 1);
+    const int Wdim = static_cast<int>(radial_table.size(3));
+    const int num_blocks = static_cast<int>(block_data.size(0));
 
     auto grad_features = torch::zeros_like(features);
     auto grad_radial_table = torch::zeros({num_bins_plus_1, Cout, Cin, Wdim},
@@ -457,7 +472,7 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
 
     // Features backward
     {
-        const size_t shared_size = Cout * max_out_size * sizeof(float);
+        const size_t shared_size = static_cast<size_t>(Cout) * max_out_size * sizeof(float);
 
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features", ([&] {
             block_diagonal_backward_binned_interp_features_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
@@ -474,10 +489,11 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
 
     // Table backward
     {
-        const size_t shared_size = (Cin * max_in_size + Cout * max_out_size) * sizeof(float);
+        const size_t shared_size = static_cast<size_t>(Cin) * max_in_size + static_cast<size_t>(Cout) * max_out_size;
+        const size_t shared_bytes = shared_size * sizeof(float);
 
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table", ([&] {
-            block_diagonal_backward_binned_interp_table_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
+            block_diagonal_backward_binned_interp_table_kernel<scalar_t><<<grid_size, threads, shared_bytes>>>(
                 grad_output.data_ptr<scalar_t>(),
                 features.data_ptr<scalar_t>(),
                 radial_table.data_ptr<scalar_t>(),

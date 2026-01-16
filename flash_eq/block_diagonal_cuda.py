@@ -9,6 +9,7 @@ The binned approach precomputes weights at K bin edges and interpolates at
 runtime, avoiding the O(B * Cout * Cin * Wdim) memory bottleneck.
 
 Supports FP16, FP32, and FP64 with FP32 accumulation for numerical stability.
+Uses int64 indexing for batch dimension to support >2^31 edges.
 """
 
 import os

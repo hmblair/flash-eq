@@ -183,4 +183,30 @@ In the low-rank approach:
 \end{itemize}
 Overall complexity: $\mathcal{O}(\lmax^6)$ time and $\mathcal{O}(\lmax^4)$ space.
 
+
+\subsection{Binned Radial Weights}
+
+In molecular networks, the radial weights $\Lambda$ are typically parameterized by a neural network $\phi : \R_{\geq 0} \to \R^d$ that maps interatomic distances to weight vectors. For a batch of $B$ edges, the naive approach requires $B$ forward passes through $\phi$, and the resulting weight tensor of shape $(B, n, m, d)$ dominates memory usage during training.
+
+\textbf{Observation.} The radial function $\phi$ is typically smooth and slowly varying. We can exploit this by discretizing the distance domain and using interpolation.
+
+\textbf{Binned approach.} Partition $[0, r_{\max}]$ into $K$ bins with edges $0 = r_0 < r_1 < \cdots < r_K = r_{\max}$. Precompute a lookup table
+\begin{align*}
+	T_k = \phi(r_k) \in \R^{n \times m \times d}, \qquad k = 0, 1, \ldots, K.
+\end{align*}
+For an edge with distance $r \in [r_k, r_{k+1}]$, compute the interpolation weight $t = (r - r_k)/(r_{k+1} - r_k)$ and approximate
+\begin{align*}
+	\phi(r) \approx (1 - t) \, T_k + t \, T_{k+1}.
+\end{align*}
+
+\textbf{Complexity reduction.} This reduces MLP evaluations from $\mathcal{O}(B)$ to $\mathcal{O}(K)$, where typically $K \ll B$. More importantly, the weight tensor is never materialized: the fused CUDA kernel performs interpolation on-the-fly during the block-diagonal multiplication, reducing memory from $\mathcal{O}(B \cdot nmd)$ to $\mathcal{O}(K \cdot nmd)$.
+
+\textbf{Gradient computation.} The interpolation is differentiable. During backpropagation, gradients with respect to the lookup table $T$ are computed via weighted scatter-add:
+\begin{align*}
+	\frac{\partial \mathcal{L}}{\partial T_k} = \sum_{i : r_i \in [r_{k-1}, r_k]} (1 - t_i) \frac{\partial \mathcal{L}}{\partial \phi(r_i)} + \sum_{i : r_i \in [r_k, r_{k+1}]} t_i \frac{\partial \mathcal{L}}{\partial \phi(r_i)}.
+\end{align*}
+This is implemented with atomic operations for efficiency. Gradients also flow through the interpolation weights $t$ to the distances $r$, enabling force computation.
+
+\textbf{Accuracy.} For smooth radial functions, linear interpolation with $K = 100$ bins typically achieves relative error below $0.1\%$, which is negligible compared to other sources of approximation in neural network training.
+
 \end{document}

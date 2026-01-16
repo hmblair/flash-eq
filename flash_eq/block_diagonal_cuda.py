@@ -114,8 +114,15 @@ def build_block_metadata(
         dtype=torch.int32, device=device
     )
 
+    # block_w_size: weight block size for each m-block (for binned kernel)
+    block_w_size = torch.tensor(
+        [b['n_out'] * b['n_in'] if b['m'] == 0 else 2 * b['n_out'] * b['n_in'] for b in blocks],
+        dtype=torch.int32, device=device
+    )
+
     return (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-            block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out)
+            block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+            block_w_size, dim_out)
 
 
 class BlockDiagonalFunction(Function):
@@ -124,7 +131,7 @@ class BlockDiagonalFunction(Function):
     @staticmethod
     def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, block_out_size, dim_out):
+                out_to_local, block_in_size, block_out_size, block_w_size, dim_out):
         cuda_module = _get_cuda_module()
 
         # Use V2 (m-block parallel) kernel for forward pass
@@ -163,7 +170,7 @@ class BlockDiagonalFunction(Function):
             ctx.dim_in
         )
 
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class BlockDiagonalFunctionV1(Function):
@@ -172,7 +179,7 @@ class BlockDiagonalFunctionV1(Function):
     @staticmethod
     def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
                 block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, block_out_size, dim_out):
+                out_to_local, block_in_size, block_out_size, block_w_size, dim_out):
         cuda_module = _get_cuda_module()
 
         output, = cuda_module.forward(
@@ -206,7 +213,7 @@ class BlockDiagonalFunctionV1(Function):
             ctx.dim_in
         )
 
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None
+        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def block_diagonal_cuda(
@@ -233,12 +240,13 @@ def block_diagonal_cuda(
     Supports FP16, FP32, and FP64. Internal accumulation is done in FP32.
     """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out) = metadata
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
 
     return BlockDiagonalFunction.apply(
         features, weights, block_m, block_n_in, block_n_out,
         block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, block_out_size, dim_out
+        out_to_local, block_in_size, block_out_size, block_w_size, dim_out
     )
 
 
@@ -262,12 +270,13 @@ def block_diagonal_cuda_v1(
         output: (batch, channels_out, dim_out)
     """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size, dim_out) = metadata
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
 
     return BlockDiagonalFunctionV1.apply(
         features, weights, block_m, block_n_in, block_n_out,
         block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, block_out_size, dim_out
+        out_to_local, block_in_size, block_out_size, block_w_size, dim_out
     )
 
 
@@ -299,3 +308,94 @@ def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
             weight_dim += mult * n_out * n_in
 
     return weight_dim
+
+
+def block_diagonal_binned_cuda(
+    features: torch.Tensor,
+    radial_table: torch.Tensor,
+    bin_indices: torch.Tensor,
+    channels_out: int,
+    metadata: Tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    """
+    Apply block-diagonal multiplication with binned radial weights (no grad).
+
+    This is a memory-efficient version where weights are stored per distance bin
+    instead of per edge. Memory reduction: O(num_bins) vs O(batch).
+
+    Args:
+        features: (batch, channels_in, dim_in) - features in diagonal basis
+        radial_table: (num_bins, weight_dim) - lookup table of weights per bin
+        bin_indices: (batch,) - bin index for each edge
+        channels_out: Number of output channels
+        metadata: Tuple from build_block_metadata()
+
+    Returns:
+        output: (batch, channels_out, dim_out)
+    """
+    cuda_module = _get_cuda_module()
+
+    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
+
+    output, = cuda_module.forward_binned(
+        features.contiguous(),
+        radial_table.contiguous(),
+        bin_indices.contiguous().int(),
+        block_m, block_n_in, block_n_out,
+        block_in_off, block_out_off, block_w_off,
+        block_in_size, block_w_size,
+        channels_out,
+        dim_out
+    )
+
+    return output
+
+
+def block_diagonal_binned_interp_cuda(
+    features: torch.Tensor,
+    radial_table: torch.Tensor,
+    bin_lo: torch.Tensor,
+    bin_hi: torch.Tensor,
+    interp_weight: torch.Tensor,
+    channels_out: int,
+    metadata: Tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    """
+    Apply block-diagonal multiplication with interpolated binned weights (no grad).
+
+    Linear interpolation between adjacent bins for smoother results.
+
+    Args:
+        features: (batch, channels_in, dim_in) - features in diagonal basis
+        radial_table: (num_bins + 1, weight_dim) - lookup table evaluated at bin edges
+        bin_lo: (batch,) - lower bin index for each edge
+        bin_hi: (batch,) - upper bin index for each edge
+        interp_weight: (batch,) - interpolation weight (0 to 1)
+        channels_out: Number of output channels
+        metadata: Tuple from build_block_metadata()
+
+    Returns:
+        output: (batch, channels_out, dim_out)
+    """
+    cuda_module = _get_cuda_module()
+
+    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
+
+    output, = cuda_module.forward_binned_interp(
+        features.contiguous(),
+        radial_table.contiguous(),
+        bin_lo.contiguous().int(),
+        bin_hi.contiguous().int(),
+        interp_weight.contiguous(),
+        block_m, block_n_in, block_n_out,
+        block_in_off, block_out_off, block_w_off,
+        block_in_size, block_w_size,
+        channels_out,
+        dim_out
+    )
+
+    return output

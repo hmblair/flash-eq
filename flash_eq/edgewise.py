@@ -6,6 +6,18 @@ equivariant linear layer where weights depend on pairwise distances.
 
 The layer uses binned interpolation for O(num_bins) memory instead of O(batch),
 enabling training on large molecular systems.
+
+Supports two usage modes:
+1. Diagonal basis: Pass features already in m-diagonalized basis (default)
+2. Standard basis: Pass features in standard (ℓ,m) basis with pre-computed P, Q
+
+For multi-layer networks, use WignerDBasis to compute P, Q once and share:
+
+    basis = WignerDBasis(repr_in, repr_out)
+    P, Q = basis(directions)
+
+    out1 = layer1(features, distances, P=P, Q=Q)
+    out2 = layer2(out1, distances, P=P, Q=Q)
 """
 
 import torch
@@ -27,6 +39,18 @@ class EquivariantEdgewiseLinear(nn.Module):
     block-diagonal weights. Weights are precomputed at bin edges and
     interpolated at runtime.
 
+    Supports two modes:
+    1. **Diagonal basis mode** (P, Q not provided): Features are assumed
+       to already be in the m-diagonalized basis. Output is also in
+       diagonal basis.
+
+    2. **Standard basis mode** (P, Q provided): Features are in standard
+       spherical harmonic basis. The layer transforms to diagonal basis,
+       applies weights, and transforms back.
+
+    For multi-layer networks, compute P, Q once using WignerDBasis and
+    pass to all layers to avoid redundant computation.
+
     Args:
         in_repr: Input representation (Repr object with lvals and mult).
         out_repr: Output representation.
@@ -36,18 +60,20 @@ class EquivariantEdgewiseLinear(nn.Module):
         radial_hidden: Hidden dimension for radial MLP (default: 64).
         radial_layers: Number of hidden layers in radial MLP (default: 2).
 
-    Example:
-        >>> in_repr = Repr(lvals=[0, 1, 2], mult=32)
-        >>> out_repr = Repr(lvals=[0, 1, 2], mult=32)
+    Example (diagonal basis):
         >>> layer = EquivariantEdgewiseLinear(in_repr, out_repr)
+        >>> features_diag = torch.randn(1000, 32, 9)  # Already in diagonal basis
+        >>> output_diag = layer(features_diag, distances)
+
+    Example (standard basis with shared Wigner-D):
+        >>> from flash_eq import WignerDBasis
+        >>> basis = WignerDBasis(in_repr, out_repr)
+        >>> layer1 = EquivariantEdgewiseLinear(in_repr, out_repr)
+        >>> layer2 = EquivariantEdgewiseLinear(in_repr, out_repr)
         >>>
-        >>> # features: (batch, channels_in, dim_in)
-        >>> # distances: (batch,)
-        >>> features = torch.randn(1000, 32, 9)  # 9 = 1 + 3 + 5
-        >>> distances = torch.rand(1000) * 5.0
-        >>> output = layer(features, distances)
-        >>> output.shape
-        torch.Size([1000, 32, 9])
+        >>> P, Q = basis(directions)  # Compute once
+        >>> out1 = layer1(features, distances, P=P, Q=Q)
+        >>> out2 = layer2(out1, distances, P=P, Q=Q)
 
     Memory usage:
         - Standard approach: O(batch * cout * cin * weight_dim)
@@ -112,21 +138,45 @@ class EquivariantEdgewiseLinear(nn.Module):
         self,
         features: torch.Tensor,
         distances: torch.Tensor,
+        P: Optional[torch.Tensor] = None,
+        Q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply equivariant linear transformation.
 
         Args:
-            features: (batch, channels_in, dim_in) input features in diagonal basis.
+            features: (batch, channels_in, dim_in) input features.
+                If P, Q provided: features in standard (ℓ,m) basis.
+                If P, Q not provided: features in m-diagonalized basis.
             distances: (batch,) pairwise distances.
+            P: (batch, dim_in, dim_in) input basis matrix from WignerDBasis.
+                If provided, transforms features from standard to diagonal basis.
+            Q: (batch, dim_out, dim_out) output basis matrix from WignerDBasis.
+                If provided, transforms output from diagonal to standard basis.
 
         Returns:
             output: (batch, channels_out, dim_out) transformed features.
+                In same basis as input (standard if P, Q provided, diagonal otherwise).
+
+        Note:
+            P and Q must both be provided or both be None.
         """
+        if (P is None) != (Q is None):
+            raise ValueError("P and Q must both be provided or both be None")
+
         device = features.device
         dtype = features.dtype
 
         # Get metadata for this device
         metadata = self._get_metadata(device)
+
+        # Transform to diagonal basis if P provided
+        if P is not None:
+            # features: (batch, channels, dim) -> need to apply P^T per channel
+            # P: (batch, dim, dim)
+            # f_diag = P^T @ f for each channel
+            f_diag = torch.einsum('bji,bci->bcj', P, features)
+        else:
+            f_diag = features
 
         # Evaluate radial MLP at bin edges -> (num_bins+1, cout, cin, weight_dim)
         radial_table = self.radial_mlp(self.bin_edges.unsqueeze(-1))
@@ -138,10 +188,19 @@ class EquivariantEdgewiseLinear(nn.Module):
         ).to(dtype)
 
         # Apply block-diagonal multiplication with binned interpolation
-        return block_diagonal_binned_interp_cuda(
-            features, radial_table, distances, metadata,
+        out_diag = block_diagonal_binned_interp_cuda(
+            f_diag, radial_table, distances, metadata,
             self.min_dist, self.max_dist
         )
+
+        # Transform back to standard basis if Q provided
+        if Q is not None:
+            # out_diag: (batch, channels, dim_out)
+            # Q: (batch, dim_out, dim_out)
+            # output = Q @ out_diag for each channel
+            return torch.einsum('bij,bcj->bci', Q, out_diag)
+        else:
+            return out_diag
 
     def extra_repr(self) -> str:
         return (

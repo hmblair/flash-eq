@@ -1,4 +1,4 @@
-"""Tests for EquivariantEdgewiseLinear layer."""
+"""Tests for EquivariantEdgewiseLinear layer and WignerDBasis."""
 
 import torch
 import sys
@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from flash_eq import Repr, EquivariantEdgewiseLinear
+from flash_eq import Repr, EquivariantEdgewiseLinear, WignerDBasis
 
 
 def test_basic_forward():
@@ -195,6 +195,153 @@ def test_high_lmax():
     print("  test_high_lmax: PASS")
 
 
+def test_wigner_d_basis():
+    """Test WignerDBasis computation."""
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=[0, 1, 2], mult=32)
+    out_repr = Repr(lvals=[0, 1, 2], mult=32)
+
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+
+    batch = 100
+    directions = torch.randn(batch, 3, device=device)
+
+    P, Q = basis(directions)
+
+    # Check shapes
+    dim = in_repr.dim()  # 9
+    assert P.shape == (batch, dim, dim), f"Expected P shape {(batch, dim, dim)}, got {P.shape}"
+    assert Q.shape == (batch, dim, dim), f"Expected Q shape {(batch, dim, dim)}, got {Q.shape}"
+
+    # Check orthogonality (Wigner-D matrices are orthogonal)
+    identity = torch.eye(dim, device=device)
+    P_orth = torch.bmm(P.transpose(-1, -2), P)
+    Q_orth = torch.bmm(Q.transpose(-1, -2), Q)
+
+    assert torch.allclose(P_orth, identity.expand_as(P_orth), atol=1e-5), "P should be orthogonal"
+    assert torch.allclose(Q_orth, identity.expand_as(Q_orth), atol=1e-5), "Q should be orthogonal"
+
+    print("  test_wigner_d_basis: PASS")
+
+
+def test_with_basis_matrices():
+    """Test EquivariantEdgewiseLinear with pre-computed P, Q."""
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=[0, 1, 2], mult=16)
+    out_repr = Repr(lvals=[0, 1, 2], mult=16)
+
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
+
+    batch = 200
+    dim = in_repr.dim()
+
+    # Features in standard basis
+    features = torch.randn(batch, 16, dim, device=device)
+    distances = torch.rand(batch, device=device) * 5.0
+    directions = torch.randn(batch, 3, device=device)
+
+    # Compute basis matrices
+    P, Q = basis(directions)
+
+    # Apply layer with basis matrices
+    output = layer(features, distances, P=P, Q=Q)
+
+    assert output.shape == (batch, 16, dim)
+    assert not torch.isnan(output).any()
+    print("  test_with_basis_matrices: PASS")
+
+
+def test_basis_sharing_multi_layer():
+    """Test that basis matrices can be shared across multiple layers."""
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=[0, 1, 2], mult=16)
+    out_repr = Repr(lvals=[0, 1, 2], mult=16)
+
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+    layer1 = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
+    layer2 = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
+
+    batch = 100
+    dim = in_repr.dim()
+
+    features = torch.randn(batch, 16, dim, device=device)
+    distances = torch.rand(batch, device=device) * 5.0
+    directions = torch.randn(batch, 3, device=device)
+
+    # Compute basis once
+    P, Q = basis(directions)
+
+    # Apply multiple layers with shared basis
+    out1 = layer1(features, distances, P=P, Q=Q)
+    out2 = layer2(out1, distances, P=P, Q=Q)
+
+    assert out2.shape == (batch, 16, dim)
+    assert not torch.isnan(out2).any()
+    print("  test_basis_sharing_multi_layer: PASS")
+
+
+def test_gradient_with_basis():
+    """Test gradient flow with P, Q matrices."""
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=[0, 1, 2], mult=8)
+    out_repr = Repr(lvals=[0, 1, 2], mult=8)
+
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
+
+    features = torch.randn(50, 8, 9, device=device, requires_grad=True)
+    distances = torch.rand(50, device=device) * 5.0
+    directions = torch.randn(50, 3, device=device)
+
+    P, Q = basis(directions)
+    output = layer(features, distances, P=P, Q=Q)
+    loss = output.sum()
+    loss.backward()
+
+    assert features.grad is not None
+    assert features.grad.abs().sum() > 0
+
+    has_mlp_grads = all(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in layer.radial_mlp.parameters()
+    )
+    assert has_mlp_grads
+    print("  test_gradient_with_basis: PASS")
+
+
+def test_pq_validation():
+    """Test that P and Q must both be provided or both None."""
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=[0, 1], mult=8)
+    out_repr = Repr(lvals=[0, 1], mult=8)
+
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
+
+    features = torch.randn(10, 8, 4, device=device)
+    distances = torch.rand(10, device=device) * 5.0
+    P = torch.randn(10, 4, 4, device=device)
+
+    try:
+        layer(features, distances, P=P, Q=None)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "both be provided" in str(e)
+
+    try:
+        layer(features, distances, P=None, Q=P)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "both be provided" in str(e)
+
+    print("  test_pq_validation: PASS")
+
+
 def main():
     print("=" * 60)
     print("EquivariantEdgewiseLinear Tests")
@@ -221,6 +368,13 @@ def main():
     print("\nConfiguration Tests:")
     test_custom_bins()
     test_high_lmax()
+
+    print("\nWigner-D Basis Tests:")
+    test_wigner_d_basis()
+    test_with_basis_matrices()
+    test_basis_sharing_multi_layer()
+    test_gradient_with_basis()
+    test_pq_validation()
 
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED")

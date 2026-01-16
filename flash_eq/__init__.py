@@ -7,6 +7,7 @@ Uses Wigner-D diagonalization to reduce memory from O(L^4) to O(L^2).
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr
 from .linear import EquivariantLinear
 from .edgewise import EquivariantEdgewiseLinear
+from .basis import WignerDBasis
 
 __all__ = [
     "Irrep",
@@ -15,5 +16,6 @@ __all__ = [
     "ProductRepr",
     "EquivariantLinear",
     "EquivariantEdgewiseLinear",
+    "WignerDBasis",
 ]
 __version__ = "0.1.0"

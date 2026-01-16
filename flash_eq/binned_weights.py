@@ -10,6 +10,11 @@ Key components:
 - BinnedRadialEmbedding: nn.Module that creates and caches the lookup table
 - block_diagonal_binned_*: CUDA kernels that use binned weights directly
 
+Performance:
+- Bin computation uses O(1) arithmetic for uniform bins (not O(log n) searchsorted)
+- Interpolation weight computed from fractional bin coordinate
+- CUDA kernels fuse interpolation with block-diagonal multiplication
+
 Example:
     # Setup
     binning = RadialBinning(num_bins=100, max_dist=10.0, device='cuda')
@@ -119,34 +124,37 @@ class RadialBinning:
         """
         Compute bin indices and interpolation weights for given distances.
 
+        Uses direct arithmetic O(1) instead of searchsorted O(log n) since
+        bins are uniformly spaced.
+
         Args:
             distances: (...,) tensor of distances
 
         Returns:
             BinData with lo, hi indices and interpolation weights
         """
-        # Ensure bin_edges are on the same device
-        if distances.device != self._bin_edges.device:
-            bin_edges = self._bin_edges.to(distances.device)
-        else:
-            bin_edges = self._bin_edges
+        # Normalize distances to bin coordinates: [0, num_bins]
+        # For uniform bins: bin_coord = (d - min_dist) / bin_width
+        inv_bin_width = self.num_bins / (self.max_dist - self.min_dist)
+        normalized = (distances - self.min_dist) * inv_bin_width
 
-        # Compute lower bin index using searchsorted with right=True
-        # This ensures values exactly at bin edges go to the higher bin
-        # e.g., distance=5.0 with edges [0,1,...,10] -> bin 5, not bin 4
-        bin_lo = torch.searchsorted(bin_edges[1:-1], distances.contiguous(), right=True)
-        bin_lo = bin_lo.clamp(0, self.num_bins - 1)
+        # Clamp to valid range and compute floor
+        normalized = normalized.clamp(0.0, self.num_bins)
+        bin_lo = normalized.floor().int()
+
+        # Handle edge case: distance exactly at max_dist
+        bin_lo = bin_lo.clamp(max=self.num_bins - 1)
+
+        # Interpolation weight is the fractional part
+        interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
+
+        # bin_hi is computed in the CUDA kernel as min(bin_lo + 1, num_bins)
+        # to avoid allocating another tensor
         bin_hi = (bin_lo + 1).clamp(max=self.num_bins)
 
-        # Compute interpolation weight: (d - edge_lo) / bin_width
-        edge_lo = bin_edges[bin_lo]
-        edge_hi = bin_edges[bin_hi]
-        bin_width = (edge_hi - edge_lo).clamp(min=1e-8)
-        interp_weight = ((distances - edge_lo) / bin_width).clamp(0.0, 1.0)
-
         return BinData(
-            lo=bin_lo.int(),
-            hi=bin_hi.int(),
+            lo=bin_lo,
+            hi=bin_hi,
             weight=interp_weight,
         )
 
@@ -154,19 +162,18 @@ class RadialBinning:
         """
         Compute bin indices only (for nearest-neighbor lookup).
 
+        Uses direct arithmetic O(1) instead of searchsorted O(log n).
+
         Args:
             distances: (...,) tensor of distances
 
         Returns:
             (...,) tensor of bin indices (int32)
         """
-        if distances.device != self._bin_edges.device:
-            bin_edges = self._bin_edges.to(distances.device)
-        else:
-            bin_edges = self._bin_edges
-
-        indices = torch.searchsorted(bin_edges[1:-1], distances.contiguous(), right=True)
-        return indices.clamp(0, self.num_bins - 1).int()
+        inv_bin_width = self.num_bins / (self.max_dist - self.min_dist)
+        normalized = (distances - self.min_dist) * inv_bin_width
+        indices = normalized.clamp(0.0, self.num_bins - 1e-6).floor().int()
+        return indices
 
     @torch.no_grad()
     def create_table(
@@ -346,14 +353,15 @@ def compute_bin_interpolation(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute bin indices and interpolation weights. Prefer RadialBinning for new code."""
     num_bins = len(bin_edges) - 1
-    bin_lo = torch.searchsorted(bin_edges[1:-1], edge_lengths.contiguous(), right=True)
-    bin_lo = bin_lo.clamp(0, num_bins - 1)
-    bin_hi = (bin_lo + 1).clamp(0, num_bins)
+    min_dist = bin_edges[0].item()
+    max_dist = bin_edges[-1].item()
 
-    edge_lo = bin_edges[bin_lo]
-    edge_hi = bin_edges[bin_hi]
-    bin_width = (edge_hi - edge_lo).clamp(min=1e-8)
-    interp_weight = ((edge_lengths - edge_lo) / bin_width).clamp(0, 1)
+    inv_bin_width = num_bins / (max_dist - min_dist)
+    normalized = (edge_lengths - min_dist) * inv_bin_width
+    normalized = normalized.clamp(0.0, num_bins)
+    bin_lo = normalized.floor().int().clamp(max=num_bins - 1)
+    bin_hi = (bin_lo + 1).clamp(max=num_bins)
+    interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
 
     return bin_lo, bin_hi, interp_weight
 
@@ -364,8 +372,15 @@ def compute_bin_indices(
     clamp: bool = True,
 ) -> torch.Tensor:
     """Compute bin indices. Prefer RadialBinning for new code."""
-    indices = torch.searchsorted(bin_edges[1:-1], edge_lengths.contiguous(), right=True)
+    num_bins = len(bin_edges) - 1
+    min_dist = bin_edges[0].item()
+    max_dist = bin_edges[-1].item()
+
+    inv_bin_width = num_bins / (max_dist - min_dist)
+    normalized = (edge_lengths - min_dist) * inv_bin_width
+
     if clamp:
-        num_bins = len(bin_edges) - 1
-        indices = indices.clamp(0, num_bins - 1)
+        indices = normalized.clamp(0.0, num_bins - 1e-6).floor().int()
+    else:
+        indices = normalized.floor().int()
     return indices

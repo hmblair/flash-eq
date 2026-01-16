@@ -13,10 +13,7 @@ import torch.nn as nn
 from typing import Optional
 
 from .representations import Repr, ProductRepr
-from .block_diagonal_cuda import (
-    build_block_metadata,
-    block_diagonal_binned_interp_cuda,
-)
+from .block_diagonal_cuda import block_diagonal_binned_interp_cuda
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -80,9 +77,9 @@ class EquivariantEdgewiseLinear(nn.Module):
         self.add_module('_in_repr', in_repr)
         self.add_module('_out_repr', out_repr)
 
-        # Compute weight dimension from representation product
-        product = ProductRepr(in_repr, out_repr)
-        self.weight_dim = product.weight_dim()
+        # Compute structure from representation product
+        self._product = ProductRepr(in_repr, out_repr)
+        self.weight_dim = self._product.weight_dim()
         self.channels_in = in_repr.mult
         self.channels_out = out_repr.mult
 
@@ -107,9 +104,7 @@ class EquivariantEdgewiseLinear(nn.Module):
     def _get_metadata(self, device: torch.device):
         """Get or build CUDA metadata for the given device."""
         if self._metadata is None or self._metadata_device != device:
-            self._metadata = build_block_metadata(
-                self.in_repr.lvals, self.out_repr.lvals, device
-            )
+            self._metadata = self._product.build_block_metadata(device)
             self._metadata_device = device
         return self._metadata
 

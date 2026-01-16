@@ -332,6 +332,56 @@ class ProductRepr:
         """Return total number of irreps in the tensor product."""
         return sum(rep.nreps() for rep in self.reps)
 
+    def _compute_block_structure(self) -> tuple:
+        """Compute block structure for the m-basis parameterization.
+
+        Returns:
+            Tuple of (blocks, dim_in, dim_out, weight_dim) where blocks is a list
+            of dicts with keys: m, n_in, n_out, in_off, out_off, w_off
+        """
+        lvals_in = torch.tensor(self.rep1.lvals)
+        lvals_out = torch.tensor(self.rep2.lvals)
+        lmax_in = int(lvals_in.max())
+        lmax_out = int(lvals_out.max())
+        lmax = max(lmax_in, lmax_out)
+
+        # Vectorized count: for each m, count how many l >= m
+        m_vals = torch.arange(lmax + 1)
+        n_in_all = (lvals_in.unsqueeze(0) >= m_vals.unsqueeze(1)).sum(dim=1)
+        n_out_all = (lvals_out.unsqueeze(0) >= m_vals.unsqueeze(1)).sum(dim=1)
+
+        # Compute offsets for all m-values (needed even for skipped blocks)
+        mult = torch.where(m_vals == 0, 1, 2)
+        in_sizes = mult * n_in_all
+        out_sizes = mult * n_out_all
+
+        # Cumulative offsets (exclusive prefix sum)
+        in_offsets = torch.cat([torch.tensor([0]), in_sizes[:-1].cumsum(0)])
+        out_offsets = torch.cat([torch.tensor([0]), out_sizes[:-1].cumsum(0)])
+
+        # Build blocks only where coupling exists
+        blocks = []
+        w_off = 0
+        for m in range(lmax + 1):
+            n_in = int(n_in_all[m])
+            n_out = int(n_out_all[m])
+            if n_in > 0 and n_out > 0:
+                m_mult = 1 if m == 0 else 2
+                blocks.append({
+                    'm': m,
+                    'n_in': n_in,
+                    'n_out': n_out,
+                    'in_off': int(in_offsets[m]),
+                    'out_off': int(out_offsets[m]),
+                    'w_off': w_off,
+                })
+                w_off += m_mult * n_out * n_in
+
+        dim_in = int(in_sizes[n_in_all > 0].sum()) if (n_in_all > 0).any() else 0
+        dim_out = int(out_sizes[n_out_all > 0].sum()) if (n_out_all > 0).any() else 0
+
+        return blocks, dim_in, dim_out, w_off
+
     def weight_dim(self) -> int:
         """Compute the weight dimension for block-diagonal parameterization.
 
@@ -343,21 +393,35 @@ class ProductRepr:
         Returns:
             Total number of weight parameters per (channel_out, channel_in) pair.
         """
-        lvals_in = self.rep1.lvals
-        lvals_out = self.rep2.lvals
-        lmax = max(max(lvals_in), max(lvals_out))
-
-        def count(lvals, m):
-            return sum(1 for l in lvals if l >= m)
-
-        weight_dim = 0
-        for m in range(lmax + 1):
-            n_in, n_out = count(lvals_in, m), count(lvals_out, m)
-            if n_in > 0 and n_out > 0:
-                mult = 1 if m == 0 else 2
-                weight_dim += mult * n_out * n_in
-
+        _, _, _, weight_dim = self._compute_block_structure()
         return weight_dim
+
+    def build_block_metadata(self, device: torch.device) -> tuple:
+        """Build metadata tensors for CUDA kernel.
+
+        Args:
+            device: Target device for metadata tensors.
+
+        Returns:
+            Tuple of (block_data, dim_out, max_in_size, max_out_size) where:
+            - block_data: (num_blocks, 6) tensor with columns [m, n_in, n_out, in_off, out_off, w_off]
+            - dim_out: Total output dimension
+            - max_in_size: Maximum input block size (for shared memory)
+            - max_out_size: Maximum output block size (for shared memory)
+        """
+        blocks, _, dim_out, _ = self._compute_block_structure()
+
+        # Pack into tensor
+        block_data = torch.tensor(
+            [[b['m'], b['n_in'], b['n_out'], b['in_off'], b['out_off'], b['w_off']] for b in blocks],
+            dtype=torch.int32, device=device
+        )
+
+        # Compute max sizes for shared memory allocation
+        max_in_size = max(b['n_in'] if b['m'] == 0 else 2 * b['n_in'] for b in blocks)
+        max_out_size = max(b['n_out'] if b['m'] == 0 else 2 * b['n_out'] for b in blocks)
+
+        return (block_data, dim_out, max_in_size, max_out_size)
 
     def __str__(self) -> str:
         return f"ProductRepr({self.rep1} x {self.rep2})"

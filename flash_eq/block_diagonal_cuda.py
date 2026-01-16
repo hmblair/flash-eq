@@ -16,7 +16,9 @@ import torch
 from torch.autograd import Function
 from torch.utils.cpp_extension import load
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Union
+
+from .representations import Repr, ProductRepr
 
 # Set CUDA_HOME if available
 if os.path.exists("/usr/local/cuda-12.6"):
@@ -55,86 +57,33 @@ def _get_reference_module():
 
 
 def build_block_metadata(
-    lvals_in: List[int],
-    lvals_out: List[int],
+    in_repr: Union[Repr, List[int]],
+    out_repr: Union[Repr, List[int]],
     device: torch.device
 ) -> Tuple[torch.Tensor, ...]:
     """
     Build metadata tensors for the CUDA kernel.
 
     Args:
-        lvals_in: List of input angular momentum values (e.g., [0, 1, 2])
-        lvals_out: List of output angular momentum values
+        in_repr: Input representation (Repr object or list of l-values)
+        out_repr: Output representation (Repr object or list of l-values)
         device: Target device for metadata tensors
 
     Returns:
-        Tuple of metadata tensors for block structure
+        Tuple of (block_data, dim_out, max_in_size, max_out_size)
 
     Note:
-        When lvals_in != lvals_out, the block-diagonal weight matrix is non-square.
+        When in_repr != out_repr, the block-diagonal weight matrix is non-square.
         Output m-components with no corresponding input (n_in=0) remain zero.
         Input m-components with no corresponding output (n_out=0) are ignored.
     """
-    lmax_in = max(lvals_in)
-    lmax_out = max(lvals_out)
-    lmax = max(lmax_in, lmax_out)
+    # Convert lists to Repr objects for backward compatibility
+    if isinstance(in_repr, list):
+        in_repr = Repr(lvals=in_repr)
+    if isinstance(out_repr, list):
+        out_repr = Repr(lvals=out_repr)
 
-    def count(lvals, m):
-        return sum(1 for l in lvals if l >= m)
-
-    # First pass: compute offsets for ALL m-values in input and output
-    # This ensures correct indexing even when some blocks are skipped
-    in_offsets = {}
-    out_offsets = {}
-    in_off = out_off = 0
-
-    for m in range(lmax + 1):
-        n_in = count(lvals_in, m)
-        n_out = count(lvals_out, m)
-        mult = 1 if m == 0 else 2
-
-        if n_in > 0:
-            in_offsets[m] = in_off
-            in_off += mult * n_in
-
-        if n_out > 0:
-            out_offsets[m] = out_off
-            out_off += mult * n_out
-
-    dim_out = out_off
-
-    # Second pass: build blocks only where coupling exists (both n_in > 0 and n_out > 0)
-    blocks = []
-    w_off = 0
-
-    for m in range(lmax + 1):
-        n_in = count(lvals_in, m)
-        n_out = count(lvals_out, m)
-
-        if n_in > 0 and n_out > 0:
-            mult = 1 if m == 0 else 2
-            blocks.append({
-                'm': m,
-                'n_in': n_in,
-                'n_out': n_out,
-                'in_off': in_offsets[m],
-                'out_off': out_offsets[m],
-                'w_off': w_off,
-            })
-            w_off += mult * n_out * n_in
-
-    # Pack block metadata into single (num_blocks, 6) tensor
-    # Columns: [m, n_in, n_out, in_off, out_off, w_off]
-    block_data = torch.tensor(
-        [[b['m'], b['n_in'], b['n_out'], b['in_off'], b['out_off'], b['w_off']] for b in blocks],
-        dtype=torch.int32, device=device
-    )
-
-    # Compute max sizes for shared memory allocation
-    max_in_size = max(b['n_in'] if b['m'] == 0 else 2 * b['n_in'] for b in blocks)
-    max_out_size = max(b['n_out'] if b['m'] == 0 else 2 * b['n_out'] for b in blocks)
-
-    return (block_data, dim_out, max_in_size, max_out_size)
+    return ProductRepr(in_repr, out_repr).build_block_metadata(device)
 
 
 def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
@@ -148,19 +97,7 @@ def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
     Returns:
         Total number of weight parameters per (channel_out, channel_in) pair
     """
-    lmax = max(max(lvals_in), max(lvals_out))
-
-    def count(lvals, m):
-        return sum(1 for l in lvals if l >= m)
-
-    weight_dim = 0
-    for m in range(lmax + 1):
-        n_in, n_out = count(lvals_in, m), count(lvals_out, m)
-        if n_in > 0 and n_out > 0:
-            mult = 1 if m == 0 else 2
-            weight_dim += mult * n_out * n_in
-
-    return weight_dim
+    return ProductRepr(Repr(lvals=lvals_in), Repr(lvals=lvals_out)).weight_dim()
 
 
 # =============================================================================

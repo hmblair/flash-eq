@@ -173,49 +173,6 @@ class BlockDiagonalFunction(Function):
         return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
 
 
-class BlockDiagonalFunctionV1(Function):
-    """Autograd function using V1 (per-output) kernel. Kept for compatibility."""
-
-    @staticmethod
-    def forward(ctx, features, weights, block_m, block_n_in, block_n_out,
-                block_in_off, block_out_off, block_w_off, out_to_block,
-                out_to_local, block_in_size, block_out_size, block_w_size, dim_out):
-        cuda_module = _get_cuda_module()
-
-        output, = cuda_module.forward(
-            features.contiguous(),
-            weights.contiguous(),
-            block_m, block_n_in, block_n_out,
-            block_in_off, block_out_off, block_w_off,
-            out_to_block, out_to_local,
-            dim_out
-        )
-
-        ctx.save_for_backward(features, weights, block_m, block_n_in, block_n_out,
-                              block_in_off, block_out_off, block_w_off)
-        ctx.dim_in = features.size(2)
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        features, weights, block_m, block_n_in, block_n_out, \
-            block_in_off, block_out_off, block_w_off = ctx.saved_tensors
-
-        cuda_module = _get_cuda_module()
-
-        grad_features, grad_weights = cuda_module.backward(
-            grad_output.contiguous(),
-            features,
-            weights,
-            block_m, block_n_in, block_n_out,
-            block_in_off, block_out_off, block_w_off,
-            ctx.dim_in
-        )
-
-        return grad_features, grad_weights, None, None, None, None, None, None, None, None, None, None, None, None
-
-
 def block_diagonal_cuda(
     features: torch.Tensor,
     weights: torch.Tensor,
@@ -248,40 +205,6 @@ def block_diagonal_cuda(
         block_in_off, block_out_off, block_w_off, out_to_block,
         out_to_local, block_in_size, block_out_size, block_w_size, dim_out
     )
-
-
-def block_diagonal_cuda_v1(
-    features: torch.Tensor,
-    weights: torch.Tensor,
-    metadata: Tuple[torch.Tensor, ...]
-) -> torch.Tensor:
-    """
-    Apply block-diagonal multiplication using V1 CUDA kernel (per-output parallel).
-
-    V1 parallelizes by (batch, cout, out_idx) with reduction over channels_in.
-    Slower than V2 but kept for compatibility and comparison.
-
-    Args:
-        features: (batch, channels_in, dim_in) - features in diagonal (m-ordered) basis
-        weights: (batch, channels_out, channels_in, weight_dim) - block-diagonal weights
-        metadata: Tuple from build_block_metadata()
-
-    Returns:
-        output: (batch, channels_out, dim_out)
-    """
-    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
-     block_w_size, dim_out) = metadata
-
-    return BlockDiagonalFunctionV1.apply(
-        features, weights, block_m, block_n_in, block_n_out,
-        block_in_off, block_out_off, block_w_off, out_to_block,
-        out_to_local, block_in_size, block_out_size, block_w_size, dim_out
-    )
-
-
-# Alias for explicit V2 usage
-block_diagonal_cuda_v2 = block_diagonal_cuda
 
 
 def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
@@ -396,6 +319,51 @@ def block_diagonal_binned_interp_cuda(
         block_in_size, block_w_size,
         channels_out,
         dim_out
+    )
+
+    return output
+
+
+def block_diagonal_fused_broadcast_cuda(
+    features: torch.Tensor,
+    hidden2: torch.Tensor,
+    W3: torch.Tensor,
+    b3: torch.Tensor,
+    channels_out: int,
+    metadata: Tuple[torch.Tensor, ...],
+    chunk_size: int = 8,
+) -> torch.Tensor:
+    """
+    Fused block-diagonal with MLP final projection using chunked weights.
+
+    Processes output channels in chunks to reduce peak memory from
+    O(B * Cout * Cin * Wdim) to O(B * chunk_size * Cin * Wdim).
+
+    The chunking loop runs entirely in C++ for minimal overhead.
+
+    Args:
+        features: (batch, channels_in, dim_in) - features in diagonal basis
+        hidden2: (batch, hidden_dim) - MLP hidden activations
+        W3: (channels_out, channels_in, hidden_dim, weight_dim) - final layer weights
+        b3: (channels_out, channels_in, weight_dim) - final layer bias
+        channels_out: Number of output channels
+        metadata: Tuple from build_block_metadata()
+        chunk_size: Number of output channels to process at once (default 8)
+
+    Returns:
+        output: (batch, channels_out, dim_out)
+    """
+    cuda_module = _get_cuda_module()
+
+    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
+     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
+     block_w_size, dim_out) = metadata
+
+    output, = cuda_module.forward_chunked_matmul(
+        features, hidden2, W3, b3,
+        block_m, block_n_in, block_n_out,
+        block_in_off, block_out_off, block_w_off,
+        block_in_size, dim_out, chunk_size
     )
 
     return output

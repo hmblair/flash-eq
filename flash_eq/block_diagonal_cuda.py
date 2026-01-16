@@ -69,32 +69,59 @@ def build_block_metadata(
 
     Returns:
         Tuple of metadata tensors for block structure
+
+    Note:
+        When lvals_in != lvals_out, the block-diagonal weight matrix is non-square.
+        Output m-components with no corresponding input (n_in=0) remain zero.
+        Input m-components with no corresponding output (n_out=0) are ignored.
     """
-    lmax = max(max(lvals_in), max(lvals_out))
+    lmax_in = max(lvals_in)
+    lmax_out = max(lvals_out)
+    lmax = max(lmax_in, lmax_out)
 
     def count(lvals, m):
         return sum(1 for l in lvals if l >= m)
 
-    blocks = []
-    in_off = out_off = w_off = 0
+    # First pass: compute offsets for ALL m-values in input and output
+    # This ensures correct indexing even when some blocks are skipped
+    in_offsets = {}
+    out_offsets = {}
+    in_off = out_off = 0
 
     for m in range(lmax + 1):
-        n_in, n_out = count(lvals_in, m), count(lvals_out, m)
+        n_in = count(lvals_in, m)
+        n_out = count(lvals_out, m)
+        mult = 1 if m == 0 else 2
+
+        if n_in > 0:
+            in_offsets[m] = in_off
+            in_off += mult * n_in
+
+        if n_out > 0:
+            out_offsets[m] = out_off
+            out_off += mult * n_out
+
+    dim_out = out_off
+
+    # Second pass: build blocks only where coupling exists (both n_in > 0 and n_out > 0)
+    blocks = []
+    w_off = 0
+
+    for m in range(lmax + 1):
+        n_in = count(lvals_in, m)
+        n_out = count(lvals_out, m)
+
         if n_in > 0 and n_out > 0:
+            mult = 1 if m == 0 else 2
             blocks.append({
                 'm': m,
                 'n_in': n_in,
                 'n_out': n_out,
-                'in_off': in_off,
-                'out_off': out_off,
+                'in_off': in_offsets[m],
+                'out_off': out_offsets[m],
                 'w_off': w_off,
             })
-            mult = 1 if m == 0 else 2
-            in_off += mult * n_in
-            out_off += mult * n_out
             w_off += mult * n_out * n_in
-
-    dim_out = out_off
 
     # Pack block metadata into single (num_blocks, 6) tensor
     # Columns: [m, n_in, n_out, in_off, out_off, w_off]

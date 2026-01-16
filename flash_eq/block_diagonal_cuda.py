@@ -12,7 +12,6 @@ Supports FP16, FP32, and FP64 with FP32 accumulation for numerical stability.
 
 import os
 import torch
-import torch.nn as nn
 from torch.autograd import Function
 from torch.utils.cpp_extension import load
 from pathlib import Path
@@ -233,49 +232,6 @@ def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
     return weight_dim
 
 
-def block_diagonal_binned_cuda(
-    features: torch.Tensor,
-    radial_table: torch.Tensor,
-    bin_indices: torch.Tensor,
-    channels_out: int,
-    metadata: Tuple[torch.Tensor, ...]
-) -> torch.Tensor:
-    """
-    Apply block-diagonal multiplication with binned radial weights (no grad).
-
-    This is a memory-efficient version where weights are stored per distance bin
-    instead of per edge. Memory reduction factor: batch_size / num_bins.
-
-    Args:
-        features: (batch, channels_in, dim_in) - features in diagonal basis
-        radial_table: (num_bins, channels_out, channels_in, weight_dim) - weights per bin
-        bin_indices: (batch,) - bin index for each edge
-        channels_out: Number of output channels
-        metadata: Tuple from build_block_metadata()
-
-    Returns:
-        output: (batch, channels_out, dim_out)
-    """
-    cuda_module = _get_cuda_module()
-
-    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
-     block_w_size, dim_out) = metadata
-
-    output, = cuda_module.forward_binned(
-        features.contiguous(),
-        radial_table.contiguous(),
-        bin_indices.contiguous().int(),
-        block_m, block_n_in, block_n_out,
-        block_in_off, block_out_off, block_w_off,
-        block_in_size, block_w_size,
-        channels_out,
-        dim_out
-    )
-
-    return output
-
-
 class BlockDiagonalBinnedInterpFunction(Function):
     """Autograd function for binned interpolated block-diagonal multiplication."""
 
@@ -399,48 +355,3 @@ def block_diagonal_binned_interp_cuda(
             dim_out
         )
         return output
-
-
-def block_diagonal_fused_broadcast_cuda(
-    features: torch.Tensor,
-    hidden2: torch.Tensor,
-    W3: torch.Tensor,
-    b3: torch.Tensor,
-    channels_out: int,
-    metadata: Tuple[torch.Tensor, ...],
-    chunk_size: int = 8,
-) -> torch.Tensor:
-    """
-    Fused block-diagonal with MLP final projection using chunked weights.
-
-    Processes output channels in chunks to reduce peak memory from
-    O(B * Cout * Cin * Wdim) to O(B * chunk_size * Cin * Wdim).
-
-    The chunking loop runs entirely in C++ for minimal overhead.
-
-    Args:
-        features: (batch, channels_in, dim_in) - features in diagonal basis
-        hidden2: (batch, hidden_dim) - MLP hidden activations
-        W3: (channels_out, channels_in, hidden_dim, weight_dim) - final layer weights
-        b3: (channels_out, channels_in, weight_dim) - final layer bias
-        channels_out: Number of output channels
-        metadata: Tuple from build_block_metadata()
-        chunk_size: Number of output channels to process at once (default 8)
-
-    Returns:
-        output: (batch, channels_out, dim_out)
-    """
-    cuda_module = _get_cuda_module()
-
-    (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
-     block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
-     block_w_size, dim_out) = metadata
-
-    output, = cuda_module.forward_chunked_matmul(
-        features, hidden2, W3, b3,
-        block_m, block_n_in, block_n_out,
-        block_in_off, block_out_off, block_w_off,
-        block_in_size, dim_out, chunk_size
-    )
-
-    return output

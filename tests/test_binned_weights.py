@@ -18,7 +18,6 @@ from flash_eq.binned_weights import (
 from flash_eq.block_diagonal_cuda import (
     build_block_metadata,
     block_diagonal_cuda,
-    block_diagonal_binned_cuda,
     block_diagonal_binned_interp_cuda,
     get_weight_dim,
 )

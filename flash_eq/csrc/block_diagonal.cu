@@ -248,119 +248,6 @@ __global__ void block_diagonal_forward_v2_kernel(
 
 
 /*
- * Binned Forward kernel: Uses lookup table for radial weights.
- *
- * Instead of storing weights per edge (B, Cout, Cin, Wdim), we store:
- *   - radial_table: (num_bins, Cout, Cin, Wdim) - weights per distance bin
- *   - bin_indices: (B,) - which bin each edge belongs to
- *
- * This reduces memory from O(B * Cout * Cin * Wdim) to O(num_bins * Cout * Cin * Wdim).
- * Memory reduction factor is batch_size / num_bins (e.g., 50x for batch=5000, bins=100).
- *
- * Identical to V2 kernel, but indexes weights by bin_indices[b] instead of b.
- *
- * Grid: B × num_m_blocks thread blocks
- */
-template <typename scalar_t>
-__global__ void block_diagonal_forward_binned_kernel(
-    const scalar_t* __restrict__ features,      // (B, Cin, Din)
-    const scalar_t* __restrict__ radial_table,  // (num_bins, Cout, Cin, Wdim)
-    const int* __restrict__ bin_indices,        // (B,)
-    scalar_t* __restrict__ output,              // (B, Cout, Dout)
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
-) {
-    // Each block handles one (batch, m-block) pair
-    const int blk = blockIdx.x % num_blocks;
-    const int64_t b = blockIdx.x / num_blocks;
-
-    if (b >= B) return;
-
-    const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
-
-    // Get m-block parameters
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
-
-    const int in_size = (m == 0) ? n_in : 2 * n_in;
-
-    // Shared memory layout: features for all Cin channels
-    extern __shared__ float feat_shared[];
-
-    // Cooperatively load features into shared memory
-    const int64_t feat_base = b * Cin * Din;
-    const int total_feat_elems = Cin * in_size;
-
-    for (int i = tid; i < total_feat_elems; i += num_threads) {
-        const int ci = i / in_size;
-        const int local_idx = i % in_size;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
-    }
-    __syncthreads();
-
-    // Each thread computes a subset of (cout, out_local) pairs
-    const int total_outputs = Cout * n_out;
-
-    // Get bin index for this batch element - only difference from V2!
-    const int bin_idx = bin_indices[b];
-
-    for (int out_idx = tid; out_idx < total_outputs; out_idx += num_threads) {
-        const int co = out_idx / n_out;
-        const int o_local = out_idx % n_out;
-
-        float acc = 0.0f;
-        float acc_im = 0.0f;
-
-        // Weight base: radial_table[bin_idx, co, :, :]
-        const scalar_t* w_base = radial_table + bin_idx * Cout * Cin * Wdim + co * Cin * Wdim;
-
-        // Sum over all input channels (using cached features)
-        for (int64_t ci = 0; ci < Cin; ci++) {
-            const float* f_ptr = feat_shared + ci * in_size;
-            const scalar_t* w_ptr = w_base + ci * Wdim + w_off;
-
-            if (m == 0) {
-                // Real block: dot product
-                for (int i = 0; i < n_in; i++) {
-                    acc += static_cast<float>(w_ptr[o_local * n_in + i]) * f_ptr[i];
-                }
-            } else {
-                // Complex block: [a, b; -b, a] @ [f_re; f_im]
-                for (int i = 0; i < n_in; i++) {
-                    const float f_re = f_ptr[i];
-                    const float f_im = f_ptr[n_in + i];
-
-                    const int w_idx = (o_local * n_in + i) * 2;
-                    const float a = static_cast<float>(w_ptr[w_idx]);
-                    const float bv = static_cast<float>(w_ptr[w_idx + 1]);
-
-                    acc += a * f_re + bv * f_im;
-                    acc_im += a * f_im - bv * f_re;
-                }
-            }
-        }
-
-        // Write output
-        const int64_t out_base = b * Cout * Dout + co * Dout + out_off;
-        output[out_base + o_local] = static_cast<scalar_t>(acc);
-        if (m > 0) {
-            output[out_base + n_out + o_local] = static_cast<scalar_t>(acc_im);
-        }
-    }
-}
-
-
-/*
  * Binned Forward kernel with linear interpolation between bins.
  *
  * Uses two adjacent bin entries and interpolates:
@@ -1649,58 +1536,6 @@ std::vector<torch::Tensor> block_diagonal_forward_v2_cuda(
 }
 
 
-std::vector<torch::Tensor> block_diagonal_forward_binned_cuda(
-    torch::Tensor features,
-    torch::Tensor radial_table,
-    torch::Tensor bin_indices,
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    torch::Tensor block_w_size,
-    int64_t Cout,
-    int dim_out
-) {
-    const int64_t B = features.size(0);
-    const int64_t Cin = features.size(1);
-    const int64_t Din = features.size(2);
-    // radial_table shape: (num_bins, Cout, Cin, Wdim)
-    const int64_t Wdim = radial_table.size(3);
-    const int num_blocks = block_m.size(0);
-
-    auto output = torch::zeros({B, Cout, dim_out}, features.options());
-
-    // Grid: B × num_m_blocks
-    const int64_t grid_size = B * num_blocks;
-    const int threads = 256;
-
-    // Shared memory: Cin × max_in_size floats (same as V2)
-    const int max_in_size = block_in_size.max().item<int>();
-    const size_t shared_size = Cin * max_in_size * sizeof(float);
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_forward_binned", ([&] {
-        block_diagonal_forward_binned_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
-            features.data_ptr<scalar_t>(),
-            radial_table.data_ptr<scalar_t>(),
-            bin_indices.data_ptr<int>(),
-            output.data_ptr<scalar_t>(),
-            block_m.data_ptr<int>(),
-            block_n_in.data_ptr<int>(),
-            block_n_out.data_ptr<int>(),
-            block_in_off.data_ptr<int>(),
-            block_out_off.data_ptr<int>(),
-            block_w_off.data_ptr<int>(),
-            B, Cin, Cout, Din, dim_out, Wdim, num_blocks
-        );
-    }));
-
-    return {output};
-}
-
-
 std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
     torch::Tensor features,
     torch::Tensor radial_table,
@@ -1978,91 +1813,6 @@ std::vector<torch::Tensor> block_diagonal_forward_fused_mlp_cuda(
             B, Cin, Cout, Din, dim_out, Wdim, num_blocks, hidden_dim
         );
     }));
-
-    return {output};
-}
-
-
-/*
- * Chunked matmul + block-diagonal in C++.
- *
- * Exactly replicates the Python version but without Python loop overhead:
- *
- *   for co in range(0, Cout, chunk_size):
- *       weights_chunk = einsum('bh,chw->bcw', hidden2, W3[co:co+chunk]) + b3[co:co+chunk]
- *       output[:, co:co+chunk] = block_diagonal_v2(features, weights_chunk)
- */
-std::vector<torch::Tensor> block_diagonal_chunked_matmul_cuda(
-    torch::Tensor features,      // (B, Cin, Din)
-    torch::Tensor hidden2,       // (B, H)
-    torch::Tensor W3,            // (Cout, Cin, H, Wdim)
-    torch::Tensor b3,            // (Cout, Cin, Wdim)
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    int dim_out,
-    int chunk_size
-) {
-    const int64_t B = features.size(0);
-    const int64_t Cin = features.size(1);
-    const int64_t Din = features.size(2);
-    const int64_t Cout = W3.size(0);
-    const int64_t H = W3.size(2);
-    const int64_t Wdim = W3.size(3);
-    const int num_blocks = block_m.size(0);
-
-    // Ensure contiguous (matches Python)
-    features = features.contiguous();
-
-    // Allocate output
-    auto output = torch::zeros({B, Cout, dim_out}, features.options());
-
-    // Kernel config
-    const int threads = 256;
-    const int max_in_size = block_in_size.max().item<int>();
-    const size_t shared_size = Cin * max_in_size * sizeof(float);
-
-    // Process chunks (mirrors Python loop exactly)
-    for (int64_t co_start = 0; co_start < Cout; co_start += chunk_size) {
-        const int64_t co_end = std::min(co_start + (int64_t)chunk_size, Cout);
-        const int64_t chunk_cout = co_end - co_start;
-
-        // W3_flat = W3[co_start:co_end].reshape(chunk_cout * Cin, H, Wdim)
-        auto W3_flat = W3.slice(0, co_start, co_end).reshape({chunk_cout * Cin, H, Wdim});
-        auto b3_flat = b3.slice(0, co_start, co_end).reshape({chunk_cout * Cin, Wdim});
-
-        // weights_flat = einsum('bh,chw->bcw', hidden2, W3_flat) + b3_flat
-        auto weights_flat = torch::einsum("bh,chw->bcw", {hidden2, W3_flat}) + b3_flat;
-
-        // weights_chunk = weights_flat.view(B, chunk_cout, Cin, Wdim).contiguous()
-        auto weights_chunk = weights_flat.view({B, chunk_cout, Cin, Wdim}).contiguous();
-
-        // output_chunk = forward_v2(features, weights_chunk, ...)
-        auto output_chunk = torch::zeros({B, chunk_cout, dim_out}, features.options());
-        const int64_t grid_size = B * num_blocks;
-
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "block_diagonal_chunked", ([&] {
-            block_diagonal_forward_v2_kernel<scalar_t><<<grid_size, threads, shared_size>>>(
-                features.data_ptr<scalar_t>(),
-                weights_chunk.data_ptr<scalar_t>(),
-                output_chunk.data_ptr<scalar_t>(),
-                block_m.data_ptr<int>(),
-                block_n_in.data_ptr<int>(),
-                block_n_out.data_ptr<int>(),
-                block_in_off.data_ptr<int>(),
-                block_out_off.data_ptr<int>(),
-                block_w_off.data_ptr<int>(),
-                B, Cin, chunk_cout, Din, dim_out, Wdim, num_blocks
-            );
-        }));
-
-        // output[:, co_start:co_end] = output_chunk
-        output.slice(1, co_start, co_end).copy_(output_chunk);
-    }
 
     return {output};
 }
@@ -2445,9 +2195,7 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_v2", &block_diagonal_forward_v2_cuda, "Block diagonal forward V2 - m-block parallel (CUDA)");
-    m.def("forward_binned", &block_diagonal_forward_binned_cuda, "Block diagonal forward with binned weights (CUDA)");
     m.def("forward_binned_interp", &block_diagonal_forward_binned_interp_cuda, "Block diagonal forward with interpolated binned weights (CUDA)");
-    m.def("forward_chunked_matmul", &block_diagonal_chunked_matmul_cuda, "Block diagonal with chunked matmul (CUDA)");
     m.def("backward_v2", &block_diagonal_backward_v2_cuda, "Block diagonal backward V2 - m-block parallel (CUDA)");
     m.def("backward_binned_interp", &block_diagonal_backward_binned_interp_cuda, "Block diagonal backward with interpolated binned weights (CUDA)");
 }

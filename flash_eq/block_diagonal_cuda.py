@@ -276,6 +276,84 @@ def block_diagonal_binned_cuda(
     return output
 
 
+class BlockDiagonalBinnedInterpFunction(Function):
+    """Autograd function for binned interpolated block-diagonal multiplication."""
+
+    @staticmethod
+    def forward(ctx, features, radial_table, bin_lo, bin_hi, interp_weight,
+                channels_out, block_m, block_n_in, block_n_out,
+                block_in_off, block_out_off, block_w_off,
+                block_in_size, block_out_size, block_w_size, dim_out):
+        cuda_module = _get_cuda_module()
+
+        output, = cuda_module.forward_binned_interp(
+            features.contiguous(),
+            radial_table.contiguous(),
+            bin_lo.contiguous().int(),
+            bin_hi.contiguous().int(),
+            interp_weight.contiguous(),
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_w_size,
+            channels_out,
+            dim_out
+        )
+
+        ctx.save_for_backward(
+            features, radial_table, bin_lo, bin_hi, interp_weight,
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_out_size
+        )
+        ctx.channels_out = channels_out
+        ctx.dim_in = features.size(2)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (features, radial_table, bin_lo, bin_hi, interp_weight,
+         block_m, block_n_in, block_n_out,
+         block_in_off, block_out_off, block_w_off,
+         block_in_size, block_out_size) = ctx.saved_tensors
+
+        cuda_module = _get_cuda_module()
+        batch = features.size(0)
+
+        # Interpolate weights from radial_table (need full weights for backward)
+        # weights[b] = (1 - t[b]) * radial_table[lo[b]] + t[b] * radial_table[hi[b]]
+        t = interp_weight.view(-1, 1, 1, 1)
+        weights = (1 - t) * radial_table[bin_lo] + t * radial_table[bin_hi]
+
+        # Use existing backward kernel to get grad_features and grad_weights
+        grad_features, grad_weights = cuda_module.backward_v2(
+            grad_output.contiguous(),
+            features,
+            weights,
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_out_size,
+            ctx.dim_in
+        )
+
+        # Scatter grad_weights to grad_radial_table
+        # grad_radial_table[lo[b]] += (1 - t[b]) * grad_weights[b]
+        # grad_radial_table[hi[b]] += t[b] * grad_weights[b]
+        grad_radial_table = torch.zeros_like(radial_table)
+        grad_radial_table.index_add_(0, bin_lo, (1 - t) * grad_weights)
+        grad_radial_table.index_add_(0, bin_hi, t * grad_weights)
+
+        # grad_interp_weight for force computation (optional, but we compute it)
+        # d/dt [(1-t)*w_lo + t*w_hi] = w_hi - w_lo
+        # grad_t = (w_hi - w_lo) · grad_weights (dot product over cout, cin, wdim)
+        weight_diff = radial_table[bin_hi] - radial_table[bin_lo]
+        grad_interp_weight = (weight_diff * grad_weights).sum(dim=(1, 2, 3))
+
+        # Return gradients for all inputs (None for non-differentiable ones)
+        return (grad_features, grad_radial_table, None, None, grad_interp_weight,
+                None, None, None, None, None, None, None, None, None, None, None)
+
+
 def block_diagonal_binned_interp_cuda(
     features: torch.Tensor,
     radial_table: torch.Tensor,
@@ -283,12 +361,14 @@ def block_diagonal_binned_interp_cuda(
     bin_hi: torch.Tensor,
     interp_weight: torch.Tensor,
     channels_out: int,
-    metadata: Tuple[torch.Tensor, ...]
+    metadata: Tuple[torch.Tensor, ...],
+    enable_grad: bool = True,
 ) -> torch.Tensor:
     """
-    Apply block-diagonal multiplication with interpolated binned weights (no grad).
+    Apply block-diagonal multiplication with interpolated binned weights.
 
     Linear interpolation between adjacent bins for smoother results.
+    Supports autograd for training when enable_grad=True.
 
     Args:
         features: (batch, channels_in, dim_in) - features in diagonal basis
@@ -298,30 +378,43 @@ def block_diagonal_binned_interp_cuda(
         interp_weight: (batch,) - interpolation weight (0 to 1)
         channels_out: Number of output channels
         metadata: Tuple from build_block_metadata()
+        enable_grad: If True, use autograd Function (default). If False, use raw kernel.
 
     Returns:
         output: (batch, channels_out, dim_out)
-    """
-    cuda_module = _get_cuda_module()
 
+    Gradient support:
+        - grad_features: backprop through feature pathway
+        - grad_radial_table: backprop through MLP (weighted scatter-add to bins)
+        - grad_interp_weight: for force computation via distances
+    """
     (block_m, block_n_in, block_n_out, block_in_off, block_out_off,
      block_w_off, out_to_block, out_to_local, block_in_size, block_out_size,
      block_w_size, dim_out) = metadata
 
-    output, = cuda_module.forward_binned_interp(
-        features.contiguous(),
-        radial_table.contiguous(),
-        bin_lo.contiguous().int(),
-        bin_hi.contiguous().int(),
-        interp_weight.contiguous(),
-        block_m, block_n_in, block_n_out,
-        block_in_off, block_out_off, block_w_off,
-        block_in_size, block_w_size,
-        channels_out,
-        dim_out
-    )
-
-    return output
+    if enable_grad and (features.requires_grad or radial_table.requires_grad or interp_weight.requires_grad):
+        return BlockDiagonalBinnedInterpFunction.apply(
+            features, radial_table, bin_lo, bin_hi, interp_weight,
+            channels_out, block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_out_size, block_w_size, dim_out
+        )
+    else:
+        # No grad needed, use raw kernel
+        cuda_module = _get_cuda_module()
+        output, = cuda_module.forward_binned_interp(
+            features.contiguous(),
+            radial_table.contiguous(),
+            bin_lo.contiguous().int(),
+            bin_hi.contiguous().int(),
+            interp_weight.contiguous(),
+            block_m, block_n_in, block_n_out,
+            block_in_off, block_out_off, block_w_off,
+            block_in_size, block_w_size,
+            channels_out,
+            dim_out
+        )
+        return output
 
 
 def block_diagonal_fused_broadcast_cuda(

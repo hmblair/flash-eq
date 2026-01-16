@@ -86,7 +86,6 @@ def test_compute_bins():
 
     assert isinstance(bin_data, BinData)
     assert bin_data.lo.dtype == torch.int32
-    assert bin_data.hi.dtype == torch.int32
     assert bin_data.weight.shape == distances.shape
     print("  test_compute_bins: PASS")
 
@@ -188,7 +187,6 @@ def test_interpolate_weights():
     table = torch.arange(num_bins).float().view(num_bins, 1, 1, 1).expand(num_bins, cout, cin, weight_dim)
     bin_data = BinData(
         lo=torch.tensor([0, 2, 4]),
-        hi=torch.tensor([1, 3, 5]),
         weight=torch.tensor([0.5, 0.5, 0.5]),
     )
     result = interpolate_weights(table, bin_data)
@@ -219,17 +217,14 @@ def test_binned_vs_full_correctness():
     distances = torch.rand(batch, device=device) * 10.0
     # Table shape: (num_bins + 1, cout, cin, weight_dim)
     radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device)
-    bin_data = binning.compute_bins(distances)
 
     # Binned kernel
     output_binned = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight,
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     # Full kernel with expanded weights
-    # interpolate_weights returns (batch, cout, cin, weight_dim)
+    bin_data = binning.compute_bins(distances)
     weights_interp = interpolate_weights(radial_table, bin_data)
     output_full = block_diagonal_cuda(features, weights_interp, metadata)
 
@@ -248,16 +243,13 @@ def test_binned_output_shape():
 
     metadata = build_block_metadata(lvals, lvals, device)
     features = torch.randn(batch, cin, dim, device=device)
+    distances = torch.rand(batch, device=device) * 10.0
 
-    binning = RadialBinning(num_bins=num_bins, device=device)
     # Table shape: (num_bins + 1, cout, cin, weight_dim)
     radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device)
-    bin_data = binning.compute_bins(torch.rand(batch, device=device) * 10.0)
 
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight,
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     assert output.shape == (batch, cout, dim)
@@ -274,19 +266,15 @@ def test_binned_dtypes():
     num_bins = 50
 
     metadata = build_block_metadata(lvals, lvals, device)
-    binning = RadialBinning(num_bins=num_bins, device=device)
 
     for dtype in [torch.float32, torch.float16]:
         features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
+        distances = torch.rand(batch, device=device) * 10.0
         # Table shape: (num_bins + 1, cout, cin, weight_dim)
         radial_table = torch.randn(num_bins + 1, cout, cin, weight_dim, device=device, dtype=dtype)
-        bin_data = binning.compute_bins(torch.rand(batch, device=device) * 10.0)
-        bin_data.weight = bin_data.weight.to(dtype)
 
         output = block_diagonal_binned_interp_cuda(
-            features, radial_table,
-            bin_data.lo, bin_data.hi, bin_data.weight,
-            cout, metadata
+            features, radial_table, distances, metadata
         )
 
         assert output.dtype == dtype

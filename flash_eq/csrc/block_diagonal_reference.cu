@@ -44,12 +44,7 @@ __global__ void block_diagonal_forward_v2_kernel(
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ weights,
     scalar_t* __restrict__ output,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
     int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
     const int blk = blockIdx.x % num_blocks;
@@ -60,13 +55,14 @@ __global__ void block_diagonal_forward_v2_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    // Block parameters
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int in_size = (m == 0) ? n_in : 2 * n_in;
 
     // Load features into shared memory
@@ -136,12 +132,7 @@ __global__ void block_diagonal_backward_features_v2_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ weights,
     scalar_t* __restrict__ grad_features,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
     int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
     const int blk = blockIdx.x % num_blocks;
@@ -152,12 +143,14 @@ __global__ void block_diagonal_backward_features_v2_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int out_size = (m == 0) ? n_out : 2 * n_out;
     const int in_size = (m == 0) ? n_in : 2 * n_in;
 
@@ -228,12 +221,7 @@ __global__ void block_diagonal_backward_weights_v2_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ features,
     scalar_t* __restrict__ grad_weights,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
     int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
 ) {
     const int blk = blockIdx.x % num_blocks;
@@ -244,12 +232,14 @@ __global__ void block_diagonal_backward_weights_v2_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int in_size = (m == 0) ? n_in : 2 * n_in;
     const int out_size = (m == 0) ? n_out : 2 * n_out;
     const int w_block_size = (m == 0) ? (n_out * n_in) : (2 * n_out * n_in);
@@ -323,27 +313,21 @@ __global__ void block_diagonal_backward_weights_v2_kernel(
 std::vector<torch::Tensor> block_diagonal_forward_v2_cuda(
     torch::Tensor features,
     torch::Tensor weights,
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    int dim_out
+    torch::Tensor block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int dim_out,
+    int max_in_size
 ) {
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
     const int64_t Din = features.size(2);
     const int64_t Cout = weights.size(1);
     const int64_t Wdim = weights.size(3);
-    const int num_blocks = block_m.size(0);
+    const int num_blocks = block_data.size(0);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
 
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
-    const int max_in_size = block_in_size.max().item<int>();
     const size_t shared_size = Cin * max_in_size * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_v2", ([&] {
@@ -351,12 +335,7 @@ std::vector<torch::Tensor> block_diagonal_forward_v2_cuda(
             features.data_ptr<scalar_t>(),
             weights.data_ptr<scalar_t>(),
             output.data_ptr<scalar_t>(),
-            block_m.data_ptr<int>(),
-            block_n_in.data_ptr<int>(),
-            block_n_out.data_ptr<int>(),
-            block_in_off.data_ptr<int>(),
-            block_out_off.data_ptr<int>(),
-            block_w_off.data_ptr<int>(),
+            block_data.data_ptr<int>(),
             B, Cin, Cout, Din, dim_out, Wdim, num_blocks
         );
     }));
@@ -369,15 +348,10 @@ std::vector<torch::Tensor> block_diagonal_backward_v2_cuda(
     torch::Tensor grad_output,
     torch::Tensor features,
     torch::Tensor weights,
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    torch::Tensor block_out_size,
-    int dim_in
+    torch::Tensor block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int dim_in,
+    int max_in_size,
+    int max_out_size
 ) {
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
@@ -385,15 +359,13 @@ std::vector<torch::Tensor> block_diagonal_backward_v2_cuda(
     const int64_t Cout = weights.size(1);
     const int64_t Wdim = weights.size(3);
     const int64_t Dout = grad_output.size(2);
-    const int num_blocks = block_m.size(0);
+    const int num_blocks = block_data.size(0);
 
     auto grad_features = torch::zeros_like(features);
     auto grad_weights = torch::zeros_like(weights);
 
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
-    const int max_in_size = block_in_size.max().item<int>();
-    const int max_out_size = block_out_size.max().item<int>();
 
     // Features backward
     {
@@ -404,12 +376,7 @@ std::vector<torch::Tensor> block_diagonal_backward_v2_cuda(
                 grad_output.data_ptr<scalar_t>(),
                 weights.data_ptr<scalar_t>(),
                 grad_features.data_ptr<scalar_t>(),
-                block_m.data_ptr<int>(),
-                block_n_in.data_ptr<int>(),
-                block_n_out.data_ptr<int>(),
-                block_in_off.data_ptr<int>(),
-                block_out_off.data_ptr<int>(),
-                block_w_off.data_ptr<int>(),
+                block_data.data_ptr<int>(),
                 B, Cin, Cout, Din, Dout, Wdim, num_blocks
             );
         }));
@@ -424,12 +391,7 @@ std::vector<torch::Tensor> block_diagonal_backward_v2_cuda(
                 grad_output.data_ptr<scalar_t>(),
                 features.data_ptr<scalar_t>(),
                 grad_weights.data_ptr<scalar_t>(),
-                block_m.data_ptr<int>(),
-                block_n_in.data_ptr<int>(),
-                block_n_out.data_ptr<int>(),
-                block_in_off.data_ptr<int>(),
-                block_out_off.data_ptr<int>(),
-                block_w_off.data_ptr<int>(),
+                block_data.data_ptr<int>(),
                 B, Cin, Cout, Din, Dout, Wdim, num_blocks
             );
         }));

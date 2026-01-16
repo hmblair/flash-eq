@@ -27,7 +27,7 @@ Example:
     # Forward pass
     bin_data = binning.compute_bins(edge_lengths)
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table, bin_data.lo, bin_data.hi, bin_data.weight,
+        features, radial_table, bin_data.lo, bin_data.weight,
         channels_out, metadata
     )
 """
@@ -44,13 +44,11 @@ from typing import Callable, Optional, Union
 class BinData:
     """Container for bin indices and interpolation weights."""
     lo: torch.Tensor      # (batch,) lower bin indices, int32
-    hi: torch.Tensor      # (batch,) upper bin indices, int32
     weight: torch.Tensor  # (batch,) interpolation weight in [0, 1]
 
     def to(self, device: torch.device) -> BinData:
         return BinData(
             lo=self.lo.to(device),
-            hi=self.hi.to(device),
             weight=self.weight.to(device),
         )
 
@@ -149,12 +147,8 @@ class RadialBinning:
         interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
 
         # bin_hi is computed in the CUDA kernel as min(bin_lo + 1, num_bins)
-        # to avoid allocating another tensor
-        bin_hi = (bin_lo + 1).clamp(max=self.num_bins)
-
         return BinData(
             lo=bin_lo,
-            hi=bin_hi,
             weight=interp_weight,
         )
 
@@ -324,63 +318,15 @@ def interpolate_weights(
 
     Args:
         table: (num_bins + 1, cout, cin, weight_dim) lookup table
-        bin_data: BinData with lo, hi, weight
+        bin_data: BinData with lo, weight
 
     Returns:
         (batch, cout, cin, weight_dim) interpolated weights
     """
+    num_bins = table.size(0) - 1
+    bin_hi = (bin_data.lo + 1).clamp(max=num_bins)
     w_lo = table[bin_data.lo]  # (batch, cout, cin, weight_dim)
-    w_hi = table[bin_data.hi]  # (batch, cout, cin, weight_dim)
+    w_hi = table[bin_hi]       # (batch, cout, cin, weight_dim)
     # Reshape weight for broadcasting: (batch,) -> (batch, 1, 1, 1)
     t = bin_data.weight.view(-1, 1, 1, 1)
     return torch.lerp(w_lo, w_hi, t)
-
-
-# Legacy API compatibility
-def create_bin_edges(
-    min_dist: float = 0.0,
-    max_dist: float = 10.0,
-    num_bins: int = 100,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Create bin edges. Prefer RadialBinning class for new code."""
-    return torch.linspace(min_dist, max_dist, num_bins + 1, device=device)
-
-
-def compute_bin_interpolation(
-    edge_lengths: torch.Tensor,
-    bin_edges: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute bin indices and interpolation weights. Prefer RadialBinning for new code."""
-    num_bins = len(bin_edges) - 1
-    min_dist = bin_edges[0].item()
-    max_dist = bin_edges[-1].item()
-
-    inv_bin_width = num_bins / (max_dist - min_dist)
-    normalized = (edge_lengths - min_dist) * inv_bin_width
-    normalized = normalized.clamp(0.0, num_bins)
-    bin_lo = normalized.floor().int().clamp(max=num_bins - 1)
-    bin_hi = (bin_lo + 1).clamp(max=num_bins)
-    interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
-
-    return bin_lo, bin_hi, interp_weight
-
-
-def compute_bin_indices(
-    edge_lengths: torch.Tensor,
-    bin_edges: torch.Tensor,
-    clamp: bool = True,
-) -> torch.Tensor:
-    """Compute bin indices. Prefer RadialBinning for new code."""
-    num_bins = len(bin_edges) - 1
-    min_dist = bin_edges[0].item()
-    max_dist = bin_edges[-1].item()
-
-    inv_bin_width = num_bins / (max_dist - min_dist)
-    normalized = (edge_lengths - min_dist) * inv_bin_width
-
-    if clamp:
-        indices = normalized.clamp(0.0, num_bins - 1e-6).floor().int()
-    else:
-        indices = normalized.floor().int()
-    return indices

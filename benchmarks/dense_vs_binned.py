@@ -116,14 +116,11 @@ def benchmark_binned_training(lmax, batch, cin, cout, num_bins, dtype, n_warmup=
     def train_step():
         optimizer.zero_grad()
 
-        # Binned approach: MLP at bin edges, interpolate for each edge
+        # Binned approach: MLP at bin edges, kernel handles interpolation
         radial_table = mlp(binning.bin_edges)
-        bin_data = binning.compute_bins(distances)
 
         output = block_diagonal_binned_interp_cuda(
-            features, radial_table,
-            bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-            cout, metadata
+            features, radial_table, distances, metadata
         )
 
         loss = ((output - target) ** 2).mean()

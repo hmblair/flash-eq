@@ -33,16 +33,13 @@ def test_grad_features(lvals, batch, cin, cout, num_bins, dtype=torch.float32):
 
     binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
     distances = torch.rand(batch, device=device) * 10.0
-    bin_data = binning.compute_bins(distances)
 
     # Input features with grad
     features = torch.randn(batch, cin, dim, device=device, dtype=dtype, requires_grad=True)
 
     # Forward pass
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     # Backward pass
@@ -53,8 +50,10 @@ def test_grad_features(lvals, batch, cin, cout, num_bins, dtype=torch.float32):
 
     # Compare with exact approach
     features_exact = features.detach().clone().requires_grad_(True)
+    bin_data = binning.compute_bins(distances)
     t = bin_data.weight.to(dtype).view(-1, 1, 1, 1)
-    weights_exact = (1 - t) * radial_table.detach()[bin_data.lo] + t * radial_table.detach()[bin_data.hi]
+    bin_hi = (bin_data.lo + 1).clamp(max=num_bins)
+    weights_exact = (1 - t) * radial_table.detach()[bin_data.lo] + t * radial_table.detach()[bin_hi]
     output_exact = block_diagonal_cuda(features_exact, weights_exact, metadata)
     output_exact.backward(grad_output)
 
@@ -89,9 +88,7 @@ def test_grad_radial_table(lvals, batch, cin, cout, num_bins, dtype=torch.float3
 
     # Forward pass with binned
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     # Backward pass
@@ -103,7 +100,8 @@ def test_grad_radial_table(lvals, batch, cin, cout, num_bins, dtype=torch.float3
     # Compare with manual computation using exact weights
     radial_table_exact = radial_table.detach().clone().requires_grad_(True)
     t = bin_data.weight.to(dtype).view(-1, 1, 1, 1)
-    weights = (1 - t) * radial_table_exact[bin_data.lo] + t * radial_table_exact[bin_data.hi]
+    bin_hi = (bin_data.lo + 1).clamp(max=num_bins)
+    weights = (1 - t) * radial_table_exact[bin_data.lo] + t * radial_table_exact[bin_hi]
     output_exact = block_diagonal_cuda(features, weights, metadata)
     output_exact.backward(grad_output)
 
@@ -137,16 +135,13 @@ def test_grad_through_mlp(lvals, batch, cin, cout, num_bins, dtype=torch.float32
 
     binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
     distances = torch.rand(batch, device=device) * 10.0
-    bin_data = binning.compute_bins(distances)
 
     features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
 
     # Forward: MLP at bin edges -> radial_table -> binned block-diagonal
     radial_table = mlp(binning.bin_edges.unsqueeze(-1)).view(num_bins + 1, cout, cin, weight_dim)
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     # Compute loss and backward
@@ -175,24 +170,21 @@ def test_gradcheck(lvals, batch, cin, cout, num_bins):
         device=device, dtype=dtype, requires_grad=True
     )
 
-    binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
-    distances = torch.rand(batch, device=device, dtype=dtype) * 10.0
-    bin_data = binning.compute_bins(distances)
+    # Distances away from bin edges to avoid discontinuities
+    distances = torch.rand(batch, device=device, dtype=dtype) * 8.0 + 1.0
+    distances = distances.requires_grad_(True)
 
     features = torch.randn(batch, cin, dim, device=device, dtype=dtype, requires_grad=True)
-    interp_weight = bin_data.weight.to(dtype).requires_grad_(True)
 
-    def func(features, radial_table, interp_weight):
+    def func(features, radial_table, distances):
         return block_diagonal_binned_interp_cuda(
-            features, radial_table,
-            bin_data.lo, bin_data.hi, interp_weight,
-            cout, metadata
+            features, radial_table, distances, metadata
         )
 
     # Use relaxed tolerances for CUDA kernels
     try:
         passed = torch.autograd.gradcheck(
-            func, (features, radial_table, interp_weight),
+            func, (features, radial_table, distances),
             eps=1e-5, atol=1e-2, rtol=1e-2,
             raise_exception=True,
             nondet_tol=1e-4,  # Allow some non-determinism in CUDA
@@ -218,20 +210,15 @@ def test_grad_distances(lvals, batch, cin, cout, num_bins, dtype=torch.float32):
         device=device, dtype=dtype
     )
 
-    binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
-
     # Distances with requires_grad (for force computation)
     distances = torch.rand(batch, device=device, dtype=dtype) * 9.0 + 0.5  # Avoid edges
     distances = distances.requires_grad_(True)
 
     features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
 
-    # Forward pass - binning should preserve gradient graph
-    bin_data = binning.compute_bins(distances)
+    # Forward pass
     output = block_diagonal_binned_interp_cuda(
-        features, radial_table,
-        bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-        cout, metadata
+        features, radial_table, distances, metadata
     )
 
     # Backward pass
@@ -259,7 +246,6 @@ def test_grad_distances_numerical(lvals, batch, cin, cout, num_bins):
         device=device, dtype=dtype
     )
 
-    binning = RadialBinning(num_bins=num_bins, max_dist=10.0, device=device)
     features = torch.randn(batch, cin, dim, device=device, dtype=dtype)
 
     # Distances away from bin edges to avoid clamp discontinuities
@@ -267,11 +253,8 @@ def test_grad_distances_numerical(lvals, batch, cin, cout, num_bins):
     distances = distances.requires_grad_(True)
 
     def compute_output(d):
-        bin_data = binning.compute_bins(d)
         out = block_diagonal_binned_interp_cuda(
-            features, radial_table,
-            bin_data.lo, bin_data.hi, bin_data.weight.to(dtype),
-            cout, metadata
+            features, radial_table, d, metadata
         )
         return out.sum()
 

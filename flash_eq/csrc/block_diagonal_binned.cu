@@ -38,26 +38,20 @@
  * @param features      Input features (B, Cin, Din)
  * @param radial_table  Weight table at bin edges (K+1, Cout, Cin, Wdim)
  * @param bin_lo        Lower bin index per edge (B,)
- * @param bin_hi        Upper bin index per edge (B,)
  * @param interp_weight Interpolation weight t in [0,1] (B,)
  * @param output        Output features (B, Cout, Dout)
  * @param block_*       Block structure metadata
+ * @param num_bins      Number of bins (for computing bin_hi = min(bin_lo + 1, num_bins))
  */
 template <typename scalar_t>
 __global__ void block_diagonal_forward_binned_interp_kernel(
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
-    const int* __restrict__ bin_hi,
     const scalar_t* __restrict__ interp_weight,
     scalar_t* __restrict__ output,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
 ) {
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
@@ -67,13 +61,14 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    // Block parameters
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int in_size = (m == 0) ? n_in : 2 * n_in;
 
     // Load features into shared memory
@@ -90,7 +85,7 @@ __global__ void block_diagonal_forward_binned_interp_kernel(
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = bin_hi[b];
+    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
     const int64_t table_stride = Cout * Cin * Wdim;
@@ -163,16 +158,10 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
-    const int* __restrict__ bin_hi,
     const scalar_t* __restrict__ interp_weight,
     scalar_t* __restrict__ grad_features,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
 ) {
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
@@ -182,19 +171,20 @@ __global__ void block_diagonal_backward_binned_interp_features_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    // Block parameters
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int out_size = (m == 0) ? n_out : 2 * n_out;
     const int in_size = (m == 0) ? n_in : 2 * n_in;
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = bin_hi[b];
+    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
     const int64_t table_stride = Cout * Cin * Wdim;
@@ -278,17 +268,11 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
-    const int* __restrict__ bin_hi,
     const scalar_t* __restrict__ interp_weight,
     float* __restrict__ grad_radial_table,
     float* __restrict__ grad_interp_weight,
-    const int* __restrict__ block_m,
-    const int* __restrict__ block_n_in,
-    const int* __restrict__ block_n_out,
-    const int* __restrict__ block_in_off,
-    const int* __restrict__ block_out_off,
-    const int* __restrict__ block_w_off,
-    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks
+    const int* __restrict__ block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int64_t B, int64_t Cin, int64_t Cout, int64_t Din, int64_t Dout, int64_t Wdim, int num_blocks, int num_bins
 ) {
     const int blk = blockIdx.x % num_blocks;
     const int64_t b = blockIdx.x / num_blocks;
@@ -298,20 +282,21 @@ __global__ void block_diagonal_backward_binned_interp_table_kernel(
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
 
-    // Block parameters
-    const int m = block_m[blk];
-    const int n_in = block_n_in[blk];
-    const int n_out = block_n_out[blk];
-    const int in_off = block_in_off[blk];
-    const int out_off = block_out_off[blk];
-    const int w_off = block_w_off[blk];
+    // Unpack block parameters from packed tensor
+    const int* blk_ptr = block_data + blk * 6;
+    const int m = blk_ptr[0];
+    const int n_in = blk_ptr[1];
+    const int n_out = blk_ptr[2];
+    const int in_off = blk_ptr[3];
+    const int out_off = blk_ptr[4];
+    const int w_off = blk_ptr[5];
     const int in_size = (m == 0) ? n_in : 2 * n_in;
     const int out_size = (m == 0) ? n_out : 2 * n_out;
     const int w_block_size = (m == 0) ? (n_out * n_in) : (2 * n_out * n_in);
 
     // Interpolation parameters
     const int idx_lo = bin_lo[b];
-    const int idx_hi = bin_hi[b];
+    const int idx_hi = min(idx_lo + 1, num_bins);  // Compute bin_hi on the fly
     const float t = static_cast<float>(interp_weight[b]);
     const float one_minus_t = 1.0f - t;
     const int64_t table_stride = Cout * Cin * Wdim;
@@ -406,30 +391,23 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
     torch::Tensor features,
     torch::Tensor radial_table,
     torch::Tensor bin_lo,
-    torch::Tensor bin_hi,
     torch::Tensor interp_weight,
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    torch::Tensor block_w_size,
+    torch::Tensor block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
     int64_t Cout,
-    int dim_out
+    int dim_out,
+    int num_bins,
+    int max_in_size
 ) {
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
     const int64_t Din = features.size(2);
     const int64_t Wdim = radial_table.size(3);
-    const int num_blocks = block_m.size(0);
+    const int num_blocks = block_data.size(0);
 
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
 
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
-    const int max_in_size = block_in_size.max().item<int>();
     const size_t shared_size = Cin * max_in_size * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_binned_interp", ([&] {
@@ -437,16 +415,10 @@ std::vector<torch::Tensor> block_diagonal_forward_binned_interp_cuda(
             features.data_ptr<scalar_t>(),
             radial_table.data_ptr<scalar_t>(),
             bin_lo.data_ptr<int>(),
-            bin_hi.data_ptr<int>(),
             interp_weight.data_ptr<scalar_t>(),
             output.data_ptr<scalar_t>(),
-            block_m.data_ptr<int>(),
-            block_n_in.data_ptr<int>(),
-            block_n_out.data_ptr<int>(),
-            block_in_off.data_ptr<int>(),
-            block_out_off.data_ptr<int>(),
-            block_w_off.data_ptr<int>(),
-            B, Cin, Cout, Din, dim_out, Wdim, num_blocks
+            block_data.data_ptr<int>(),
+            B, Cin, Cout, Din, dim_out, Wdim, num_blocks, num_bins
         );
     }));
 
@@ -459,17 +431,11 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
     torch::Tensor features,
     torch::Tensor radial_table,
     torch::Tensor bin_lo,
-    torch::Tensor bin_hi,
     torch::Tensor interp_weight,
-    torch::Tensor block_m,
-    torch::Tensor block_n_in,
-    torch::Tensor block_n_out,
-    torch::Tensor block_in_off,
-    torch::Tensor block_out_off,
-    torch::Tensor block_w_off,
-    torch::Tensor block_in_size,
-    torch::Tensor block_out_size,
-    int dim_in
+    torch::Tensor block_data,  // (num_blocks, 6): [m, n_in, n_out, in_off, out_off, w_off]
+    int dim_in,
+    int max_in_size,
+    int max_out_size
 ) {
     const int64_t B = features.size(0);
     const int64_t Cin = features.size(1);
@@ -477,8 +443,9 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
     const int64_t Cout = grad_output.size(1);
     const int64_t Dout = grad_output.size(2);
     const int64_t num_bins_plus_1 = radial_table.size(0);
+    const int num_bins = num_bins_plus_1 - 1;
     const int64_t Wdim = radial_table.size(3);
-    const int num_blocks = block_m.size(0);
+    const int num_blocks = block_data.size(0);
 
     auto grad_features = torch::zeros_like(features);
     auto grad_radial_table = torch::zeros({num_bins_plus_1, Cout, Cin, Wdim},
@@ -487,8 +454,6 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
 
     const int64_t grid_size = B * num_blocks;
     const int threads = 256;
-    const int max_in_size = block_in_size.max().item<int>();
-    const int max_out_size = block_out_size.max().item<int>();
 
     // Features backward
     {
@@ -499,16 +464,10 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
                 grad_output.data_ptr<scalar_t>(),
                 radial_table.data_ptr<scalar_t>(),
                 bin_lo.data_ptr<int>(),
-                bin_hi.data_ptr<int>(),
                 interp_weight.data_ptr<scalar_t>(),
                 grad_features.data_ptr<scalar_t>(),
-                block_m.data_ptr<int>(),
-                block_n_in.data_ptr<int>(),
-                block_n_out.data_ptr<int>(),
-                block_in_off.data_ptr<int>(),
-                block_out_off.data_ptr<int>(),
-                block_w_off.data_ptr<int>(),
-                B, Cin, Cout, Din, Dout, Wdim, num_blocks
+                block_data.data_ptr<int>(),
+                B, Cin, Cout, Din, Dout, Wdim, num_blocks, num_bins
             );
         }));
     }
@@ -523,17 +482,11 @@ std::vector<torch::Tensor> block_diagonal_backward_binned_interp_cuda(
                 features.data_ptr<scalar_t>(),
                 radial_table.data_ptr<scalar_t>(),
                 bin_lo.data_ptr<int>(),
-                bin_hi.data_ptr<int>(),
                 interp_weight.data_ptr<scalar_t>(),
                 grad_radial_table.data_ptr<float>(),
                 grad_interp_weight.data_ptr<float>(),
-                block_m.data_ptr<int>(),
-                block_n_in.data_ptr<int>(),
-                block_n_out.data_ptr<int>(),
-                block_in_off.data_ptr<int>(),
-                block_out_off.data_ptr<int>(),
-                block_w_off.data_ptr<int>(),
-                B, Cin, Cout, Din, Dout, Wdim, num_blocks
+                block_data.data_ptr<int>(),
+                B, Cin, Cout, Din, Dout, Wdim, num_blocks, num_bins
             );
         }));
     }

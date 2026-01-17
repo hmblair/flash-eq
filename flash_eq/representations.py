@@ -88,26 +88,37 @@ class Irrep:
     def _generators(self) -> torch.Tensor:
         """Return the generators of so(3) in this representation.
 
-        Returns generators in standard (x, y, z) ordering.
+        Returns generators in standard Cartesian (x, y, z) ordering.
+        These satisfy the commutation relations [Jx, Jy] = Jz (cyclic).
+
+        For l=1, the generators match the standard 3x3 rotation generators
+        when the basis is converted to Cartesian coordinates.
 
         Returns:
             Shape (3, 2l+1, 2l+1) tensor of generator matrices [Jx, Jy, Jz].
         """
-        raising = self.raising()
-        lowering = self.lowering()
+        raising = self.raising().to(self.COMPLEX_DTYPE)
+        lowering = self.lowering().to(self.COMPLEX_DTYPE)
 
+        # Standard angular momentum operators in complex basis
+        # J+ = Jx + i*Jy, J- = Jx - i*Jy
+        # => Jx = (J+ + J-) / 2, Jy = (J+ - J-) / (2i)
         genx = 0.5 * (raising + lowering)
         geny = -0.5j * (raising - lowering)
 
         mvals = torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE)
         genz = 1j * torch.diag(mvals)
 
-        # Standard ordering: x, y, z
-        gens = torch.stack([genx, geny, genz], dim=0)
-
+        # Transform to real spherical harmonic basis
         Q = self.toreal()
-        out = Q.t().conj() @ gens @ Q
-        return out.real.to(self.REAL_DTYPE)
+        genx_real = (Q.t().conj() @ genx @ Q).real.to(self.REAL_DTYPE)
+        geny_real = (Q.t().conj() @ geny @ Q).real.to(self.REAL_DTYPE)
+        genz_real = (Q.t().conj() @ genz @ Q).real.to(self.REAL_DTYPE)
+
+        # The complex-to-real transformation maps the quantum generators to
+        # a permuted ordering. Empirically verified: the output corresponds to
+        # (Jx_cart, Jz_cart, Jy_cart). We reorder to standard (x, y, z).
+        return torch.stack([genx_real, genz_real, geny_real], dim=0)
 
     def toreal(self) -> torch.Tensor:
         """Get the conversion matrix from complex to real spherical harmonics.
@@ -329,47 +340,40 @@ class Repr(nn.Module):
         return self.rot(axis, angle)
 
     @staticmethod
-    def cartesian_rotation(directions: torch.Tensor) -> torch.Tensor:
-        """Compute 3x3 Cartesian rotation matrix taking e_z to direction.
+    def cartesian_rot(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+        """Compute 3x3 Cartesian rotation matrix from axis-angle.
 
-        This uses Rodrigues formula to compute the rotation directly in
-        Cartesian coordinates, independent of the SH basis used by Wigner-D.
+        Uses Rodrigues formula: R = I + sin(θ)K + (1-cos(θ))K²
+        where K is the skew-symmetric matrix of the axis.
 
         Args:
-            directions: (..., 3) direction vectors (need not be normalized)
+            axis: (..., 3) rotation axis (should be normalized)
+            angle: (...) rotation angle in radians
 
         Returns:
-            R: (..., 3, 3) rotation matrix in Cartesian (x, y, z) basis
+            R: (..., 3, 3) rotation matrix
         """
-        # Normalize direction
-        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + 1e-8)
+        # Ensure axis is normalized
+        axis = axis / (torch.linalg.norm(axis, dim=-1, keepdim=True) + 1e-8)
 
-        # Rotation axis: e_z × d = (-d_y, d_x, 0)
-        ax = -d[..., 1]
-        ay = d[..., 0]
+        c = torch.cos(angle)
+        s = torch.sin(angle)
+        t = 1 - c
 
-        # Normalize axis (handle d ≈ ±e_z)
-        axis_norm = torch.sqrt(ax**2 + ay**2 + 1e-16)
-        ax = ax / axis_norm
-        ay = ay / axis_norm
+        x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
 
-        # Angle: arccos(d_z)
-        c = d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7)  # cos(theta)
-        s = torch.sqrt(1 - c**2)  # sin(theta)
-        t = 1 - c  # 1 - cos(theta)
+        # Rodrigues formula components
+        R = torch.zeros(*axis.shape[:-1], 3, 3, device=axis.device, dtype=axis.dtype)
 
-        # Rodrigues formula with axis = (ax, ay, 0)
-        R = torch.zeros(*directions.shape[:-1], 3, 3, device=directions.device, dtype=directions.dtype)
-
-        R[..., 0, 0] = c + t * ax * ax
-        R[..., 0, 1] = t * ax * ay
-        R[..., 0, 2] = s * ay
-        R[..., 1, 0] = t * ax * ay
-        R[..., 1, 1] = c + t * ay * ay
-        R[..., 1, 2] = -s * ax
-        R[..., 2, 0] = -s * ay
-        R[..., 2, 1] = s * ax
-        R[..., 2, 2] = c
+        R[..., 0, 0] = c + t * x * x
+        R[..., 0, 1] = t * x * y - s * z
+        R[..., 0, 2] = t * x * z + s * y
+        R[..., 1, 0] = t * x * y + s * z
+        R[..., 1, 1] = c + t * y * y
+        R[..., 1, 2] = t * y * z - s * x
+        R[..., 2, 0] = t * x * z - s * y
+        R[..., 2, 1] = t * y * z + s * x
+        R[..., 2, 2] = c + t * z * z
 
         return R
 

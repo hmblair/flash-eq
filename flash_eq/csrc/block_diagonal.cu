@@ -29,6 +29,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <c10/cuda/CUDAException.h>
+
+
+//------------------------------------------------------------------------------
+// Input Validation Macros
+//------------------------------------------------------------------------------
+
+#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
 
 //------------------------------------------------------------------------------
@@ -397,6 +407,12 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     int num_bins,
     int max_in_size
 ) {
+    CHECK_INPUT(features);
+    CHECK_INPUT(radial_table);
+    CHECK_INPUT(bin_lo);
+    CHECK_INPUT(interp_weight);
+    CHECK_INPUT(block_data);
+
     const int64_t B = features.size(0);  // num_edges
     const int Cin = static_cast<int>(features.size(1));
     const int Din = static_cast<int>(features.size(2));
@@ -421,6 +437,7 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
             B, Cin, Cout_int, Din, dim_out, Wdim, num_blocks, num_bins
         );
     }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {output};
 }
@@ -437,6 +454,13 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     int max_in_size,
     int max_out_size
 ) {
+    CHECK_INPUT(grad_output);
+    CHECK_INPUT(features);
+    CHECK_INPUT(radial_table);
+    CHECK_INPUT(bin_lo);
+    CHECK_INPUT(interp_weight);
+    CHECK_INPUT(block_data);
+
     const int64_t B = features.size(0);  // num_edges
     const int Cin = static_cast<int>(features.size(1));
     const int Din = static_cast<int>(features.size(2));
@@ -471,6 +495,7 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 B, Cin, Cout, Din, Dout, Wdim, num_blocks, num_bins
             );
         }));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
     // Table backward (scatter to bins)
@@ -491,6 +516,7 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 B, Cin, Cout, Din, Dout, Wdim, num_blocks, num_bins
             );
         }));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
     // Convert back to original dtype if needed

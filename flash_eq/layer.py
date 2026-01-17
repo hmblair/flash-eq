@@ -164,7 +164,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         # Step 2: Transform to m-first diagonal basis (PyTorch matmul)
         # f_diag = P^T @ edge_features
         # =====================================================================
-        f_diag = torch.einsum('eji,eci->ecj', P, edge_features)
+        f_diag = torch.einsum('eij,eci->ecj', P, edge_features)
 
         # =====================================================================
         # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)

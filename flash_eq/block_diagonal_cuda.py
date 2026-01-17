@@ -143,11 +143,11 @@ class _BlockDiagonalFunction(Function):
 
         grad_features, grad_radial_table, grad_interp_weight = cuda_module.backward(
             grad_output.contiguous(),
-            features,
-            radial_table,
-            bin_lo.int(),
-            interp_weight,
-            block_data,
+            features.contiguous(),
+            radial_table.contiguous(),
+            bin_lo.contiguous().int(),
+            interp_weight.contiguous(),
+            block_data.contiguous(),
             ctx.dim_in,
             ctx.max_in_size,
             ctx.max_out_size

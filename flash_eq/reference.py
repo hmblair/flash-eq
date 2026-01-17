@@ -16,48 +16,16 @@ where:
 """
 
 import torch
-from typing import List, Tuple
+from typing import Tuple
 
-from .representations import Repr, ProductRepr
-from .basis import _build_m_order_permutation
-
-
-def get_weight_dim(lvals_in: List[int], lvals_out: List[int] = None) -> int:
-    """Compute weight dimension for given lvals.
-
-    For each m from 0 to lmax:
-    - n_in(m) = number of input l's with l >= m
-    - n_out(m) = number of output l's with l >= m
-    - m=0 contributes n_in * n_out scalar parameters
-    - m>0 contributes 2 * n_in * n_out parameters (a, b for each coupling)
-
-    Args:
-        lvals_in: list of input l values
-        lvals_out: list of output l values (defaults to lvals_in)
-
-    Returns:
-        Total number of weight parameters
-    """
-    if lvals_out is None:
-        lvals_out = lvals_in
-
-    lmax = max(max(lvals_in), max(lvals_out))
-    weight_dim = 0
-
-    for m in range(lmax + 1):
-        n_in = sum(1 for l in lvals_in if l >= m)
-        n_out = sum(1 for l in lvals_out if l >= m)
-        if n_in > 0 and n_out > 0:
-            mult = 1 if m == 0 else 2
-            weight_dim += mult * n_in * n_out
-
-    return weight_dim
+from .representations import Repr
+from .basis import WignerDBasis
 
 
-def reference_expand_weights(
+def expand_weights(
     compact_weights: torch.Tensor,
-    lvals_in: List[int],
-    lvals_out: List[int] = None,
+    repr_in: Repr,
+    repr_out: Repr,
 ) -> torch.Tensor:
     """Expand compact block-diagonal weights to dense matrix in standard SH order.
 
@@ -71,30 +39,26 @@ def reference_expand_weights(
 
     Args:
         compact_weights: (weight_dim,) compact representation
-        lvals_in: list of input l values
-        lvals_out: list of output l values (defaults to lvals_in)
+        repr_in: input representation
+        repr_out: output representation
 
     Returns:
         W: (dim_out, dim_in) dense weight matrix in standard SH order
     """
-    if lvals_out is None:
-        lvals_out = lvals_in
+    lvals_in = repr_in.lvals
+    lvals_out = repr_out.lvals
 
     device = compact_weights.device
     dtype = compact_weights.dtype
-    dim_in = sum(2 * l + 1 for l in lvals_in)
-    dim_out = sum(2 * l + 1 for l in lvals_out)
-    lmax = max(max(lvals_in), max(lvals_out))
+    dim_in = repr_in.dim()
+    dim_out = repr_out.dim()
+    lmax = max(repr_in.lmax(), repr_out.lmax())
 
     W = torch.zeros(dim_out, dim_in, device=device, dtype=dtype)
 
     # Compute cumulative dimensions for indexing into standard SH order
-    cumdims_in = [0]
-    for l in lvals_in:
-        cumdims_in.append(cumdims_in[-1] + 2 * l + 1)
-    cumdims_out = [0]
-    for l in lvals_out:
-        cumdims_out.append(cumdims_out[-1] + 2 * l + 1)
+    cumdims_in = repr_in.cumdims()
+    cumdims_out = repr_out.cumdims()
 
     # Helper to get position of m within l-block in standard SH order
     # Standard order: m = -l, -l+1, ..., l, so position of m is l + m
@@ -154,16 +118,16 @@ def reference_layer(
     src_indices: torch.Tensor,
     directions: torch.Tensor,
     compact_weights: torch.Tensor,
-    lvals_in: List[int],
-    lvals_out: List[int] = None,
+    repr_in: Repr,
+    repr_out: Repr = None,
 ) -> torch.Tensor:
     """Canonical reference implementation of SO(3)-equivariant layer.
 
     Computes: out = Q @ W @ P^T @ f
 
     This is the simplest possible implementation:
-    1. Get P, Q from WignerDBasis (includes m-first permutation)
-    2. Build one W matrix in m-first order
+    1. Get P, Q from WignerDBasis
+    2. Build dense W matrix from compact weights
     3. Do the matmul
 
     Args:
@@ -171,63 +135,55 @@ def reference_layer(
         src_indices: (num_edges,) source node for each edge
         directions: (num_edges, 3) edge direction vectors
         compact_weights: (cout, cin, weight_dim) block-diagonal weights
-        lvals_in: list of input angular momentum values
-        lvals_out: list of output angular momentum values (defaults to lvals_in)
+        repr_in: input representation
+        repr_out: output representation (defaults to repr_in)
 
     Returns:
         output: (num_edges, cout, dim_out) in standard SH basis
     """
-    from .basis import WignerDBasis
-
-    if lvals_out is None:
-        lvals_out = lvals_in
+    if repr_out is None:
+        repr_out = repr_in
 
     cout, cin, _ = compact_weights.shape
-    dim_in = sum(2 * l + 1 for l in lvals_in)
-    dim_out = sum(2 * l + 1 for l in lvals_out)
     device = node_features.device
     dtype = node_features.dtype
 
     # 1. Get P, Q from WignerDBasis
-    repr_in = Repr(lvals=lvals_in, mult=1)
-    repr_out = Repr(lvals=lvals_out, mult=1)
     basis = WignerDBasis(repr_in, repr_out)
-    P, Q = basis(directions)  # (num_edges, dim_in, dim_in), (num_edges, dim_out, dim_out)
+    P, Q = basis(directions)
     P = P.to(dtype)
     Q = Q.to(dtype)
 
     # 2. Build W matrices for all (cout, cin) pairs
-    W = torch.zeros(cout, cin, dim_out, dim_in, device=device, dtype=dtype)
-    for o in range(cout):
-        for c in range(cin):
-            W[o, c] = reference_expand_weights(compact_weights[o, c], lvals_in, lvals_out)
+    W = torch.stack([
+        torch.stack([expand_weights(compact_weights[o, c], repr_in, repr_out) for c in range(cin)])
+        for o in range(cout)
+    ])  # (cout, cin, dim_out, dim_in)
 
     # 3. Gather features and compute Q @ W @ P^T @ f
     f = node_features[src_indices]  # (num_edges, cin, dim_in)
 
-    # P^T @ f: (num_edges, dim_in, dim_in) @ (num_edges, cin, dim_in).T -> need einsum
-    # f_diag[e, c, i] = sum_j P[e, j, i] * f[e, c, j] = (P^T @ f)[e, c, i]
+    # P^T @ f: f @ P computes f_diag[e, c, i] = sum_j f[e, c, j] * P[e, j, i]
     f_diag = f @ P  # (num_edges, cin, dim_in)
 
-    # W @ f_diag: (cout, cin, dim_out, dim_in) @ (num_edges, cin, dim_in)
-    # out[e, o, i] = sum_c sum_j W[o, c, i, j] * f_diag[e, c, j]
+    # W @ f_diag: out[e, o, i] = sum_c sum_j W[o, c, i, j] * f_diag[e, c, j]
     Wf = torch.einsum('ocij,ecj->eoi', W, f_diag)  # (num_edges, cout, dim_out)
 
-    # Q @ Wf: (num_edges, dim_out, dim_out) @ (num_edges, cout, dim_out)
-    # out[e, o, i] = sum_j Q[e, i, j] * Wf[e, o, j]
+    # Q @ Wf: out[e, o, i] = sum_j Q[e, i, j] * Wf[e, o, j]
     output = Wf @ Q.mT  # (num_edges, cout, dim_out)
 
     return output
 
 
-def reference_equivariance_test(
+def equivariance_test(
     node_features: torch.Tensor,
     src_indices: torch.Tensor,
     directions: torch.Tensor,
     compact_weights: torch.Tensor,
-    lvals_in: List[int],
-    lvals_out: List[int],
-    rotation_matrix: torch.Tensor,
+    repr_in: Repr,
+    repr_out: Repr,
+    axis: torch.Tensor,
+    angle: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """Test equivariance of the reference implementation.
 
@@ -241,39 +197,35 @@ def reference_equivariance_test(
         src_indices: (num_edges,)
         directions: (num_edges, 3)
         compact_weights: (cout, cin, weight_dim)
-        lvals_in: list of input l values
-        lvals_out: list of output l values
-        rotation_matrix: (3, 3) rotation matrix
+        repr_in: input representation
+        repr_out: output representation
+        axis: (..., 3) rotation axis (normalized)
+        angle: (...) rotation angle in radians
 
     Returns:
         output_then_rotate: D_out @ layer(f, d)
         rotate_then_output: layer(D_in @ f, R @ d)
         relative_error: ||difference|| / ||expected||
     """
-    repr_in = Repr(lvals=lvals_in, mult=1)
-    repr_out = Repr(lvals=lvals_out, mult=1)
-
-    # Compute rotation axis and angle from matrix
-    from scipy.spatial.transform import Rotation
-    R_scipy = Rotation.from_matrix(rotation_matrix.cpu().numpy())
-    rotvec = R_scipy.as_rotvec()
-    angle = torch.tensor(float(torch.norm(torch.tensor(rotvec))))
-    axis = torch.tensor(rotvec) / (angle + 1e-12)
+    device = node_features.device
+    dtype = node_features.dtype
 
     # Wigner-D for input and output representations
-    D_in = repr_in.rot(axis, angle).to(node_features.dtype).to(node_features.device)
-    D_out = repr_out.rot(axis, angle).to(node_features.dtype).to(node_features.device)
+    D_in = repr_in.rot(axis, angle).to(dtype).to(device)
+    D_out = repr_out.rot(axis, angle).to(dtype).to(device)
+
+    # 3x3 rotation matrix for directions (l=1 Wigner-D with cartesian=True)
+    R = Repr(lvals=[1]).rot(axis, angle, cartesian=True).to(dtype).to(device)
 
     # Method 1: compute output, then rotate
-    output = reference_layer(node_features, src_indices, directions, compact_weights, lvals_in, lvals_out)
+    output = reference_layer(node_features, src_indices, directions, compact_weights, repr_in, repr_out)
     output_then_rotate = torch.einsum('ij,ecj->eci', D_out, output)
 
     # Method 2: rotate inputs, then compute output
     rotated_features = torch.einsum('ij,ncj->nci', D_in, node_features)
-    # Use the original 3x3 rotation matrix for directions (Cartesian coordinates)
-    rotated_directions = directions @ rotation_matrix.T
+    rotated_directions = directions @ R.T
     rotate_then_output = reference_layer(
-        rotated_features, src_indices, rotated_directions, compact_weights, lvals_in, lvals_out
+        rotated_features, src_indices, rotated_directions, compact_weights, repr_in, repr_out
     )
 
     # Compute error

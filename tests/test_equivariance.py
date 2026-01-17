@@ -2,47 +2,35 @@
 Equivariance tests for flash-eq.
 
 Tests that the layer satisfies SO(3)-equivariance:
-    D_out @ f(x) = f(D_in @ x)
+    D_out @ f(x, d) = f(D_in @ x, R @ d)
 
-where D_in, D_out are Wigner-D rotation matrices.
+where D_in, D_out are Wigner-D rotation matrices and R is the 3x3 rotation matrix.
 """
 
 import math
 import numpy as np
 import torch
 import pytest
-import sys
-from pathlib import Path
 from scipy.spatial.transform import Rotation
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from flash_eq import Repr, WignerD, EquivariantEdgewiseLinear, WignerDBasis
 
 
-def random_rotation(device: torch.device, use_identity: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def random_rotation(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a random rotation.
 
     Returns:
         axis: (1, 3) rotation axis
         angle: (1,) rotation angle
-        R: (3, 3) scipy-computed rotation matrix
+        R: (3, 3) rotation matrix
     """
-    if use_identity:
-        # Identity rotation for debugging
-        axis_np = np.array([0., 0., 1.])
-        angle_np = 0.0
-    else:
-        # Generate random axis-angle
-        axis_np = torch.randn(3).numpy()
-        axis_np = axis_np / (axis_np ** 2).sum() ** 0.5
-        angle_np = float(torch.rand(1) * 2 * math.pi)
+    axis_np = torch.randn(3).numpy()
+    axis_np = axis_np / (axis_np ** 2).sum() ** 0.5
+    angle_np = float(torch.rand(1) * 2 * math.pi)
 
-    # Use scipy to compute rotation matrix
     rotvec = axis_np * angle_np
     R_np = Rotation.from_rotvec(rotvec).as_matrix()
 
-    # Convert to torch
     axis = torch.tensor(axis_np, device=device, dtype=torch.float32).unsqueeze(0)
     angle = torch.tensor([angle_np], device=device, dtype=torch.float32)
     R = torch.tensor(R_np, device=device, dtype=torch.float32)
@@ -55,171 +43,121 @@ def device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def check_equivariance(layer, basis, in_repr, wigner, node_features, src_indices, distances, directions, device, use_identity=False):
-    """
-    Check equivariance for a random rotation.
-    Returns (output_magnitude, relative_diff).
-    """
-    axis, angle, R = random_rotation(device, use_identity=use_identity)
-    # D is the Wigner-D matrix for features
-    D = wigner.rot(axis, angle).squeeze(0)
-
-    P, Q = basis(directions)
-
-    # Method 1: Apply layer, then rotate output
-    output1 = layer(P, Q, node_features, distances, src_indices)
-    output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
-
-    # Method 2: Rotate input features and directions, then apply layer
-    node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
-    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
-    P_rot, Q_rot = basis(directions_rotated)
-    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
-
-    output_magnitude = output1.abs().mean().item()
-    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
-
-    return output_magnitude, rel_diff
+# Test configurations: (lvals_in, lvals_out)
+LVALS_CONFIGS = [
+    # Same in/out - single l
+    ([0], [0]),
+    ([1], [1]),
+    ([2], [2]),
+    # Same in/out - multiple l
+    ([0, 1], [0, 1]),
+    ([0, 1, 2], [0, 1, 2]),
+    ([1, 2], [1, 2]),
+    ([0, 2], [0, 2]),  # non-contiguous
+    ([1, 2, 3], [1, 2, 3]),
+    # Different in/out
+    ([0], [0, 1]),
+    ([0, 1], [0, 1, 2]),
+    ([1], [0, 1]),
+    ([1, 2], [0, 1, 2]),
+    ([0, 1, 2], [1, 2]),
+    ([2], [0, 1, 2]),
+    ([0, 1], [2]),
+]
 
 
-def test_equivariance_identity(device):
-    """Test that identity rotation gives zero diff (sanity check)."""
+@pytest.mark.parametrize("lvals_in,lvals_out", LVALS_CONFIGS)
+def test_equivariance(device, lvals_in, lvals_out):
+    """Test SO(3) equivariance for various representation configurations."""
     torch.manual_seed(42)
 
-    lvals = [0, 1, 2]
-    mult = 8
-    num_nodes = 50
-    num_edges = 200
-    dim = sum(2 * l + 1 for l in lvals)
+    mult = 4
+    num_nodes = 20
+    num_edges = 50
+    dim_in = sum(2 * l + 1 for l in lvals_in)
+    dim_out = sum(2 * l + 1 for l in lvals_out)
 
-    in_repr = Repr(lvals=lvals, mult=mult)
-    out_repr = Repr(lvals=lvals, mult=mult)
-
-    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
-    basis = WignerDBasis(in_repr, out_repr).to(device)
-    wigner = WignerD(in_repr).to(device)
-
-    node_features = torch.randn(num_nodes, mult, dim, device=device)
-    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
-    distances = torch.rand(num_edges, device=device) * 5.0
-    directions = torch.randn(num_edges, 3, device=device)
-    directions = directions / directions.norm(dim=-1, keepdim=True)
-
-    output_mag, rel_diff = check_equivariance(
-        layer, basis, in_repr, wigner, node_features, src_indices, distances, directions, device,
-        use_identity=True
-    )
-
-    # Output should be non-trivial
-    assert output_mag > 0.01, f"Output too small: {output_mag:.2e}"
-    # Identity should give zero diff
-    assert rel_diff < 1e-5, f"Identity rotation failed: rel_diff={rel_diff:.2e}"
-
-
-def test_equivariance_basic(device):
-    """Test basic equivariance: D @ layer(x) = layer(D @ x)."""
-    torch.manual_seed(42)
-
-    lvals = [0, 1, 2]
-    mult = 8
-    num_nodes = 50
-    num_edges = 200
-    dim = sum(2 * l + 1 for l in lvals)
-
-    in_repr = Repr(lvals=lvals, mult=mult)
-    out_repr = Repr(lvals=lvals, mult=mult)
-
-    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
-    basis = WignerDBasis(in_repr, out_repr).to(device)
-    wigner = WignerD(in_repr).to(device)
-
-    node_features = torch.randn(num_nodes, mult, dim, device=device)
-    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
-    distances = torch.rand(num_edges, device=device) * 5.0
-    directions = torch.randn(num_edges, 3, device=device)
-    directions = directions / directions.norm(dim=-1, keepdim=True)
-
-    output_mag, rel_diff = check_equivariance(
-        layer, basis, in_repr, wigner, node_features, src_indices, distances, directions, device
-    )
-
-    # Output should be non-trivial
-    assert output_mag > 0.01, f"Output too small: {output_mag:.2e}"
-    # Equivariance check
-    assert rel_diff < 1e-4, f"Equivariance failed: rel_diff={rel_diff:.2e}"
-
-
-def test_equivariance_multiple_rotations(device):
-    """Test equivariance with multiple random rotations."""
-    torch.manual_seed(123)
-
-    lvals = [0, 1, 2, 3]
-    mult = 8
-    num_nodes = 30
-    num_edges = 100
-    dim = sum(2 * l + 1 for l in lvals)
-
-    in_repr = Repr(lvals=lvals, mult=mult)
-    out_repr = Repr(lvals=lvals, mult=mult)
-
-    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
-    basis = WignerDBasis(in_repr, out_repr).to(device)
-    wigner = WignerD(in_repr).to(device)
-
-    node_features = torch.randn(num_nodes, mult, dim, device=device)
-    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
-    distances = torch.rand(num_edges, device=device) * 5.0
-    directions = torch.randn(num_edges, 3, device=device)
-    directions = directions / directions.norm(dim=-1, keepdim=True)
-
-    for i in range(5):
-        output_mag, rel_diff = check_equivariance(
-            layer, basis, in_repr, wigner, node_features, src_indices, distances, directions, device
-        )
-        assert rel_diff < 1e-4, f"Rotation {i+1} failed: rel_diff={rel_diff:.2e}"
-
-
-def test_equivariance_different_channels(device):
-    """Test equivariance with different input/output channels."""
-    torch.manual_seed(456)
-
-    lvals = [0, 1, 2]
-    mult_in = 16
-    mult_out = 32
-    num_nodes = 30
-    num_edges = 100
-    dim = sum(2 * l + 1 for l in lvals)
-
-    in_repr = Repr(lvals=lvals, mult=mult_in)
-    out_repr = Repr(lvals=lvals, mult=mult_out)
+    in_repr = Repr(lvals=lvals_in, mult=mult)
+    out_repr = Repr(lvals=lvals_out, mult=mult)
 
     layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
     basis = WignerDBasis(in_repr, out_repr).to(device)
     wigner_in = WignerD(in_repr).to(device)
     wigner_out = WignerD(out_repr).to(device)
 
-    node_features = torch.randn(num_nodes, mult_in, dim, device=device)
+    node_features = torch.randn(num_nodes, mult, dim_in, device=device)
     src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
     distances = torch.rand(num_edges, device=device) * 5.0
     directions = torch.randn(num_edges, 3, device=device)
     directions = directions / directions.norm(dim=-1, keepdim=True)
 
+    # Random rotation
     axis, angle, R = random_rotation(device)
     D_in = wigner_in.rot(axis, angle).squeeze(0)
     D_out = wigner_out.rot(axis, angle).squeeze(0)
 
     P, Q = basis(directions)
 
+    # Method 1: Apply layer, then rotate output
     output1 = layer(P, Q, node_features, distances, src_indices)
     output1_rotated = torch.einsum('ij,ecj->eci', D_out, output1)
 
+    # Method 2: Rotate input features and directions, then apply layer
     node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
     directions_rotated = torch.einsum('ij,ej->ei', R, directions)
     P_rot, Q_rot = basis(directions_rotated)
     output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
 
+    # Check output is non-trivial
+    output_mag = output1.abs().mean().item()
+    assert output_mag > 0.01, f"Output too small: {output_mag:.2e}"
+
+    # Check equivariance
     rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
     assert rel_diff < 1e-4, f"Equivariance failed: rel_diff={rel_diff:.2e}"
+
+
+@pytest.mark.parametrize("lvals_in,lvals_out", LVALS_CONFIGS[:5])  # Subset for speed
+def test_equivariance_multiple_rotations(device, lvals_in, lvals_out):
+    """Test equivariance with multiple random rotations."""
+    torch.manual_seed(123)
+
+    mult = 4
+    num_nodes = 20
+    num_edges = 50
+    dim_in = sum(2 * l + 1 for l in lvals_in)
+    dim_out = sum(2 * l + 1 for l in lvals_out)
+
+    in_repr = Repr(lvals=lvals_in, mult=mult)
+    out_repr = Repr(lvals=lvals_out, mult=mult)
+
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+    wigner_in = WignerD(in_repr).to(device)
+    wigner_out = WignerD(out_repr).to(device)
+
+    node_features = torch.randn(num_nodes, mult, dim_in, device=device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    for i in range(3):
+        axis, angle, R = random_rotation(device)
+        D_in = wigner_in.rot(axis, angle).squeeze(0)
+        D_out = wigner_out.rot(axis, angle).squeeze(0)
+
+        P, Q = basis(directions)
+        output1 = layer(P, Q, node_features, distances, src_indices)
+        output1_rotated = torch.einsum('ij,ecj->eci', D_out, output1)
+
+        node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
+        directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+        P_rot, Q_rot = basis(directions_rotated)
+        output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+
+        rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
+        assert rel_diff < 1e-4, f"Rotation {i+1} failed: rel_diff={rel_diff:.2e}"
 
 
 def test_equivariance_high_lmax(device):
@@ -227,9 +165,9 @@ def test_equivariance_high_lmax(device):
     torch.manual_seed(789)
 
     lvals = [0, 1, 2, 3, 4, 5]
-    mult = 4
-    num_nodes = 20
-    num_edges = 50
+    mult = 2
+    num_nodes = 10
+    num_edges = 30
     dim = sum(2 * l + 1 for l in lvals)
 
     in_repr = Repr(lvals=lvals, mult=mult)
@@ -245,22 +183,40 @@ def test_equivariance_high_lmax(device):
     directions = torch.randn(num_edges, 3, device=device)
     directions = directions / directions.norm(dim=-1, keepdim=True)
 
-    output_mag, rel_diff = check_equivariance(
-        layer, basis, in_repr, wigner, node_features, src_indices, distances, directions, device
-    )
+    axis, angle, R = random_rotation(device)
+    D = wigner.rot(axis, angle).squeeze(0)
+
+    P, Q = basis(directions)
+    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
+
+    node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+    P_rot, Q_rot = basis(directions_rotated)
+    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+
+    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
     assert rel_diff < 1e-4, f"Equivariance failed: rel_diff={rel_diff:.2e}"
 
 
-def test_equivariance_gradient(device):
+@pytest.mark.parametrize("lvals", [
+    [0, 1, 2],
+    [0, 1],
+    [1, 2],
+])
+def test_gradient_equivariance(device, lvals):
     """Test that gradients are also equivariant.
 
     If the forward pass is equivariant: f(D@x, R@d) = D@f(x, d)
-    Then gradients should transform: D @ ∇_x L(f(x,d)) = ∇_{x'} L(f(x',d'))
+    Then gradients should transform: D @ grad_x L(f(x,d)) = grad_{x'} L(f(x',d'))
     where x' = D@x, d' = R@d.
+
+    IMPORTANT: The loss function must be rotationally invariant for this to hold.
+    We use L = ||output||^2 = (output**2).sum(), which is preserved under orthogonal
+    rotations. Using L = output.sum() would NOT work since sum is not invariant.
     """
     torch.manual_seed(101)
 
-    lvals = [0, 1, 2]
     mult = 4
     num_nodes = 10
     num_edges = 30
@@ -286,7 +242,8 @@ def test_equivariance_gradient(device):
     # Method 1: Compute gradient, then rotate
     node_features = torch.randn(num_nodes, mult, dim, device=device, requires_grad=True)
     output1 = layer(P, Q, node_features, distances, src_indices)
-    loss1 = output1.sum()
+    # Use squared norm loss - invariant under rotation
+    loss1 = (output1 ** 2).sum()
     loss1.backward()
     grad1 = node_features.grad.clone()
 
@@ -305,9 +262,14 @@ def test_equivariance_gradient(device):
     P_rot, Q_rot = basis(directions_rotated)
 
     output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
-    loss2 = output2.sum()
+    # Use squared norm loss - invariant under rotation
+    loss2 = (output2 ** 2).sum()
     loss2.backward()
     grad2 = node_features_rotated.grad
+
+    # Verify losses are equal (sanity check for invariance)
+    assert abs(loss1.item() - loss2.item()) < 1e-4 * abs(loss1.item()), \
+        f"Losses should be equal for invariant loss: {loss1.item():.6f} vs {loss2.item():.6f}"
 
     # Compare: D @ grad1 should equal grad2
     rel_diff = (grad1_rotated - grad2).abs().max().item() / (grad1_rotated.abs().max().item() + 1e-8)

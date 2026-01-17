@@ -27,7 +27,7 @@ def expand_weights(
     repr_in: Repr,
     repr_out: Repr,
 ) -> torch.Tensor:
-    """Expand compact block-diagonal weights to dense matrix in standard SH order.
+    """Expand compact block-diagonal weights to dense matrix in m-first order.
 
     The compact weights are in m-first order matching the kernel format:
     - For m=0: n_in * n_out scalars (coupling all l_in to all l_out at m=0)
@@ -43,7 +43,7 @@ def expand_weights(
         repr_out: output representation
 
     Returns:
-        W: (dim_out, dim_in) dense weight matrix in standard SH order
+        W: (dim_out, dim_in) dense weight matrix in m-first order
     """
     lvals_in = repr_in.lvals
     lvals_out = repr_out.lvals
@@ -56,19 +56,21 @@ def expand_weights(
 
     W = torch.zeros(dim_out, dim_in, device=device, dtype=dtype)
 
-    # Compute cumulative dimensions for indexing into standard SH order
-    cumdims_in = repr_in.cumdims()
-    cumdims_out = repr_out.cumdims()
+    # Compute m-first positions
+    # m=0: one position per l, then m>0: two positions per l (for +m, -m paired)
+    def m_first_offset_in(m: int) -> int:
+        """Starting index for m-block in input."""
+        offset = len(lvals_in)  # m=0 block size
+        for mp in range(1, m):
+            offset += 2 * sum(1 for l in lvals_in if l >= mp)
+        return offset
 
-    # Helper to get position of m within l-block in standard SH order
-    # Standard order: m = -l, -l+1, ..., l, so position of m is l + m
-    def std_pos_in(l_idx: int, m: int) -> int:
-        l = lvals_in[l_idx]
-        return cumdims_in[l_idx] + l + m
-
-    def std_pos_out(l_idx: int, m: int) -> int:
-        l = lvals_out[l_idx]
-        return cumdims_out[l_idx] + l + m
+    def m_first_offset_out(m: int) -> int:
+        """Starting index for m-block in output."""
+        offset = len(lvals_out)  # m=0 block size
+        for mp in range(1, m):
+            offset += 2 * sum(1 for l in lvals_out if l >= mp)
+        return offset
 
     w_idx = 0
 
@@ -82,29 +84,29 @@ def expand_weights(
 
         if m == 0:
             # m=0: scalar coupling between all (l_out, l_in) pairs
-            for out_idx in out_l_indices:
-                for in_idx in in_l_indices:
-                    pos_out = std_pos_out(out_idx, 0)
-                    pos_in = std_pos_in(in_idx, 0)
-                    W[pos_out, pos_in] = compact_weights[w_idx]
+            # Positions are simply the l-index within the m=0 block
+            for out_local, out_idx in enumerate(out_l_indices):
+                for in_local, in_idx in enumerate(in_l_indices):
+                    W[out_local, in_local] = compact_weights[w_idx]
                     w_idx += 1
         else:
             # m>0: 2x2 block [[a, b], [-b, a]] for each (l_out, l_in) pair
-            # The block couples (m, -m) positions
-            for out_idx in out_l_indices:
-                for in_idx in in_l_indices:
+            base_in = m_first_offset_in(m)
+            base_out = m_first_offset_out(m)
+
+            for out_local, out_idx in enumerate(out_l_indices):
+                for in_local, in_idx in enumerate(in_l_indices):
                     a = compact_weights[w_idx]
                     b = compact_weights[w_idx + 1]
                     w_idx += 2
 
-                    # Positions for +m and -m in standard order
-                    pos_out_plus = std_pos_out(out_idx, m)
-                    pos_out_minus = std_pos_out(out_idx, -m)
-                    pos_in_plus = std_pos_in(in_idx, m)
-                    pos_in_minus = std_pos_in(in_idx, -m)
+                    # Positions in m-first order: +m and -m are adjacent for each l
+                    pos_out_plus = base_out + 2 * out_local
+                    pos_out_minus = base_out + 2 * out_local + 1
+                    pos_in_plus = base_in + 2 * in_local
+                    pos_in_minus = base_in + 2 * in_local + 1
 
                     # 2x2 block structure: [[a, b], [-b, a]]
-                    # Maps (in_plus, in_minus) -> (out_plus, out_minus)
                     W[pos_out_plus, pos_in_plus] = a
                     W[pos_out_plus, pos_in_minus] = b
                     W[pos_out_minus, pos_in_plus] = -b

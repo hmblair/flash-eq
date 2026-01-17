@@ -122,8 +122,12 @@ class WignerDBasis(nn.Module):
         # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
         # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
         # cartesian=True because directions are in Cartesian (x,y,z) coordinates
-        P = self.repr_in.rot_to_ez(directions).mT
-        Q = self.repr_out.rot_to_ez(directions).mT
+        P_std = self.repr_in.rot_to_ez(directions).mT
+        Q_std = self.repr_out.rot_to_ez(directions).mT
+
+        # Permute to m-first order for block-diagonal structure
+        P = P_std[..., self._perm_in]
+        Q = Q_std[..., self._perm_out]
 
         return P, Q
 

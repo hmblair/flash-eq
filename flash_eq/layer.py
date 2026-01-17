@@ -135,8 +135,6 @@ class EquivariantEdgewiseLinear(nn.Module):
             output: (num_edges, channels_out, dim_out)
                 Edge features in standard SH basis.
         """
-        dtype = node_features.dtype
-
         # =====================================================================
         # Step 1: Gather node features to edges (PyTorch)
         # =====================================================================
@@ -144,18 +142,17 @@ class EquivariantEdgewiseLinear(nn.Module):
 
         # =====================================================================
         # Step 2: Transform to m-first diagonal basis (PyTorch matmul)
-        # f_diag = P^T @ edge_features
+        # f_diag = P^T @ edge_features, equivalent to edge_features @ P
         # =====================================================================
-        f_diag = torch.einsum('eij,eci->ecj', P, edge_features)
+        f_diag = torch.bmm(edge_features, P)
 
         # =====================================================================
         # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
-        radial_table = self.radial_mlp()
         out_diag = block_diagonal_cuda(
             f_diag,
-            radial_table.to(dtype),
+            self.radial_mlp(),
             distances,
             self.product_repr,
             self.min_dist,
@@ -164,9 +161,9 @@ class EquivariantEdgewiseLinear(nn.Module):
 
         # =====================================================================
         # Step 4: Transform back to standard SH basis (PyTorch matmul)
-        # out = Q @ out_diag
+        # out = Q @ out_diag, equivalent to out_diag @ Q^T
         # =====================================================================
-        return torch.einsum('eij,ecj->eci', Q, out_diag)
+        return torch.bmm(out_diag, Q.mT)
 
     def extra_repr(self) -> str:
         return (

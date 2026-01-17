@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
 
 from .representations import Repr, ProductRepr
 from .block_diagonal_cuda import block_diagonal_cuda
@@ -87,13 +86,9 @@ class EquivariantEdgewiseLinear(nn.Module):
         self.min_dist = min_dist
         self.max_dist = max_dist
 
-        # Store representations as submodules (for .to() device transfer)
-        self.add_module('_in_repr', in_repr)
-        self.add_module('_out_repr', out_repr)
-
         # Compute weight structure from representation product
-        self._product = ProductRepr(in_repr, out_repr)
-        self.weight_dim = self._product.nreps()
+        self.product_repr = ProductRepr(in_repr, out_repr)
+        self.weight_dim = self.product_repr.nreps()
         self.channels_in = in_repr.mult
         self.channels_out = out_repr.mult
 
@@ -108,17 +103,6 @@ class EquivariantEdgewiseLinear(nn.Module):
             max_dist=max_dist,
             num_layers=radial_layers,
         )
-
-        # Block metadata (built lazily on first forward)
-        self._metadata: Optional[Tuple] = None
-        self._metadata_device: Optional[torch.device] = None
-
-    def _get_metadata(self, device: torch.device):
-        """Get or build CUDA kernel metadata for the given device."""
-        if self._metadata is None or self._metadata_device != device:
-            self._metadata = self._product.build_block_metadata(device)
-            self._metadata_device = device
-        return self._metadata
 
     def forward(
         self,
@@ -151,9 +135,7 @@ class EquivariantEdgewiseLinear(nn.Module):
             output: (num_edges, channels_out, dim_out)
                 Edge features in standard SH basis.
         """
-        device = node_features.device
         dtype = node_features.dtype
-        metadata = self._get_metadata(device)
 
         # =====================================================================
         # Step 1: Gather node features to edges (PyTorch)
@@ -175,7 +157,7 @@ class EquivariantEdgewiseLinear(nn.Module):
             f_diag,
             radial_table.to(dtype),
             distances,
-            metadata,
+            self.product_repr,
             self.min_dist,
             self.max_dist,
         )

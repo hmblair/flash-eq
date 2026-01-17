@@ -15,10 +15,9 @@ The kernel does NOT handle:
 
 Optimizations:
     - Binned radial weights: O(bins) memory instead of O(edges)
-    - Bin-sorted edge ordering: L2 cache locality for weight table
     - Linear interpolation between bin edges
 
-Supports FP32 and FP64. Also supports FP16.
+Supports FP32, FP64, and FP16.
 """
 
 import os
@@ -26,9 +25,10 @@ import torch
 from torch.autograd import Function
 from torch.utils.cpp_extension import load
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import TYPE_CHECKING
 
-from .representations import Repr, ProductRepr
+if TYPE_CHECKING:
+    from .representations import ProductRepr
 
 # Set CUDA_HOME if available
 if os.path.exists("/usr/local/cuda-12.6"):
@@ -49,60 +49,6 @@ def _get_cuda_module():
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
     return _cuda_module
-
-
-# =============================================================================
-# Metadata Construction
-# =============================================================================
-
-def build_block_metadata(
-    in_repr: Union[Repr, List[int]],
-    out_repr: Union[Repr, List[int]],
-    device: torch.device
-) -> Tuple[torch.Tensor, int, int, int]:
-    """
-    Build metadata tensors describing the block-diagonal structure.
-
-    The block structure groups components by |m| value:
-        m=0: n_in × n_out block (real scalars)
-        m>0: 2×n_in × 2×n_out block (complex, stored as real/imag pairs)
-
-    Args:
-        in_repr: Input representation (Repr or list of l-values).
-        out_repr: Output representation (Repr or list of l-values).
-        device: Target device for metadata tensors.
-
-    Returns:
-        Tuple of (block_data, dim_out, max_in_size, max_out_size):
-            block_data: (num_blocks, 6) int32 tensor with columns
-                        [m, n_in, n_out, in_offset, out_offset, weight_offset]
-            dim_out: Total output dimension.
-            max_in_size: Largest input block size (for shared memory).
-            max_out_size: Largest output block size (for shared memory).
-    """
-    if isinstance(in_repr, list):
-        in_repr = Repr(lvals=in_repr)
-    if isinstance(out_repr, list):
-        out_repr = Repr(lvals=out_repr)
-
-    return ProductRepr(in_repr, out_repr).build_block_metadata(device)
-
-
-def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
-    """
-    Compute the weight dimension for given input/output representations.
-
-    This is the number of scalar weights per (channel_out, channel_in) pair
-    in the block-diagonal parameterization.
-
-    Args:
-        lvals_in: List of input angular momentum values.
-        lvals_out: List of output angular momentum values.
-
-    Returns:
-        Weight dimension (sum over blocks of block_size).
-    """
-    return ProductRepr(Repr(lvals=lvals_in), Repr(lvals=lvals_out)).nreps()
 
 
 # =============================================================================
@@ -158,51 +104,6 @@ class _BlockDiagonalFunction(Function):
 
 
 # =============================================================================
-# Bin Sorting (Cache Optimization)
-# =============================================================================
-
-def _compute_bin_sorted_order(
-    distances: torch.Tensor,
-    num_bins: int,
-    min_dist: float,
-    max_dist: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Sort edges by distance bin for improved cache locality.
-
-    Edges accessing similar bins are grouped together, improving L2 cache
-    hit rate when reading the radial weight table.
-
-    Args:
-        distances: (num_edges,) edge distances.
-        num_bins: Number of bins in the radial table.
-        min_dist: Minimum distance (maps to bin 0).
-        max_dist: Maximum distance (maps to bin num_bins).
-
-    Returns:
-        sorted_order: (num_edges,) indices to reorder edges by bin.
-        unsort_indices: (num_edges,) indices to restore original order.
-        bin_lo: (num_edges,) lower bin index for each sorted edge.
-        interp_weight: (num_edges,) interpolation weight t in [0,1] for each sorted edge.
-    """
-    distances_f32 = distances.float()
-    inv_bin_width = num_bins / (max_dist - min_dist)
-    normalized = (distances_f32 - min_dist) * inv_bin_width
-    normalized = normalized.clamp(0.0, num_bins)
-    bin_lo = normalized.floor().int().clamp(max=num_bins - 1)
-
-    # Stable sort preserves order within bins
-    sorted_order = torch.argsort(bin_lo, stable=True)
-    unsort_indices = torch.argsort(sorted_order)
-
-    bin_lo_sorted = bin_lo[sorted_order]
-    normalized_sorted = normalized[sorted_order]
-    interp_weight = (normalized_sorted - bin_lo_sorted.float()).clamp(0.0, 1.0)
-
-    return sorted_order, unsort_indices, bin_lo_sorted, interp_weight
-
-
-# =============================================================================
 # Main Public API
 # =============================================================================
 
@@ -210,7 +111,7 @@ def block_diagonal_cuda(
     features: torch.Tensor,
     radial_table: torch.Tensor,
     distances: torch.Tensor,
-    metadata: Tuple[torch.Tensor, int, int, int],
+    product_repr: "ProductRepr",
     min_dist: float = 0.0,
     max_dist: float = 10.0,
 ) -> torch.Tensor:
@@ -231,7 +132,7 @@ def block_diagonal_cuda(
             Block-diagonal weights at bin edges. Interpolated linearly.
         distances: (num_edges,)
             Edge distances for weight interpolation.
-        metadata: Tuple from build_block_metadata().
+        product_repr: ProductRepr describing input/output representation structure.
         min_dist: Minimum distance for binning (default 0.0).
         max_dist: Maximum distance for binning (default 10.0).
 
@@ -239,24 +140,23 @@ def block_diagonal_cuda(
         output: (num_edges, channels_out, dim_out)
             Output features in m-first diagonal basis.
     """
-    block_data, dim_out, max_in_size, max_out_size = metadata
+    device = features.device
     num_bins = radial_table.size(0) - 1
     channels_out = radial_table.size(1)
 
-    # Sort edges by bin for cache locality
-    sorted_order, unsort_indices, bin_lo, interp_weight = _compute_bin_sorted_order(
-        distances, num_bins, min_dist, max_dist
-    )
-    interp_weight = interp_weight.to(features.dtype)
+    # Build block metadata from ProductRepr
+    block_data, dim_out, max_in_size, max_out_size = product_repr.block_metadata(device)
 
-    # Reorder features to match sorted order
-    features_sorted = features[sorted_order]
+    # Compute bin indices and interpolation weights
+    distances_f32 = distances.float()
+    inv_bin_width = num_bins / (max_dist - min_dist)
+    normalized = (distances_f32 - min_dist) * inv_bin_width
+    normalized = normalized.clamp(0.0, num_bins)
+    bin_lo = normalized.floor().int().clamp(max=num_bins - 1)
+    interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0).to(features.dtype)
 
     # Run kernel
-    output_sorted = _BlockDiagonalFunction.apply(
-        features_sorted, radial_table, bin_lo, interp_weight,
+    return _BlockDiagonalFunction.apply(
+        features, radial_table, bin_lo, interp_weight,
         channels_out, num_bins, block_data, dim_out, max_in_size, max_out_size
     )
-
-    # Restore original edge order
-    return output_sorted[unsort_indices]

@@ -17,23 +17,23 @@ import torch.nn as nn
 from .representations import Repr, WignerD
 
 
-def _build_m_order_permutation(lvals: list[int]) -> torch.Tensor:
+def _build_m_order_permutation(lvals: torch.Tensor) -> torch.Tensor:
     """Build permutation from standard (ℓ,m) order to m-first order.
 
     Standard order: [l=0,m=0], [l=1,m=-1,0,1], [l=2,m=-2,-1,0,1,2], ...
     M-first order: [m=0 components] [m=1 reals] [m=1 imags] [m=2 reals] ...
 
     Args:
-        lvals: List of angular momentum values in the representation
+        lvals: Tensor of angular momentum values in the representation
 
     Returns:
         Permutation tensor of shape (dim,)
     """
     perm = []
-    lmax = max(lvals) if lvals else 0
+    lmax = int(lvals.max()) if len(lvals) > 0 else 0
 
     def std_pos(l_idx, m):
-        return sum(2 * lvals[i] + 1 for i in range(l_idx)) + lvals[l_idx] + m
+        return sum(2 * int(lvals[i]) + 1 for i in range(l_idx)) + int(lvals[l_idx]) + m
 
     # m=0: one component per l
     for l_idx, l in enumerate(lvals):
@@ -42,7 +42,7 @@ def _build_m_order_permutation(lvals: list[int]) -> torch.Tensor:
     # m>0: pair +m/-m for each l to get contiguous 2x2 blocks
     for m in range(1, lmax + 1):
         for l_idx, l in enumerate(lvals):
-            if l >= m:
+            if int(l) >= m:
                 perm.append(std_pos(l_idx, m))   # +m
                 perm.append(std_pos(l_idx, -m))  # -m
 

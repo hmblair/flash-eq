@@ -69,9 +69,9 @@ class Irrep:
         """Return the dimension of the representation (2l+1)."""
         return 2 * self.l + 1
 
-    def mvals(self) -> List[int]:
+    def mvals(self) -> torch.Tensor:
         """Return the magnetic quantum numbers from -l to l."""
-        return list(range(-self.l, self.l + 1))
+        return torch.arange(-self.l, self.l + 1)
 
     def raising(self) -> torch.Tensor:
         """Compute the raising operator J_+ for this irrep."""
@@ -101,7 +101,7 @@ class Irrep:
         # Angular momentum operators in complex |l,m> basis
         Jx = 0.5 * (raising + lowering)
         Jy = -0.5j * (raising - lowering)
-        Jz = 1j * torch.diag(torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE))
+        Jz = 1j * torch.diag(self.mvals().to(self.COMPLEX_DTYPE))
 
         # Transform to real spherical harmonic basis.
         # The toreal() transformation swaps y<->z: Jx -> Lx, Jy -> Lz, Jz -> Ly
@@ -203,13 +203,13 @@ class Repr:
             raise ValueError(f"Multiplicity must be a positive integer, got {mult}")
 
         self.irreps = [Irrep(l, mult) for l in lvals]
-        self.lvals = [irrep.l for irrep in self.irreps]
+        self.lvals = torch.tensor([irrep.l for irrep in self.irreps])
         self.mult = mult
 
-        self._cumdims = [
+        self._cumdims = torch.tensor([
             sum(rep.dim() for rep in self.irreps[:i])
             for i in range(len(self.irreps) + 1)
-        ]
+        ])
 
     def nreps(self) -> int:
         """Return the number of irreducible representations."""
@@ -221,10 +221,10 @@ class Repr:
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Repr):
             return False
-        return self.lvals == other.lvals and self.mult == other.mult
+        return torch.equal(self.lvals, other.lvals) and self.mult == other.mult
 
     def __hash__(self) -> int:
-        return hash((tuple(self.lvals), self.mult))
+        return hash((tuple(self.lvals.tolist()), self.mult))
 
     def dim(self) -> int:
         """Get total dimension of the representation."""
@@ -234,9 +234,21 @@ class Repr:
         """Get the largest degree among all irreps."""
         return max(irrep.l for irrep in self)
 
-    def cumdims(self) -> List[int]:
+    def cumdims(self) -> torch.Tensor:
         """Get cumulative dimensions for indexing into subspaces."""
         return self._cumdims
+
+    def mvals(self) -> torch.Tensor:
+        """Return the magnetic quantum numbers for all components.
+
+        Returns m-values in standard (l-first) basis ordering:
+        [m values for l=0], [m values for l=1], ...
+
+        Example:
+            >>> Repr(lvals=[0, 1, 2]).mvals()
+            tensor([0, -1, 0, 1, -2, -1, 0, 1, 2])
+        """
+        return torch.cat([irrep.mvals() for irrep in self.irreps])
 
     def __str__(self) -> str:
         degrees = ', '.join(str(rep.l) for rep in self.irreps)
@@ -396,83 +408,57 @@ class ProductRepr:
         """Return total number of irreps in the tensor product."""
         return sum(rep.nreps() for rep in self.reps)
 
-    def _compute_block_structure(self) -> tuple:
-        """Compute block structure for the m-basis parameterization.
-
-        Returns:
-            Tuple of (blocks, dim_in, dim_out, weight_dim) where blocks is a list
-            of dicts with keys: m, n_in, n_out, in_off, out_off, w_off
-        """
-        lvals_in = torch.tensor(self.rep1.lvals)
-        lvals_out = torch.tensor(self.rep2.lvals)
-        lmax_in = int(lvals_in.max())
-        lmax_out = int(lvals_out.max())
-        lmax = max(lmax_in, lmax_out)
-
-        # Vectorized count: for each m, count how many l >= m
-        m_vals = torch.arange(lmax + 1)
-        n_in_all = (lvals_in.unsqueeze(0) >= m_vals.unsqueeze(1)).sum(dim=1)
-        n_out_all = (lvals_out.unsqueeze(0) >= m_vals.unsqueeze(1)).sum(dim=1)
-
-        # Compute offsets for all m-values (needed even for skipped blocks)
-        mult = torch.where(m_vals == 0, 1, 2)
-        in_sizes = mult * n_in_all
-        out_sizes = mult * n_out_all
-
-        # Cumulative offsets (exclusive prefix sum)
-        in_offsets = torch.cat([torch.tensor([0]), in_sizes[:-1].cumsum(0)])
-        out_offsets = torch.cat([torch.tensor([0]), out_sizes[:-1].cumsum(0)])
-
-        # Build blocks only where coupling exists
-        blocks = []
-        w_off = 0
-        for m in range(lmax + 1):
-            n_in = int(n_in_all[m])
-            n_out = int(n_out_all[m])
-            if n_in > 0 and n_out > 0:
-                m_mult = 1 if m == 0 else 2
-                blocks.append({
-                    'm': m,
-                    'n_in': n_in,
-                    'n_out': n_out,
-                    'in_off': int(in_offsets[m]),
-                    'out_off': int(out_offsets[m]),
-                    'w_off': w_off,
-                })
-                w_off += m_mult * n_out * n_in
-
-        dim_in = int(in_sizes[n_in_all > 0].sum()) if (n_in_all > 0).any() else 0
-        dim_out = int(out_sizes[n_out_all > 0].sum()) if (n_out_all > 0).any() else 0
-
-        return blocks, dim_in, dim_out, w_off
-
-
-    def build_block_metadata(self, device: torch.device) -> tuple:
+    def block_metadata(self, device: torch.device) -> tuple:
         """Build metadata tensors for CUDA kernel.
+
+        Computes block structure from input/output lvals. For each m from 0 to
+        lmax, we have a block of size:
+        - m=0: n_in × n_out (real scalars)
+        - m>0: 2*n_in × 2*n_out (interleaved +m/-m pairs)
+
+        where n_in/n_out = number of l-values with l >= m.
 
         Args:
             device: Target device for metadata tensors.
 
         Returns:
             Tuple of (block_data, dim_out, max_in_size, max_out_size) where:
-            - block_data: (num_blocks, 6) tensor with columns [m, n_in, n_out, in_off, out_off, w_off]
+            - block_data: (num_blocks, 6) int32 tensor with columns
+              [m, n_in, n_out, in_off, out_off, w_off]
             - dim_out: Total output dimension
             - max_in_size: Maximum input block size (for shared memory)
             - max_out_size: Maximum output block size (for shared memory)
         """
-        blocks, _, dim_out, _ = self._compute_block_structure()
+        m_max = max(self.rep1.lmax(), self.rep2.lmax())
+        lvals_in = self.rep1.lvals
+        lvals_out = self.rep2.lvals
 
-        # Pack into tensor
-        block_data = torch.tensor(
-            [[b['m'], b['n_in'], b['n_out'], b['in_off'], b['out_off'], b['w_off']] for b in blocks],
-            dtype=torch.int32, device=device
-        )
+        # Build blocks, tracking offsets as we go
+        blocks = []
+        in_off, out_off, w_off = 0, 0, 0
+        max_in_size, max_out_size = 0, 0
 
-        # Compute max sizes for shared memory allocation
-        max_in_size = max(b['n_in'] if b['m'] == 0 else 2 * b['n_in'] for b in blocks)
-        max_out_size = max(b['n_out'] if b['m'] == 0 else 2 * b['n_out'] for b in blocks)
+        for m in range(m_max + 1):
+            n_in = int((lvals_in >= m).sum())
+            n_out = int((lvals_out >= m).sum())
 
-        return (block_data, dim_out, max_in_size, max_out_size)
+            if n_in > 0 and n_out > 0:
+                m_mult = 1 if m == 0 else 2
+                in_size = m_mult * n_in
+                out_size = m_mult * n_out
+
+                blocks.append([m, n_in, n_out, in_off, out_off, w_off])
+
+                max_in_size = max(max_in_size, in_size)
+                max_out_size = max(max_out_size, out_size)
+
+                in_off += in_size
+                out_off += out_size
+                w_off += m_mult * n_out * n_in
+
+        block_data = torch.tensor(blocks, dtype=torch.int32, device=device)
+
+        return (block_data, self.rep2.dim(), max_in_size, max_out_size)
 
     def __str__(self) -> str:
         return f"ProductRepr({self.rep1} x {self.rep2})"

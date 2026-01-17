@@ -16,7 +16,7 @@ Radial weight helpers:
     - BinnedRadialWeight: Binned radial weights with interpolation
 """
 
-from .representations import Irrep, ProductIrrep, Repr, ProductRepr
+from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .layer import EquivariantEdgewiseLinear
 from .basis import WignerDBasis
 from .radial import BinnedRadialWeight
@@ -27,6 +27,7 @@ __all__ = [
     "ProductIrrep",
     "Repr",
     "ProductRepr",
+    "WignerD",
     # Layers
     "EquivariantEdgewiseLinear",
     # Basis

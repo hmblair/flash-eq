@@ -22,60 +22,129 @@ from .representations import Repr, ProductRepr
 from .basis import _build_m_order_permutation
 
 
+def get_weight_dim(lvals_in: List[int], lvals_out: List[int] = None) -> int:
+    """Compute weight dimension for given lvals.
+
+    For each m from 0 to lmax:
+    - n_in(m) = number of input l's with l >= m
+    - n_out(m) = number of output l's with l >= m
+    - m=0 contributes n_in * n_out scalar parameters
+    - m>0 contributes 2 * n_in * n_out parameters (a, b for each coupling)
+
+    Args:
+        lvals_in: list of input l values
+        lvals_out: list of output l values (defaults to lvals_in)
+
+    Returns:
+        Total number of weight parameters
+    """
+    if lvals_out is None:
+        lvals_out = lvals_in
+
+    lmax = max(max(lvals_in), max(lvals_out))
+    weight_dim = 0
+
+    for m in range(lmax + 1):
+        n_in = sum(1 for l in lvals_in if l >= m)
+        n_out = sum(1 for l in lvals_out if l >= m)
+        if n_in > 0 and n_out > 0:
+            mult = 1 if m == 0 else 2
+            weight_dim += mult * n_in * n_out
+
+    return weight_dim
+
+
 def reference_expand_weights(
     compact_weights: torch.Tensor,
     lvals_in: List[int],
     lvals_out: List[int] = None,
 ) -> torch.Tensor:
-    """Expand compact block-diagonal weights to dense matrix.
+    """Expand compact block-diagonal weights to dense matrix in standard SH order.
 
-    The basis ordering from toreal() is:
-    - Position l is m=0
-    - Positions (l-m, l+m) form the |m| pair for m=1,...,l
+    The compact weights are in m-first order matching the kernel format:
+    - For m=0: n_in * n_out scalars (coupling all l_in to all l_out at m=0)
+    - For m>0: 2 * n_in * n_out parameters (a, b pairs for each coupling)
 
-    For a single l, compact_weights has structure:
-    [λ₀, a₁, b₁, a₂, b₂, ..., aₗ, bₗ]
-    where λ₀ is the m=0 scalar and (aₘ, bₘ) parameterize the |m| block.
+    Within each m-block, the ordering is:
+    - Outer loop: output l (ascending)
+    - Inner loop: input l (ascending)
 
     Args:
         compact_weights: (weight_dim,) compact representation
-        lvals_in: list of input l values (currently only single l supported)
+        lvals_in: list of input l values
         lvals_out: list of output l values (defaults to lvals_in)
 
     Returns:
-        W: (dim_out, dim_in) dense weight matrix
+        W: (dim_out, dim_in) dense weight matrix in standard SH order
     """
     if lvals_out is None:
         lvals_out = lvals_in
 
-    # Currently only support single l with same in/out
-    assert len(lvals_in) == 1 and lvals_in == lvals_out, "Only single l supported"
-    l = lvals_in[0]
-
     device = compact_weights.device
     dtype = compact_weights.dtype
-    dim = 2 * l + 1
+    dim_in = sum(2 * l + 1 for l in lvals_in)
+    dim_out = sum(2 * l + 1 for l in lvals_out)
+    lmax = max(max(lvals_in), max(lvals_out))
 
-    W = torch.zeros(dim, dim, device=device, dtype=dtype)
+    W = torch.zeros(dim_out, dim_in, device=device, dtype=dtype)
 
-    # m=0: scalar at position (l, l)
-    W[l, l] = compact_weights[0]
+    # Compute cumulative dimensions for indexing into standard SH order
+    cumdims_in = [0]
+    for l in lvals_in:
+        cumdims_in.append(cumdims_in[-1] + 2 * l + 1)
+    cumdims_out = [0]
+    for l in lvals_out:
+        cumdims_out.append(cumdims_out[-1] + 2 * l + 1)
 
-    # |m|>0: 2x2 blocks at positions (l-m, l+m)
-    w_idx = 1
-    for m in range(1, l + 1):
-        a = compact_weights[w_idx]
-        b = compact_weights[w_idx + 1]
-        w_idx += 2
+    # Helper to get position of m within l-block in standard SH order
+    # Standard order: m = -l, -l+1, ..., l, so position of m is l + m
+    def std_pos_in(l_idx: int, m: int) -> int:
+        l = lvals_in[l_idx]
+        return cumdims_in[l_idx] + l + m
 
-        pos_minus = l - m  # position for "real" part of |m| pair
-        pos_plus = l + m   # position for "imag" part of |m| pair
+    def std_pos_out(l_idx: int, m: int) -> int:
+        l = lvals_out[l_idx]
+        return cumdims_out[l_idx] + l + m
 
-        # 2x2 block [[a, b], [-b, a]] coupling (pos_minus, pos_plus)
-        W[pos_minus, pos_minus] = a
-        W[pos_minus, pos_plus] = b
-        W[pos_plus, pos_minus] = -b
-        W[pos_plus, pos_plus] = a
+    w_idx = 0
+
+    for m in range(lmax + 1):
+        # Find which l's have this m value
+        in_l_indices = [i for i, l in enumerate(lvals_in) if l >= m]
+        out_l_indices = [i for i, l in enumerate(lvals_out) if l >= m]
+
+        if not in_l_indices or not out_l_indices:
+            continue
+
+        if m == 0:
+            # m=0: scalar coupling between all (l_out, l_in) pairs
+            for out_idx in out_l_indices:
+                for in_idx in in_l_indices:
+                    pos_out = std_pos_out(out_idx, 0)
+                    pos_in = std_pos_in(in_idx, 0)
+                    W[pos_out, pos_in] = compact_weights[w_idx]
+                    w_idx += 1
+        else:
+            # m>0: 2x2 block [[a, b], [-b, a]] for each (l_out, l_in) pair
+            # The block couples (m, -m) positions
+            for out_idx in out_l_indices:
+                for in_idx in in_l_indices:
+                    a = compact_weights[w_idx]
+                    b = compact_weights[w_idx + 1]
+                    w_idx += 2
+
+                    # Positions for +m and -m in standard order
+                    pos_out_plus = std_pos_out(out_idx, m)
+                    pos_out_minus = std_pos_out(out_idx, -m)
+                    pos_in_plus = std_pos_in(in_idx, m)
+                    pos_in_minus = std_pos_in(in_idx, -m)
+
+                    # 2x2 block structure: [[a, b], [-b, a]]
+                    # Maps (in_plus, in_minus) -> (out_plus, out_minus)
+                    W[pos_out_plus, pos_in_plus] = a
+                    W[pos_out_plus, pos_in_minus] = b
+                    W[pos_out_minus, pos_in_plus] = -b
+                    W[pos_out_minus, pos_in_minus] = a
 
     return W
 

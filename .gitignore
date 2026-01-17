@@ -9,3 +9,7 @@ build/
 .pytest_cache/
 .ruff_cache/
 debug_sizes*.py
+# TeX outputs
+*.aux
+*.log
+*.out

@@ -108,19 +108,24 @@ class WignerDBasis(nn.Module):
         """Compute Wigner-D basis matrices for given directions.
 
         Args:
-            directions: (batch, 3) direction vectors (need not be normalized)
+            directions: (batch, 3) direction vectors in Cartesian coordinates
+                        (need not be normalized)
 
         Returns:
-            P: (batch, dim_in, dim_in) input basis matrix
-            Q: (batch, dim_out, dim_out) output basis matrix
+            P: (batch, dim_in, dim_in) input basis matrix D(g_x)
+            Q: (batch, dim_out, dim_out) output basis matrix D(g_x)
 
         Note:
-            To transform features: f_diag = P^T @ f (use P.transpose(-1,-2))
-            To transform back: f = Q @ f_diag
+            These are the Wigner-D matrices for the rotation g_x that takes
+            e_z to the direction x. The equivariant layer computes:
+                out = Q @ W @ P^T @ f
+            where W is block-diagonal in the m-basis.
         """
-        # Compute Wigner-D matrices using rot_to_ez and permute to m-first order
-        P = self.repr_in.rot_to_ez(directions)[:, :, self._perm_in]
-        Q = self.repr_out.rot_to_ez(directions)[:, :, self._perm_out]
+        # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
+        # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
+        # cartesian=True because directions are in Cartesian (x,y,z) coordinates
+        P = self.repr_in.rot_to_ez(directions).mT
+        Q = self.repr_out.rot_to_ez(directions).mT
 
         return P, Q
 

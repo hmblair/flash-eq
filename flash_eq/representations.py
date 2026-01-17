@@ -115,16 +115,14 @@ class Irrep:
         geny_real = (Q.t().conj() @ geny @ Q).real.to(self.REAL_DTYPE)
         genz_real = (Q.t().conj() @ genz @ Q).real.to(self.REAL_DTYPE)
 
-        # The complex-to-real transformation maps the quantum generators to
-        # a permuted ordering. Empirically verified: the output corresponds to
-        # (Jx_cart, Jz_cart, Jy_cart). We reorder to standard (x, y, z).
-        return torch.stack([genx_real, genz_real, geny_real], dim=0)
+        # Stack in Cartesian order: [Jx, Jy, Jz]
+        # Note: after toreal() transformation, genx/geny are swapped
+        # genz_real = Q^H @ genz @ Q is block-diagonal by |m| for all l.
+        return torch.stack([geny_real, genx_real, genz_real], dim=0)
 
     def toreal(self) -> torch.Tensor:
-        """Get the conversion matrix from complex to real spherical harmonics.
-
-        The output basis uses standard m-ordering: m = -l, -l+1, ..., l.
-        For l=1, this corresponds to (y, z, x) in Cartesian coordinates.
+        """
+        Get the conversion matrix from complex to real spherical harmonics.
         """
         SQRT2 = 2 ** -0.5
 
@@ -281,17 +279,25 @@ class Repr(nn.Module):
         self,
         axis: torch.Tensor,
         angle: torch.Tensor,
+        cartesian: bool = False,
     ) -> torch.Tensor:
         """Compute the Wigner D-matrix for a rotation.
 
         Args:
-            axis: Rotation axis of shape (..., 3) in standard (x, y, z) order.
+            axis: Rotation axis of shape (..., 3).
                   Should be normalized (or will be treated as direction).
             angle: Rotation angle in radians of shape (...).
+            cartesian: If True, axis is in Cartesian (x, y, z) order and will
+                  be permuted to match the generator ordering.
 
         Returns:
             Wigner D-matrix of shape (..., dim, dim).
         """
+        if cartesian:
+            # Permute axis to match generator ordering in real SH basis
+            # (ax, ay, az) -> (az, ax, ay)
+            axis = axis[..., [2, 0, 1]]
+
         *b, _ = axis.size()
         gens = (axis @ self.generators.to(dtype=axis.dtype, device=axis.device)).view(*b, self.dim(), self.dim())
 
@@ -306,7 +312,7 @@ class Repr(nn.Module):
 
         return rot
 
-    def rot_to_ez(self, directions: torch.Tensor) -> torch.Tensor:
+    def rot_to_ez(self, directions: torch.Tensor, cartesian: bool = False) -> torch.Tensor:
         """Compute Wigner D-matrix for rotation taking e_z to direction.
 
         This computes the rotation matrix D such that applying D to features
@@ -337,45 +343,7 @@ class Repr(nn.Module):
         # Angle is arccos(e_z · d) = arccos(d_z)
         angle = torch.arccos(d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7))
 
-        return self.rot(axis, angle)
-
-    @staticmethod
-    def cartesian_rot(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-        """Compute 3x3 Cartesian rotation matrix from axis-angle.
-
-        Uses Rodrigues formula: R = I + sin(θ)K + (1-cos(θ))K²
-        where K is the skew-symmetric matrix of the axis.
-
-        Args:
-            axis: (..., 3) rotation axis (should be normalized)
-            angle: (...) rotation angle in radians
-
-        Returns:
-            R: (..., 3, 3) rotation matrix
-        """
-        # Ensure axis is normalized
-        axis = axis / (torch.linalg.norm(axis, dim=-1, keepdim=True) + 1e-8)
-
-        c = torch.cos(angle)
-        s = torch.sin(angle)
-        t = 1 - c
-
-        x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
-
-        # Rodrigues formula components
-        R = torch.zeros(*axis.shape[:-1], 3, 3, device=axis.device, dtype=axis.dtype)
-
-        R[..., 0, 0] = c + t * x * x
-        R[..., 0, 1] = t * x * y - s * z
-        R[..., 0, 2] = t * x * z + s * y
-        R[..., 1, 0] = t * x * y + s * z
-        R[..., 1, 1] = c + t * y * y
-        R[..., 1, 2] = t * y * z - s * x
-        R[..., 2, 0] = t * x * z - s * y
-        R[..., 2, 1] = t * y * z + s * x
-        R[..., 2, 2] = c + t * z * z
-
-        return R
+        return self.rot(axis, angle, cartesian).mT
 
     def __str__(self) -> str:
         degrees = ', '.join(str(rep.l) for rep in self.irreps)

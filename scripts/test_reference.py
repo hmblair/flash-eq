@@ -36,12 +36,15 @@ def test_equivariance(repr_in, repr_out=None, cin=2, cout=3, num_nodes=10, num_e
     angle = torch.tensor(1.23, dtype=dtype)  # arbitrary angle
 
     # Test equivariance
-    _, _, error = equivariance_test(
+    out1, out2, error = equivariance_test(
         node_features, src_indices, directions, compact_weights,
         repr_in, repr_out, axis, angle
     )
 
-    return error, weight_dim
+    # Sanity check: outputs should be non-trivial
+    out_norm = out1.abs().sum().item()
+
+    return error, weight_dim, out_norm
 
 
 def main():
@@ -75,10 +78,21 @@ def main():
     for repr_in, repr_out in test_cases:
         repr_out_display = repr_out if repr_out is not None else repr_in
 
-        error, weight_dim = test_equivariance(repr_in, repr_out)
-        status = "PASS" if error < 1e-6 else "FAIL"
-        if error >= 1e-6:
+        error, weight_dim, out_norm = test_equivariance(repr_in, repr_out)
+
+        # Check both equivariance error and non-trivial output
+        equivariant = error < 1e-6
+        nontrivial = out_norm > 1e-6
+        passed = equivariant and nontrivial
+
+        if not passed:
             all_passed = False
+            if not nontrivial:
+                status = "FAIL (zero output)"
+            else:
+                status = "FAIL"
+        else:
+            status = "PASS"
 
         in_str = str(repr_in.lvals)
         out_str = str(repr_out_display.lvals)

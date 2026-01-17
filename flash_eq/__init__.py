@@ -12,14 +12,15 @@ Representations:
     - ProductRepr: Product of two representations
     - Irrep, ProductIrrep: Single irreducible representations
 
-Radial weight helpers:
-    - BinnedRadialWeight: Binned radial weights with interpolation
+Radial weights:
+    - RadialMLP: MLP mapping distance to weight tensor
+    - BinnedModule: Wrapper for precomputing module outputs at bin edges
 """
 
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .layer import EquivariantEdgewiseLinear
 from .basis import WignerDBasis
-from .radial import BinnedRadialWeight
+from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
 
 __all__ = [
     # Representations
@@ -33,6 +34,8 @@ __all__ = [
     # Basis
     "WignerDBasis",
     # Radial weights
-    "BinnedRadialWeight",
+    "RadialBasisFunctions",
+    "RadialMLP",
+    "BinnedModule",
 ]
 __version__ = "0.1.0"

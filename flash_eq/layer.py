@@ -28,7 +28,7 @@ import torch.nn as nn
 
 from .representations import Repr, ProductRepr
 from .block_diagonal_cuda import block_diagonal_cuda
-from .radial import BinnedRadialWeight
+from .radial import RadialMLP, BinnedModule
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -82,9 +82,6 @@ class EquivariantEdgewiseLinear(nn.Module):
 
         self.in_repr = in_repr
         self.out_repr = out_repr
-        self.num_bins = num_bins
-        self.min_dist = min_dist
-        self.max_dist = max_dist
 
         # Compute weight structure from representation product
         self.product_repr = ProductRepr(in_repr, out_repr)
@@ -92,16 +89,20 @@ class EquivariantEdgewiseLinear(nn.Module):
         self.channels_in = in_repr.mult
         self.channels_out = out_repr.mult
 
-        # Radial weight network
-        self.radial_mlp = BinnedRadialWeight(
+        # Radial weight network with binning
+        mlp = RadialMLP(
             hidden_dim=radial_hidden,
             num_basis=self.weight_dim,
             in_mult=self.channels_in,
             out_mult=self.channels_out,
-            num_bins=num_bins,
-            min_dist=min_dist,
-            max_dist=max_dist,
             num_layers=radial_layers,
+            r_max=max_dist,
+        )
+        self.radial_weights = BinnedModule(
+            mlp,
+            num_bins=num_bins,
+            min_val=min_dist,
+            max_val=max_dist,
         )
 
     def forward(
@@ -150,13 +151,13 @@ class EquivariantEdgewiseLinear(nn.Module):
         # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
+        bin_lo, interp_weight = self.radial_weights.bin_indices(distances)
         out_diag = block_diagonal_cuda(
             f_diag,
-            self.radial_mlp(),
-            distances,
+            self.radial_weights(),
+            bin_lo,
+            interp_weight,
             self.product_repr,
-            self.min_dist,
-            self.max_dist,
         )
 
         # =====================================================================
@@ -166,7 +167,8 @@ class EquivariantEdgewiseLinear(nn.Module):
         return torch.bmm(out_diag, Q.mT)
 
     def extra_repr(self) -> str:
+        rw = self.radial_weights
         return (
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
-            f"num_bins={self.num_bins}, dist=[{self.min_dist}, {self.max_dist}]"
+            f"num_bins={rw.num_bins}, dist=[{rw.min_val}, {rw.max_val}]"
         )

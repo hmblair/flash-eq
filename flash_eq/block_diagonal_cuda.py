@@ -110,10 +110,9 @@ class _BlockDiagonalFunction(Function):
 def block_diagonal_cuda(
     features: torch.Tensor,
     radial_table: torch.Tensor,
-    distances: torch.Tensor,
+    bin_lo: torch.Tensor,
+    interp_weight: torch.Tensor,
     product_repr: "ProductRepr",
-    min_dist: float = 0.0,
-    max_dist: float = 10.0,
 ) -> torch.Tensor:
     """
     Apply block-diagonal multiplication with binned radial weights.
@@ -129,12 +128,12 @@ def block_diagonal_cuda(
         features: (num_edges, channels_in, dim_in)
             Edge features in m-first diagonal basis.
         radial_table: (num_bins + 1, channels_out, channels_in, weight_dim)
-            Block-diagonal weights at bin edges. Interpolated linearly.
-        distances: (num_edges,)
-            Edge distances for weight interpolation.
+            Block-diagonal weights at bin edges.
+        bin_lo: (num_edges,) int32
+            Lower bin index for each edge (from BinnedModule.bin_indices).
+        interp_weight: (num_edges,)
+            Interpolation weight in [0, 1] for each edge.
         product_repr: ProductRepr describing input/output representation structure.
-        min_dist: Minimum distance for binning (default 0.0).
-        max_dist: Maximum distance for binning (default 10.0).
 
     Returns:
         output: (num_edges, channels_out, dim_out)
@@ -147,16 +146,8 @@ def block_diagonal_cuda(
     # Build block metadata from ProductRepr
     block_data, dim_out, max_in_size, max_out_size = product_repr.block_metadata(device)
 
-    # Compute bin indices and interpolation weights
-    distances_f32 = distances.float()
-    inv_bin_width = num_bins / (max_dist - min_dist)
-    normalized = (distances_f32 - min_dist) * inv_bin_width
-    normalized = normalized.clamp(0.0, num_bins)
-    bin_lo = normalized.floor().int().clamp(max=num_bins - 1)
-    interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0).to(features.dtype)
-
     # Run kernel
     return _BlockDiagonalFunction.apply(
-        features, radial_table, bin_lo, interp_weight,
+        features, radial_table, bin_lo, interp_weight.to(features.dtype),
         channels_out, num_bins, block_data, dim_out, max_in_size, max_out_size
     )

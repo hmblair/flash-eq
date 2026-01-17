@@ -13,27 +13,8 @@ Reference: docs/theory.tex, Section 2
 
 import torch
 import torch.nn as nn
-from typing import Optional
 
 from .representations import Repr
-
-
-def _direction_to_rotation(direction: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute axis and angle to rotate e_z to direction.
-
-    Args:
-        direction: (..., 3) direction vectors (need not be normalized)
-
-    Returns:
-        axis: (..., 3) rotation axis (normalized)
-        angle: (...,) rotation angle in radians
-    """
-    d = direction / (torch.linalg.norm(direction, dim=-1, keepdim=True) + 1e-8)
-    # Cross product of e_z and d gives rotation axis
-    axis = torch.stack([d[..., 1], -d[..., 0], torch.zeros_like(d[..., 0])], dim=-1)
-    axis = axis / (torch.linalg.norm(axis, dim=-1, keepdim=True) + 1e-8)
-    angle = torch.arccos(d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7))
-    return axis, angle
 
 
 def _build_m_order_permutation(lvals: list[int]) -> torch.Tensor:
@@ -137,11 +118,9 @@ class WignerDBasis(nn.Module):
             To transform features: f_diag = P^T @ f (use P.transpose(-1,-2))
             To transform back: f = Q @ f_diag
         """
-        axis, angle = _direction_to_rotation(directions)
-
-        # Compute Wigner-D matrices and permute to m-first order
-        P = self.repr_in.rot(axis, angle)[:, :, self._perm_in]
-        Q = self.repr_out.rot(axis, angle)[:, :, self._perm_out]
+        # Compute Wigner-D matrices using rot_to_ez and permute to m-first order
+        P = self.repr_in.rot_to_ez(directions)[:, :, self._perm_in]
+        Q = self.repr_out.rot_to_ez(directions)[:, :, self._perm_out]
 
         return P, Q
 

@@ -8,47 +8,115 @@ Fast, memory-efficient SO(3)-equivariant linear layers using Wigner-D diagonaliz
 pip install flash-eq
 ```
 
-## Usage
+Requires PyTorch >= 2.0 with CUDA support. The CUDA kernel is JIT-compiled on first use.
+
+## Quick Start
 
 ```python
 import torch
-from ciffy.nn.geometric.representations import Repr
-from flash_eq import EquivariantLinear
+from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr
 
-# Define representations
-repr_in = Repr(lvals=[0, 1, 2])   # scalars + vectors + rank-2
-repr_out = Repr(lvals=[0, 1, 2])
+# Define representations (l=0,1,2 with 32 channels)
+in_repr = Repr(lvals=[0, 1, 2], mult=32)
+out_repr = Repr(lvals=[0, 1, 2], mult=32)
 
-# Create layer
-layer = EquivariantLinear(repr_in, repr_out)
+# Create layer and basis
+layer = EquivariantEdgewiseLinear(in_repr, out_repr).cuda()
+basis = WignerDBasis(in_repr, out_repr).cuda()
 
-# Inputs
-batch, channels_in, channels_out = 100, 8, 16
-features = torch.randn(batch, channels_in, repr_in.dim())
-directions = torch.randn(batch, 3)  # will be normalized internally
-weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim)
+# Input data
+num_nodes, num_edges = 1000, 5000
+node_features = torch.randn(num_nodes, 32, in_repr.dim, device='cuda')
+src_indices = torch.randint(0, num_nodes, (num_edges,), device='cuda')
+directions = torch.randn(num_edges, 3, device='cuda')
+directions = directions / directions.norm(dim=-1, keepdim=True)
+distances = torch.rand(num_edges, device='cuda') * 10.0
 
-# Forward pass
-output = layer(features, directions, weights)
-# output.shape = (100, 16, 9)
+# Compute basis matrices (once per forward pass, shared across layers)
+P, Q = basis(directions)
+
+# Apply layer
+output = layer(P, Q, node_features, distances, src_indices)
+# output.shape = (num_edges, 32, out_repr.dim)
 ```
 
-## Memory Savings
+## API Reference
 
-The layer stores O(L²) weights per degree pair instead of O(L⁴) for dense matrices:
+### Repr
 
-| lmax | Dense weights | flash-eq weights | Savings |
-|------|---------------|------------------|---------|
-| 2    | 81            | 19               | 4.3×    |
-| 3    | 256           | 44               | 5.8×    |
-| 4    | 625           | 85               | 7.4×    |
+Defines a spherical representation with angular momentum values and multiplicity.
+
+```python
+from flash_eq import Repr
+
+# Scalars (l=0), vectors (l=1), and rank-2 tensors (l=2) with 32 channels each
+repr = Repr(lvals=[0, 1, 2], mult=32)
+
+repr.dim      # Total dimension: 1 + 3 + 5 = 9
+repr.lvals    # [0, 1, 2]
+repr.mult     # 32
+```
+
+### WignerDBasis
+
+Computes the Wigner-D basis matrices P and Q from edge directions.
+
+```python
+from flash_eq import WignerDBasis
+
+basis = WignerDBasis(in_repr, out_repr).cuda()
+
+# directions: (num_edges, 3) unit vectors
+P, Q = basis(directions)
+# P: (num_edges, dim_in, dim_in)
+# Q: (num_edges, dim_out, dim_out)
+```
+
+The basis matrices are computed once and shared across all layers in a network.
+
+### EquivariantEdgewiseLinear
+
+SO(3)-equivariant linear layer with distance-dependent weights.
+
+```python
+from flash_eq import EquivariantEdgewiseLinear
+
+layer = EquivariantEdgewiseLinear(
+    in_repr,                # Input representation
+    out_repr,               # Output representation
+    num_bins=100,           # Distance bins for radial weights (default: 100)
+    min_dist=0.0,           # Minimum distance (default: 0.0)
+    max_dist=10.0,          # Maximum distance (default: 10.0)
+    radial_hidden=64,       # Hidden dim for radial MLP (default: 64)
+    radial_layers=2,        # Hidden layers in radial MLP (default: 2)
+)
+
+output = layer(P, Q, node_features, distances, src_indices)
+```
+
+**Arguments:**
+- `P`: Input basis matrix from `WignerDBasis`
+- `Q`: Output basis matrix from `WignerDBasis`
+- `node_features`: `(num_nodes, channels_in, dim_in)` node features
+- `distances`: `(num_edges,)` edge distances
+- `src_indices`: `(num_edges,)` source node index for each edge
+
+**Returns:**
+- `output`: `(num_edges, channels_out, dim_out)` edge features
+
+## Benchmark Results
+
+Comparison with SE3-Transformer on NVIDIA H100 (80GB):
+
+| Config | SE3-Transformer | Flash-eq | Memory Savings | Speedup |
+|--------|-----------------|----------|----------------|---------|
+| L=4, E=5k | 10.6ms / 4.7GB | 6.7ms / 0.3GB | 14.8x | 1.6x |
+| L=6, E=5k | 35.9ms / 20.7GB | 15.0ms / 0.7GB | 30.5x | 2.4x |
+| L=4, E=20k | 40.2ms / 18.4GB | 21.9ms / 0.8GB | 24.0x | 1.8x |
+| L=6, E=20k | OOM | 53.9ms / 1.7GB | - | - |
+| L=4, E=50k | 136ms / 45.8GB | 52.7ms / 1.7GB | 27.7x | 2.6x |
+| L=6, E=50k | OOM | 130.8ms / 3.7GB | - | - |
 
 ## Theory
 
-See [`docs/theory.tex`](docs/theory.tex) for the mathematical details. The key insight is that SO(3)-equivariant weight matrices W(x) are diagonalized by Wigner-D matrices:
-
-```
-W(x) = D(g_x) Λ D(g_x)^T
-```
-
-where Λ is block-diagonal with 1×1 blocks for m=0 and 2×2 blocks for m>0.
+See [`docs/theory.tex`](docs/theory.tex) for the mathematical details.

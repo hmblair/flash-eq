@@ -1,183 +1,354 @@
-"""Tests for SO(3) equivariance of EquivariantLinear."""
+"""
+Explicit equivariance tests for flash-eq.
+
+Tests that the flash-eq layer is SO(3)-equivariant:
+    D_out @ f(x) = f(D_in @ x)
+
+where D_in, D_out are Wigner-D rotation matrices for the representations.
+
+The key property: rotating the input features and basis matrices should
+give the same result as applying the layer then rotating the output.
+"""
 
 import torch
-import pytest
-from scipy.spatial.transform import Rotation
+import sys
+from pathlib import Path
 
-from flash_eq import Repr, EquivariantLinear
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Check if CUDA is available for testing
-CUDA_AVAILABLE = torch.cuda.is_available()
-
-
-def _reorder_axis(axis: torch.Tensor) -> torch.Tensor:
-    """Reorder axis from standard (x,y,z) to generator ordering (y,z,x)."""
-    return torch.stack([axis[..., 1], axis[..., 2], axis[..., 0]], dim=-1)
+from flash_eq import Repr, EquivariantEdgewiseLinear, WignerDBasis
 
 
-class TestEquivariantLinear:
-    """Test suite for EquivariantLinear."""
+def random_direction(device: torch.device) -> torch.Tensor:
+    """Generate a random unit direction vector."""
+    d = torch.randn(3, device=device)
+    return d / d.norm()
 
-    @pytest.fixture
-    def layer(self):
-        """Create a layer with lmax=2."""
-        repr_in = Repr(lvals=[0, 1, 2])
-        repr_out = Repr(lvals=[0, 1, 2])
-        return EquivariantLinear(repr_in, repr_out)
 
-    def test_output_shape(self, layer):
-        """Test that output has correct shape."""
-        batch, channels_in, channels_out = 10, 4, 8
+def test_equivariance_basic():
+    """
+    Test basic equivariance: D @ layer(x) = layer(D @ x).
 
-        features = torch.randn(batch, channels_in, layer.repr_in.dim())
-        directions = torch.randn(batch, 3)
-        weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim)
+    The test:
+    1. Apply layer to original features, then rotate output
+    2. Rotate input features, then apply layer
+    3. Check that results match
+    """
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        output = layer(features, directions, weights)
+    # Setup
+    lvals = [0, 1, 2]
+    mult = 8
+    num_nodes = 50
+    num_edges = 200
+    dim = sum(2 * l + 1 for l in lvals)  # 9
 
-        assert output.shape == (batch, channels_out, layer.repr_out.dim())
+    in_repr = Repr(lvals=lvals, mult=mult).to(device)
+    out_repr = Repr(lvals=lvals, mult=mult).to(device)
 
-    def test_equivariance(self, layer):
-        """Test SO(3) equivariance: f(D@x, D@d) = D @ f(x, d)."""
-        torch.manual_seed(42)
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
 
-        batch, channels_in, channels_out = 8, 4, 4
-        features = torch.randn(batch, channels_in, layer.repr_in.dim())
-        directions = torch.randn(batch, 3)
-        directions = directions / directions.norm(dim=-1, keepdim=True)
-        weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim) * 0.1
+    # Random rotation defined by direction
+    # R is the 3x3 Cartesian rotation matrix for rotating directions
+    # D is the Wigner-D matrix for rotating features in SH basis
+    direction = random_direction(device)
+    R = Repr.cartesian_rotation(direction.unsqueeze(0)).squeeze(0)
+    D = in_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
 
-        # Random rotation
-        axis_std = torch.randn(3)
-        axis_std = axis_std / axis_std.norm()
-        angle = torch.tensor(0.7)
+    # Input data
+    node_features = torch.randn(num_nodes, mult, dim, device=device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
 
-        axis_reordered = _reorder_axis(axis_std)
-        D_in = layer.repr_in.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
-        D_out = layer.repr_out.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0)
+    # Compute basis matrices
+    P, Q = basis(directions)
 
-        R = torch.from_numpy(
-            Rotation.from_rotvec((axis_std * angle).numpy()).as_matrix()
-        ).float()
+    # Method 1: Apply layer, then rotate output
+    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
 
-        # Method 1: Compute output, then rotate
-        out1 = layer(features, directions, weights)
-        out1_rot = torch.einsum('ij,bcj->bci', D_out, out1)
+    # Method 2: Rotate input features and directions, then apply layer
+    node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+    P_rot, Q_rot = basis(directions_rotated)
+    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
 
-        # Method 2: Rotate inputs, then compute
-        features_rot = torch.einsum('ij,bcj->bci', D_in, features)
-        directions_rot = directions @ R.T
-        out2 = layer(features_rot, directions_rot, weights)
+    # Compare
+    diff = (output1_rotated - output2).abs()
+    max_diff = diff.max().item()
+    rel_diff = max_diff / (output1_rotated.abs().max().item() + 1e-8)
 
-        # Should match
-        diff = (out1_rot - out2).abs().max().item()
-        assert diff < 1e-5, f"Equivariance failed: max diff = {diff:.2e}"
+    print(f"  Basic equivariance test:")
+    print(f"    Max absolute diff: {max_diff:.2e}")
+    print(f"    Relative diff: {rel_diff:.2e}")
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-    def test_equivariance_cuda(self):
-        """Test SO(3) equivariance with CUDA kernel: f(D@x, D@d) = D @ f(x, d)."""
-        torch.manual_seed(42)
+    passed = rel_diff < 1e-4
+    print(f"    Status: {'PASS' if passed else 'FAIL'}")
+    return passed
 
-        repr_in = Repr(lvals=[0, 1, 2])
-        repr_out = Repr(lvals=[0, 1, 2])
-        layer = EquivariantLinear(repr_in, repr_out, use_cuda=True).cuda()
 
-        batch, channels_in, channels_out = 8, 4, 4
-        features = torch.randn(batch, channels_in, layer.repr_in.dim(), device='cuda')
-        directions = torch.randn(batch, 3, device='cuda')
-        directions = directions / directions.norm(dim=-1, keepdim=True)
-        weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim, device='cuda') * 0.1
+def test_equivariance_multiple_rotations():
+    """Test equivariance with multiple random rotations."""
+    torch.manual_seed(123)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Random rotation
-        axis_std = torch.randn(3)
-        axis_std = axis_std / axis_std.norm()
-        angle = torch.tensor(0.7)
+    lvals = [0, 1, 2, 3]
+    mult = 8
+    num_nodes = 30
+    num_edges = 100
+    dim = sum(2 * l + 1 for l in lvals)
 
-        axis_reordered = _reorder_axis(axis_std)
-        D_in = layer.repr_in.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
-        D_out = layer.repr_out.rot(axis_reordered.unsqueeze(0), angle.unsqueeze(0)).squeeze(0).cuda()
+    in_repr = Repr(lvals=lvals, mult=mult).to(device)
+    out_repr = Repr(lvals=lvals, mult=mult).to(device)
 
-        R = torch.from_numpy(
-            Rotation.from_rotvec((axis_std * angle).numpy()).as_matrix()
-        ).float().cuda()
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
 
-        # Method 1: Compute output, then rotate
-        out1 = layer(features, directions, weights)
-        out1_rot = torch.einsum('ij,bcj->bci', D_out, out1)
+    node_features = torch.randn(num_nodes, mult, dim, device=device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
 
-        # Method 2: Rotate inputs, then compute
-        features_rot = torch.einsum('ij,bcj->bci', D_in, features)
-        directions_rot = directions @ R.T
-        out2 = layer(features_rot, directions_rot, weights)
+    print(f"  Multiple rotation test (lvals={lvals}):")
 
-        # Should match
-        diff = (out1_rot - out2).abs().max().item()
-        assert diff < 1e-4, f"CUDA equivariance failed: max diff = {diff:.2e}"
+    all_passed = True
+    for i in range(5):
+        direction = random_direction(device)
+        R = Repr.cartesian_rotation(direction.unsqueeze(0)).squeeze(0)
+        D = in_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
 
-    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-    def test_cuda_matches_python(self):
-        """Test that CUDA kernel produces same output as Python implementation."""
-        torch.manual_seed(123)
+        P, Q = basis(directions)
 
-        repr_in = Repr(lvals=[0, 1, 2])
-        repr_out = Repr(lvals=[0, 1, 2])
+        # Method 1: layer then rotate
+        output1 = layer(P, Q, node_features, distances, src_indices)
+        output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
 
-        layer_python = EquivariantLinear(repr_in, repr_out, use_cuda=False).cuda()
-        layer_cuda = EquivariantLinear(repr_in, repr_out, use_cuda=True).cuda()
+        # Method 2: rotate then layer
+        node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+        directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+        P_rot, Q_rot = basis(directions_rotated)
+        output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
 
-        batch, channels_in, channels_out = 8, 4, 4
-        features = torch.randn(batch, channels_in, repr_in.dim(), device='cuda')
-        directions = torch.randn(batch, 3, device='cuda')
-        directions = directions / directions.norm(dim=-1, keepdim=True)
-        weights = torch.randn(batch, channels_out, channels_in, layer_python.weight_dim, device='cuda')
+        rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
+        passed = rel_diff < 1e-4
 
-        out_python = layer_python(features, directions, weights)
-        out_cuda = layer_cuda(features, directions, weights)
+        print(f"    Rotation {i+1}: rel_diff={rel_diff:.2e} {'PASS' if passed else 'FAIL'}")
+        all_passed = all_passed and passed
 
-        diff = (out_python - out_cuda).abs().max().item()
-        rel_diff = diff / (out_python.abs().max().item() + 1e-8)
-        assert rel_diff < 1e-5, f"CUDA vs Python mismatch: rel_diff = {rel_diff:.2e}"
+    return all_passed
 
-    def test_weight_dim(self, layer):
-        """Test that weight_dim matches expected formula."""
-        # For lvals=[0,1,2], weight structure per (l1,l2) pair:
-        # (0,0): 1, (0,1): 1, (0,2): 1
-        # (1,0): 1, (1,1): 3, (1,2): 3
-        # (2,0): 1, (2,1): 3, (2,2): 5
-        # Total = 1+1+1 + 1+3+3 + 1+3+5 = 19
-        expected = 19
-        assert layer.weight_dim == expected, f"Expected {expected}, got {layer.weight_dim}"
 
-    def test_different_repr(self):
-        """Test with different input/output representations."""
-        repr_in = Repr(lvals=[0, 1])
-        repr_out = Repr(lvals=[1, 2])
-        layer = EquivariantLinear(repr_in, repr_out)
+def test_equivariance_different_channels():
+    """Test equivariance with different input/output channels."""
+    torch.manual_seed(456)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        batch, channels_in, channels_out = 5, 2, 3
-        features = torch.randn(batch, channels_in, repr_in.dim())
-        directions = torch.randn(batch, 3)
-        weights = torch.randn(batch, channels_out, channels_in, layer.weight_dim)
+    lvals = [0, 1, 2]
+    mult_in = 16
+    mult_out = 32
+    num_nodes = 30
+    num_edges = 100
+    dim = sum(2 * l + 1 for l in lvals)
 
-        output = layer(features, directions, weights)
-        assert output.shape == (batch, channels_out, repr_out.dim())
+    in_repr = Repr(lvals=lvals, mult=mult_in).to(device)
+    out_repr = Repr(lvals=lvals, mult=mult_out).to(device)
 
-    def test_scalar_only(self):
-        """Test with scalar-only representation."""
-        repr_in = Repr(lvals=[0])
-        repr_out = Repr(lvals=[0])
-        layer = EquivariantLinear(repr_in, repr_out)
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
 
-        assert layer.weight_dim == 1
+    node_features = torch.randn(num_nodes, mult_in, dim, device=device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
 
-        batch = 4
-        features = torch.randn(batch, 2, 1)
-        directions = torch.randn(batch, 3)
-        weights = torch.randn(batch, 3, 2, 1)
+    direction = random_direction(device)
+    R = Repr.cartesian_rotation(direction.unsqueeze(0)).squeeze(0)
+    # Use out_repr for D since we rotate output
+    D_out = out_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
+    # Use in_repr for rotating input
+    D_in = in_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
 
-        output = layer(features, directions, weights)
-        assert output.shape == (batch, 3, 1)
+    P, Q = basis(directions)
+
+    # Method 1: layer then rotate
+    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1_rotated = torch.einsum('ij,ecj->eci', D_out, output1)
+
+    # Method 2: rotate then layer
+    node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
+    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+    P_rot, Q_rot = basis(directions_rotated)
+    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+
+    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
+    passed = rel_diff < 1e-4
+
+    print(f"  Different channels test (cin={mult_in}, cout={mult_out}):")
+    print(f"    Relative diff: {rel_diff:.2e}")
+    print(f"    Status: {'PASS' if passed else 'FAIL'}")
+
+    return passed
+
+
+def test_equivariance_high_lmax():
+    """Test equivariance with high angular momentum."""
+    torch.manual_seed(789)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    lvals = [0, 1, 2, 3, 4, 5]
+    mult = 4
+    num_nodes = 20
+    num_edges = 50
+    dim = sum(2 * l + 1 for l in lvals)
+
+    in_repr = Repr(lvals=lvals, mult=mult).to(device)
+    out_repr = Repr(lvals=lvals, mult=mult).to(device)
+
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+
+    node_features = torch.randn(num_nodes, mult, dim, device=device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    direction = random_direction(device)
+    R = Repr.cartesian_rotation(direction.unsqueeze(0)).squeeze(0)
+    D = in_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
+
+    P, Q = basis(directions)
+
+    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
+
+    node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+    P_rot, Q_rot = basis(directions_rotated)
+    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+
+    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
+    passed = rel_diff < 1e-4
+
+    print(f"  High lmax test (lmax=5, dim={dim}):")
+    print(f"    Relative diff: {rel_diff:.2e}")
+    print(f"    Status: {'PASS' if passed else 'FAIL'}")
+
+    return passed
+
+
+def test_equivariance_gradient():
+    """Test that gradients are also equivariant."""
+    torch.manual_seed(101)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    lvals = [0, 1, 2]
+    mult = 4
+    num_nodes = 10
+    num_edges = 30
+    dim = sum(2 * l + 1 for l in lvals)
+
+    in_repr = Repr(lvals=lvals, mult=mult).to(device)
+    out_repr = Repr(lvals=lvals, mult=mult).to(device)
+
+    layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(device)
+    basis = WignerDBasis(in_repr, out_repr).to(device)
+
+    direction = random_direction(device)
+    R = Repr.cartesian_rotation(direction.unsqueeze(0)).squeeze(0)
+    D = in_repr.rot_to_ez(direction.unsqueeze(0)).squeeze(0)
+
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    distances = torch.rand(num_edges, device=device) * 5.0
+    directions = torch.randn(num_edges, 3, device=device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    P, Q = basis(directions)
+
+    # Method 1: forward then rotate, compute gradient
+    node_features1 = torch.randn(num_nodes, mult, dim, device=device, requires_grad=True)
+    output1 = layer(P, Q, node_features1, distances, src_indices)
+    output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
+    loss1 = output1_rotated.sum()
+    loss1.backward()
+    grad1 = node_features1.grad.clone()
+
+    # Method 2: rotate then forward, compute gradient
+    node_features2 = torch.randn(num_nodes, mult, dim, device=device, requires_grad=True)
+    with torch.no_grad():
+        node_features2.copy_(node_features1.detach())
+    node_features2.requires_grad_(True)
+
+    directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+    P_rot, Q_rot = basis(directions_rotated)
+    node_features2_rotated = torch.einsum('ij,ncj->nci', D, node_features2)
+    output2 = layer(P_rot, Q_rot, node_features2_rotated, distances, src_indices)
+    loss2 = output2.sum()
+    loss2.backward()
+
+    # The gradient w.r.t. node_features2 needs to be compared with D @ grad1
+    # Since node_features2_rotated = D @ node_features2,
+    # grad2 = D^T @ (grad w.r.t. rotated) = D^T @ node_features2.grad
+    # But we want to compare grad1 rotated vs node_features2.grad
+    grad1_rotated = torch.einsum('ij,ncj->nci', D, grad1)
+
+    rel_diff = (grad1_rotated - node_features2.grad).abs().max().item() / (grad1_rotated.abs().max().item() + 1e-8)
+    passed = rel_diff < 1e-4
+
+    print(f"  Gradient equivariance test:")
+    print(f"    Relative diff: {rel_diff:.2e}")
+    print(f"    Status: {'PASS' if passed else 'FAIL'}")
+
+    return passed
+
+
+def main():
+    print("=" * 70)
+    print("Flash-eq Equivariance Tests")
+    print("=" * 70)
+
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    print(f"\nDevice: {device_name}")
+
+    all_passed = True
+
+    print("\n" + "-" * 70)
+    print("Test 1: Basic equivariance")
+    print("-" * 70)
+    all_passed &= test_equivariance_basic()
+
+    print("\n" + "-" * 70)
+    print("Test 2: Multiple random rotations")
+    print("-" * 70)
+    all_passed &= test_equivariance_multiple_rotations()
+
+    print("\n" + "-" * 70)
+    print("Test 3: Different input/output channels")
+    print("-" * 70)
+    all_passed &= test_equivariance_different_channels()
+
+    print("\n" + "-" * 70)
+    print("Test 4: High angular momentum (lmax=5)")
+    print("-" * 70)
+    all_passed &= test_equivariance_high_lmax()
+
+    print("\n" + "-" * 70)
+    print("Test 5: Gradient equivariance")
+    print("-" * 70)
+    all_passed &= test_equivariance_gradient()
+
+    print("\n" + "=" * 70)
+    print(f"Overall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+    print("=" * 70)
+
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(main())

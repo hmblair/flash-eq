@@ -14,7 +14,6 @@ Key concepts:
 Conventions:
 - Basis ordering: m = -l, -l+1, ..., l-1, l
 - Real spherical harmonics: Y_l^m with Wikipedia conventions
-- Generators: Lx, Lz, Ly ordered for consistency with sphericart
 
 Classes:
     Irrep: Single irreducible representation
@@ -24,7 +23,6 @@ Classes:
 """
 from __future__ import annotations
 
-import itertools
 from typing import Generator, Any, List
 
 import torch
@@ -90,8 +88,10 @@ class Irrep:
     def _generators(self) -> torch.Tensor:
         """Return the generators of so(3) in this representation.
 
+        Returns generators in standard (x, y, z) ordering.
+
         Returns:
-            Shape (3, 2l+1, 2l+1) tensor of generator matrices.
+            Shape (3, 2l+1, 2l+1) tensor of generator matrices [Jx, Jy, Jz].
         """
         raising = self.raising()
         lowering = self.lowering()
@@ -102,14 +102,19 @@ class Irrep:
         mvals = torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE)
         genz = 1j * torch.diag(mvals)
 
-        gens = torch.stack([genx, genz, geny], dim=0)
+        # Standard ordering: x, y, z
+        gens = torch.stack([genx, geny, genz], dim=0)
 
         Q = self.toreal()
         out = Q.t().conj() @ gens @ Q
         return out.real.to(self.REAL_DTYPE)
 
     def toreal(self) -> torch.Tensor:
-        """Get the conversion matrix from complex to real spherical harmonics."""
+        """Get the conversion matrix from complex to real spherical harmonics.
+
+        The output basis uses standard m-ordering: m = -l, -l+1, ..., l.
+        For l=1, this corresponds to (y, z, x) in Cartesian coordinates.
+        """
         SQRT2 = 2 ** -0.5
 
         q = torch.zeros(self.dim(), self.dim(), dtype=torch.complex128)
@@ -124,6 +129,7 @@ class Irrep:
 
         q[self.l, self.l] = 1
         q = (-1j)**self.l * q
+
         return q
 
     def __str__(self) -> str:
@@ -181,6 +187,7 @@ class Repr(nn.Module):
         >>> repr = Repr(lvals=[0, 1, 2])
         >>> repr.dim()  # 1 + 3 + 5 = 9
         9
+        >>> # Rotate by pi/4 around z-axis
         >>> axis = torch.tensor([[0., 0., 1.]])
         >>> angle = torch.tensor([3.14159 / 4])
         >>> D = repr.rot(axis, angle)
@@ -241,7 +248,10 @@ class Repr(nn.Module):
         return self._cumdims
 
     def _generators(self) -> torch.Tensor:
-        """Compute the so(3) generators for the full representation."""
+        """Compute the so(3) generators for the full representation.
+
+        Returns generators in standard (x, y, z) ordering.
+        """
         NUM_GENS = 3
         gens = torch.zeros(NUM_GENS, self.dim(), self.dim())
 
@@ -260,14 +270,13 @@ class Repr(nn.Module):
         self,
         axis: torch.Tensor,
         angle: torch.Tensor,
-        perm: bool = False,
     ) -> torch.Tensor:
         """Compute the Wigner D-matrix for a rotation.
 
         Args:
-            axis: Rotation axis of shape (..., 3), should be normalized.
+            axis: Rotation axis of shape (..., 3) in standard (x, y, z) order.
+                  Should be normalized (or will be treated as direction).
             angle: Rotation angle in radians of shape (...).
-            perm: Unused, kept for API compatibility.
 
         Returns:
             Wigner D-matrix of shape (..., dim, dim).
@@ -285,6 +294,84 @@ class Repr(nn.Module):
                 rot[..., cdims[i], cdims[i]] = 1.0
 
         return rot
+
+    def rot_to_ez(self, directions: torch.Tensor) -> torch.Tensor:
+        """Compute Wigner D-matrix for rotation taking e_z to direction.
+
+        This computes the rotation matrix D such that applying D to features
+        is equivalent to rotating the coordinate frame so that e_z points
+        along the given direction.
+
+        Args:
+            directions: (..., 3) direction vectors (need not be normalized)
+
+        Returns:
+            D: (..., dim, dim) Wigner D-matrix
+        """
+        # Normalize direction
+        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + 1e-8)
+
+        # Rotation axis is perpendicular to both e_z and d
+        # axis = e_z × d = (-d_y, d_x, 0)
+        axis = torch.stack([
+            -d[..., 1],
+            d[..., 0],
+            torch.zeros_like(d[..., 0])
+        ], dim=-1)
+
+        # Normalize axis (handle d ≈ ±e_z case)
+        axis_norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
+        axis = axis / (axis_norm + 1e-8)
+
+        # Angle is arccos(e_z · d) = arccos(d_z)
+        angle = torch.arccos(d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7))
+
+        return self.rot(axis, angle)
+
+    @staticmethod
+    def cartesian_rotation(directions: torch.Tensor) -> torch.Tensor:
+        """Compute 3x3 Cartesian rotation matrix taking e_z to direction.
+
+        This uses Rodrigues formula to compute the rotation directly in
+        Cartesian coordinates, independent of the SH basis used by Wigner-D.
+
+        Args:
+            directions: (..., 3) direction vectors (need not be normalized)
+
+        Returns:
+            R: (..., 3, 3) rotation matrix in Cartesian (x, y, z) basis
+        """
+        # Normalize direction
+        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + 1e-8)
+
+        # Rotation axis: e_z × d = (-d_y, d_x, 0)
+        ax = -d[..., 1]
+        ay = d[..., 0]
+
+        # Normalize axis (handle d ≈ ±e_z)
+        axis_norm = torch.sqrt(ax**2 + ay**2 + 1e-16)
+        ax = ax / axis_norm
+        ay = ay / axis_norm
+
+        # Angle: arccos(d_z)
+        c = d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7)  # cos(theta)
+        s = torch.sqrt(1 - c**2)  # sin(theta)
+        t = 1 - c  # 1 - cos(theta)
+
+        # Rodrigues formula with axis = (ax, ay, 0)
+        R = torch.zeros(*directions.shape[:-1], 3, 3, device=directions.device, dtype=directions.dtype)
+
+        R[..., 0, 0] = c + t * ax * ax
+        R[..., 0, 1] = t * ax * ay
+        R[..., 0, 2] = s * ay
+        R[..., 1, 0] = t * ax * ay
+        R[..., 1, 1] = c + t * ay * ay
+        R[..., 1, 2] = -s * ax
+        R[..., 2, 0] = -s * ay
+        R[..., 2, 1] = s * ax
+        R[..., 2, 2] = c
+
+        return R
 
     def __str__(self) -> str:
         degrees = ', '.join(str(rep.l) for rep in self.irreps)

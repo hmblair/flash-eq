@@ -93,7 +93,7 @@ class EquivariantEdgewiseLinear(nn.Module):
 
         # Compute weight structure from representation product
         self._product = ProductRepr(in_repr, out_repr)
-        self.weight_dim = self._product.weight_dim()
+        self.weight_dim = self._product.nreps()
         self.channels_in = in_repr.mult
         self.channels_out = out_repr.mult
 

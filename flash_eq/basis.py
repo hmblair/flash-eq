@@ -14,7 +14,7 @@ Reference: docs/theory.tex, Section 2
 import torch
 import torch.nn as nn
 
-from .representations import Repr
+from .representations import Repr, WignerD
 
 
 def _build_m_order_permutation(lvals: list[int]) -> torch.Tensor:
@@ -91,9 +91,9 @@ class WignerDBasis(nn.Module):
         self.repr_in = repr_in
         self.repr_out = repr_out
 
-        # Store as submodules so buffers transfer with .to()
-        self.add_module('_repr_in', repr_in)
-        self.add_module('_repr_out', repr_out)
+        # WignerD modules for computing rotations
+        self._wigner_in = WignerD(repr_in)
+        self._wigner_out = WignerD(repr_out)
 
         # Build m-order permutations
         self.register_buffer('_perm_in', _build_m_order_permutation(repr_in.lvals))
@@ -122,8 +122,8 @@ class WignerDBasis(nn.Module):
         # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
         # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
         # cartesian=True because directions are in Cartesian (x,y,z) coordinates
-        P_std = self.repr_in.rot_to_ez(directions).mT
-        Q_std = self.repr_out.rot_to_ez(directions).mT
+        P_std = self._wigner_in.rot_to_ez(directions).mT
+        Q_std = self._wigner_out.rot_to_ez(directions).mT
 
         # Permute to m-first order for block-diagonal structure
         P = P_std[..., self._perm_in]

@@ -18,7 +18,7 @@ where:
 import torch
 from typing import Tuple
 
-from .representations import Repr
+from .representations import Repr, WignerD
 from .basis import WignerDBasis
 
 
@@ -213,11 +213,14 @@ def equivariance_test(
     dtype = node_features.dtype
 
     # Wigner-D for input and output representations
-    D_in = repr_in.rot(axis, angle).to(dtype).to(device)
-    D_out = repr_out.rot(axis, angle).to(dtype).to(device)
+    wigner_in = WignerD(repr_in)
+    wigner_out = WignerD(repr_out)
+    D_in = wigner_in.rot(axis, angle).to(dtype).to(device)
+    D_out = wigner_out.rot(axis, angle).to(dtype).to(device)
 
     # 3x3 rotation matrix for directions (l=1 Wigner-D with cartesian=True)
-    R = Repr(lvals=[1]).rot(axis, angle, cartesian=True).to(dtype).to(device)
+    wigner_l1 = WignerD(Repr(lvals=[1]))
+    R = wigner_l1.rot(axis, angle, cartesian=True).to(dtype).to(device)
 
     # Method 1: compute output, then rotate
     output = reference_layer(node_features, src_indices, directions, compact_weights, repr_in, repr_out)

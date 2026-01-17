@@ -19,7 +19,7 @@ def test_equivariance(repr_in, repr_out=None, cin=2, cout=3, num_nodes=10, num_e
     dtype = torch.float64
 
     prod = ProductRepr(repr_in, repr_out)
-    weight_dim = prod.weight_dim()
+    weight_dim = prod.nreps()
 
     # Random inputs
     node_features = torch.randn(num_nodes, cin, repr_in.dim(), dtype=dtype, device=device)

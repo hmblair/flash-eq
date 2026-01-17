@@ -175,11 +175,11 @@ class ProductIrrep:
         return f"ProductIrrep({self.rep1.l} x {self.rep2.l})"
 
 
-class Repr(nn.Module):
+class Repr:
     """A collection of irreducible representations.
 
-    Combines multiple irreps into a single representation, enabling
-    computation of Wigner D-matrices for the combined representation.
+    Simple data class storing representation structure. Use WignerD for
+    computing rotation matrices.
 
     Args:
         lvals: List of degrees to include. Defaults to [1] (vectors only).
@@ -189,15 +189,9 @@ class Repr(nn.Module):
         >>> repr = Repr(lvals=[0, 1, 2])
         >>> repr.dim()  # 1 + 3 + 5 = 9
         9
-        >>> # Rotate by pi/4 around z-axis
-        >>> axis = torch.tensor([[0., 0., 1.]])
-        >>> angle = torch.tensor([3.14159 / 4])
-        >>> D = repr.rot(axis, angle)
     """
 
     def __init__(self, lvals: List[int] = None, mult: int = 1) -> None:
-        super().__init__()
-
         if lvals is None:
             lvals = [1]
 
@@ -216,11 +210,6 @@ class Repr(nn.Module):
             sum(rep.dim() for rep in self.irreps[:i])
             for i in range(len(self.irreps) + 1)
         ]
-
-        self.register_buffer(
-            'generators',
-            self._generators().view(3, -1)
-        )
 
     def nreps(self) -> int:
         """Return the number of irreducible representations."""
@@ -249,16 +238,38 @@ class Repr(nn.Module):
         """Get cumulative dimensions for indexing into subspaces."""
         return self._cumdims
 
-    def _generators(self) -> torch.Tensor:
-        """Compute the so(3) generators for the full representation.
+    def __str__(self) -> str:
+        degrees = ', '.join(str(rep.l) for rep in self.irreps)
+        return f"Repr(lvals=[{degrees}])"
 
-        Returns generators in standard (x, y, z) ordering.
-        """
+
+class WignerD(nn.Module):
+    """Wigner D-matrix computation for a representation.
+
+    Computes rotation matrices (Wigner D-matrices) for a given Repr.
+
+    Args:
+        repr: The representation to compute rotations for.
+
+    Example:
+        >>> repr = Repr(lvals=[0, 1, 2])
+        >>> wigner = WignerD(repr)
+        >>> axis = torch.tensor([[0., 0., 1.]])
+        >>> angle = torch.tensor([3.14159 / 4])
+        >>> D = wigner.rot(axis, angle)
+    """
+
+    def __init__(self, repr: Repr) -> None:
+        super().__init__()
+        self.repr = repr
+
+        # Build generators eagerly
         NUM_GENS = 3
-        gens = torch.zeros(NUM_GENS, self.dim(), self.dim())
+        dim = repr.dim()
+        gens = torch.zeros(NUM_GENS, dim, dim)
 
         cumdim = 0
-        for irrep in self.irreps:
+        for irrep in repr.irreps:
             gens[
                 ...,
                 cumdim: cumdim + irrep.dim(),
@@ -266,7 +277,7 @@ class Repr(nn.Module):
             ] = irrep._generators()
             cumdim += irrep.dim()
 
-        return gens
+        self.register_buffer('generators', gens.view(3, -1))
 
     def rot(
         self,
@@ -294,15 +305,16 @@ class Repr(nn.Module):
             # (ax, ay, az) -> (az, ax, ay)
             axis = axis[..., [2, 0, 1]]
 
+        dim = self.repr.dim()
         *b, _ = axis.size()
-        gens = (axis @ self.generators.to(dtype=axis.dtype, device=axis.device)).view(*b, self.dim(), self.dim())
+        gens = (axis @ self.generators.to(dtype=axis.dtype, device=axis.device)).view(*b, dim, dim)
 
         rot = torch.linalg.matrix_exp(angle[..., None, None] * gens)
         rot = torch.nan_to_num(rot, 0.0)
 
         # Restore identity for degree-0 (scalar) irreps
-        cdims = self.cumdims()
-        for i, irrep in enumerate(self.irreps):
+        cdims = self.repr.cumdims()
+        for i, irrep in enumerate(self.repr.irreps):
             if irrep.l == 0:
                 rot[..., cdims[i], cdims[i]] = 1.0
 
@@ -317,6 +329,7 @@ class Repr(nn.Module):
 
         Args:
             directions: (..., 3) direction vectors (need not be normalized)
+            cartesian: If True, directions are in Cartesian coordinates.
 
         Returns:
             D: (..., dim, dim) Wigner D-matrix
@@ -340,10 +353,6 @@ class Repr(nn.Module):
         angle = torch.arccos(d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7))
 
         return self.rot(axis, angle, cartesian).mT
-
-    def __str__(self) -> str:
-        degrees = ', '.join(str(rep.l) for rep in self.irreps)
-        return f"Repr(lvals=[{degrees}])"
 
 
 class ProductRepr:
@@ -437,19 +446,6 @@ class ProductRepr:
 
         return blocks, dim_in, dim_out, w_off
 
-    def weight_dim(self) -> int:
-        """Compute the weight dimension for block-diagonal parameterization.
-
-        For the low-rank equivariant approach, weights are block-diagonal
-        with structure determined by m-values:
-        - m=0: 1 real parameter per (n_in, n_out) pair
-        - m>0: 2 real parameters per (n_in, n_out) pair (real + imag)
-
-        Returns:
-            Total number of weight parameters per (channel_out, channel_in) pair.
-        """
-        _, _, _, weight_dim = self._compute_block_structure()
-        return weight_dim
 
     def build_block_metadata(self, device: torch.device) -> tuple:
         """Build metadata tensors for CUDA kernel.

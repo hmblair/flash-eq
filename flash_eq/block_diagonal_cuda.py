@@ -102,7 +102,7 @@ def get_weight_dim(lvals_in: List[int], lvals_out: List[int]) -> int:
     Returns:
         Weight dimension (sum over blocks of block_size).
     """
-    return ProductRepr(Repr(lvals=lvals_in), Repr(lvals=lvals_out)).weight_dim()
+    return ProductRepr(Repr(lvals=lvals_in), Repr(lvals=lvals_out)).nreps()
 
 
 # =============================================================================

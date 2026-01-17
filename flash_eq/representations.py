@@ -86,39 +86,32 @@ class Irrep:
         return torch.diag(torch.sqrt(j * (j + 1) - m * (m - 1)), diagonal=1)
 
     def _generators(self) -> torch.Tensor:
-        """Return the generators of so(3) in this representation.
+        """Return the so(3) generators in the real spherical harmonic basis.
 
-        Returns generators in standard Cartesian (x, y, z) ordering.
-        These satisfy the commutation relations [Jx, Jy] = Jz (cyclic).
-
-        For l=1, the generators match the standard 3x3 rotation generators
-        when the basis is converted to Cartesian coordinates.
+        Returns generators that, when combined with the cartesian flag in rot(),
+        produce correct Wigner-D matrices for Cartesian axis inputs.
 
         Returns:
-            Shape (3, 2l+1, 2l+1) tensor of generator matrices [Jx, Jy, Jz].
+            Shape (3, 2l+1, 2l+1) tensor of generator matrices.
         """
         raising = self.raising().to(self.COMPLEX_DTYPE)
         lowering = self.lowering().to(self.COMPLEX_DTYPE)
 
-        # Standard angular momentum operators in complex basis
-        # J+ = Jx + i*Jy, J- = Jx - i*Jy
-        # => Jx = (J+ + J-) / 2, Jy = (J+ - J-) / (2i)
-        genx = 0.5 * (raising + lowering)
-        geny = -0.5j * (raising - lowering)
+        # Angular momentum operators in complex |l,m> basis
+        Jx = 0.5 * (raising + lowering)
+        Jy = -0.5j * (raising - lowering)
+        Jz = 1j * torch.diag(torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE))
 
-        mvals = torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE)
-        genz = 1j * torch.diag(mvals)
-
-        # Transform to real spherical harmonic basis
+        # Transform to real spherical harmonic basis.
+        # The toreal() transformation swaps y<->z:
+        #   Jx -> Lx, Jy -> Lz, Jz -> Ly
         Q = self.toreal()
-        genx_real = (Q.t().conj() @ genx @ Q).real.to(self.REAL_DTYPE)
-        geny_real = (Q.t().conj() @ geny @ Q).real.to(self.REAL_DTYPE)
-        genz_real = (Q.t().conj() @ genz @ Q).real.to(self.REAL_DTYPE)
+        Lx = (Q.t().conj() @ Jx @ Q).real.to(self.REAL_DTYPE)
+        Lz = (Q.t().conj() @ Jy @ Q).real.to(self.REAL_DTYPE)
+        Ly = (Q.t().conj() @ Jz @ Q).real.to(self.REAL_DTYPE)
 
-        # Stack in Cartesian order: [Jx, Jy, Jz]
-        # Note: after toreal() transformation, genx/geny are swapped
-        # genz_real = Q^H @ genz @ Q is block-diagonal by |m| for all l.
-        return torch.stack([geny_real, genx_real, genz_real], dim=0)
+        # Return in order that works with rot()'s cartesian permutation [2,0,1]
+        return torch.stack([Lz, Lx, Ly], dim=0)
 
     def toreal(self) -> torch.Tensor:
         """

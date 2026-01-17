@@ -88,11 +88,12 @@ class Irrep:
     def _generators(self) -> torch.Tensor:
         """Return the so(3) generators in the real spherical harmonic basis.
 
-        Returns generators that, when combined with the cartesian flag in rot(),
-        produce correct Wigner-D matrices for Cartesian axis inputs.
+        Returns generators ordered as [Lz, Lx, Ly] so that with cartesian=False,
+        axis=(0,0,1) produces rotation around the SH z-axis. This yields
+        m-diagonal Wigner-D matrices where each |m| block rotates by mθ.
 
         Returns:
-            Shape (3, 2l+1, 2l+1) tensor of generator matrices.
+            Shape (3, 2l+1, 2l+1) tensor of generator matrices [Lz, Lx, Ly].
         """
         raising = self.raising().to(self.COMPLEX_DTYPE)
         lowering = self.lowering().to(self.COMPLEX_DTYPE)
@@ -103,14 +104,13 @@ class Irrep:
         Jz = 1j * torch.diag(torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE))
 
         # Transform to real spherical harmonic basis.
-        # The toreal() transformation swaps y<->z:
-        #   Jx -> Lx, Jy -> Lz, Jz -> Ly
+        # The toreal() transformation swaps y<->z: Jx -> Lx, Jy -> Lz, Jz -> Ly
         Q = self.toreal()
         Lx = (Q.t().conj() @ Jx @ Q).real.to(self.REAL_DTYPE)
         Lz = (Q.t().conj() @ Jy @ Q).real.to(self.REAL_DTYPE)
         Ly = (Q.t().conj() @ Jz @ Q).real.to(self.REAL_DTYPE)
 
-        # Return in order that works with rot()'s cartesian permutation [2,0,1]
+        # Order [Lz, Lx, Ly] so axis=(0,0,1) with cartesian=False gives Lz rotation
         return torch.stack([Lz, Lx, Ly], dim=0)
 
     def toreal(self) -> torch.Tensor:
@@ -280,8 +280,11 @@ class Repr(nn.Module):
             axis: Rotation axis of shape (..., 3).
                   Should be normalized (or will be treated as direction).
             angle: Rotation angle in radians of shape (...).
-            cartesian: If True, axis is in Cartesian (x, y, z) order and will
-                  be permuted to match the generator ordering.
+            cartesian: If False (default), axis components index generators as
+                  [Lz, Lx, Ly]. This means axis=(0,0,1) rotates around the SH
+                  z-axis, producing m-diagonal Wigner-D matrices.
+                  If True, axis is in Cartesian (x,y,z) coordinates and is
+                  permuted to [z,x,y] to match the generator ordering.
 
         Returns:
             Wigner D-matrix of shape (..., dim, dim).

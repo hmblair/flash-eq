@@ -39,14 +39,12 @@ def _build_m_order_permutation(lvals: list[int]) -> torch.Tensor:
     for l_idx, l in enumerate(lvals):
         perm.append(std_pos(l_idx, 0))
 
-    # m>0: reals (positive m) first, then imags (negative m)
+    # m>0: pair +m/-m for each l to get contiguous 2x2 blocks
     for m in range(1, lmax + 1):
         for l_idx, l in enumerate(lvals):
             if l >= m:
-                perm.append(std_pos(l_idx, m))
-        for l_idx, l in enumerate(lvals):
-            if l >= m:
-                perm.append(std_pos(l_idx, -m))
+                perm.append(std_pos(l_idx, m))   # +m
+                perm.append(std_pos(l_idx, -m))  # -m
 
     return torch.tensor(perm, dtype=torch.long)
 

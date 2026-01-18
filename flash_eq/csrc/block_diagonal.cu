@@ -26,6 +26,83 @@ constexpr int THREADS = 256;
 
 
 //------------------------------------------------------------------------------
+// Device Helper Functions
+//------------------------------------------------------------------------------
+
+/**
+ * Interpolation state for binned radial weights.
+ */
+struct InterpState {
+    int idx_lo;
+    int idx_hi;
+    float t;
+    float one_minus_t;
+};
+
+/**
+ * Load interpolation state for an edge.
+ */
+template <typename scalar_t>
+__device__ __forceinline__ InterpState load_interp_state(
+    int64_t edge,
+    const int* __restrict__ bin_lo,
+    const scalar_t* __restrict__ interp_weight,
+    int num_bins
+) {
+    InterpState state;
+    state.idx_lo = bin_lo[edge];
+    state.idx_hi = min(state.idx_lo + 1, num_bins);
+    state.t = static_cast<float>(interp_weight[edge]);
+    state.one_minus_t = 1.0f - state.t;
+    return state;
+}
+
+/**
+ * Linearly interpolate a weight from the radial table.
+ */
+template <typename scalar_t>
+__device__ __forceinline__ float lerp_weight(
+    const scalar_t* __restrict__ table,
+    int idx_lo,
+    int idx_hi,
+    float t,
+    float one_minus_t
+) {
+    return one_minus_t * static_cast<float>(__ldg(&table[idx_lo]))
+         + t * static_cast<float>(__ldg(&table[idx_hi]));
+}
+
+/**
+ * Complex multiply-accumulate for m>0 blocks.
+ * Computes: (acc_re, acc_im) += (a + bi) * (f_re + f_im*i)
+ *         = (a*f_re + b*f_im, a*f_im - b*f_re)
+ *
+ * Note: The sign pattern comes from the 2x2 rotation matrix structure:
+ *       [a  b] [f_re]   [a*f_re + b*f_im]
+ *       [-b a] [f_im] = [a*f_im - b*f_re]
+ */
+__device__ __forceinline__ void complex_mul_add(
+    float a, float b,
+    float f_re, float f_im,
+    float& acc_re, float& acc_im
+) {
+    acc_re += a * f_re + b * f_im;
+    acc_im += a * f_im - b * f_re;
+}
+
+/**
+ * Warp-level sum reduction.
+ */
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+
+//------------------------------------------------------------------------------
 // Forward Kernels
 //------------------------------------------------------------------------------
 
@@ -59,11 +136,8 @@ __global__ void forward_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute outputs
@@ -72,8 +146,8 @@ __global__ void forward_m0_kernel(
         const int o = out_idx % n_out;
 
         float acc = 0.0f;
-        const int w_base_lo = idx_lo * table_stride + co * Cin * Wdim + w_off;
-        const int w_base_hi = idx_hi * table_stride + co * Cin * Wdim + w_off;
+        const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + w_off;
 
         for (int ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * n_in;
@@ -82,8 +156,8 @@ __global__ void forward_m0_kernel(
             #pragma unroll 4
             for (int i = 0; i < n_in; i++) {
                 const int w_idx = w_ci_off + o * n_in + i;
-                const float w = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx]));
+                const float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                            interp.t, interp.one_minus_t);
                 acc += w * f_ptr[i];
             }
         }
@@ -114,7 +188,7 @@ __global__ void forward_mpos_kernel(
 
     const int tid = threadIdx.x;
 
-    // Unpack block parameters (no m needed, all are m>0)
+    // Unpack block parameters
     const int* blk_ptr = block_data + blk * 5;
     const int n_in = blk_ptr[0];
     const int n_out = blk_ptr[1];
@@ -134,11 +208,8 @@ __global__ void forward_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute outputs
@@ -148,8 +219,8 @@ __global__ void forward_mpos_kernel(
 
         float acc_re = 0.0f;
         float acc_im = 0.0f;
-        const int w_base_lo = idx_lo * table_stride + co * Cin * Wdim + w_off;
-        const int w_base_hi = idx_hi * table_stride + co * Cin * Wdim + w_off;
+        const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + w_off;
 
         for (int ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * in_size;
@@ -161,13 +232,12 @@ __global__ void forward_mpos_kernel(
                 const float f_im = f_ptr[2 * i + 1];
                 const int w_idx = w_ci_off + (o * n_in + i) * 2;
 
-                const float a = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx]));
-                const float b = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx + 1]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx + 1]));
+                const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                            interp.t, interp.one_minus_t);
+                const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                                            interp.t, interp.one_minus_t);
 
-                acc_re += a * f_re + b * f_im;
-                acc_im += a * f_im - b * f_re;
+                complex_mul_add(a, b, f_re, f_im, acc_re, acc_im);
             }
         }
 
@@ -211,11 +281,8 @@ __global__ void backward_features_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute grad_features
@@ -224,8 +291,8 @@ __global__ void backward_features_m0_kernel(
         const int i = in_idx % n_in;
 
         float grad = 0.0f;
-        const int w_base_lo = idx_lo * table_stride + ci * Wdim + w_off;
-        const int w_base_hi = idx_hi * table_stride + ci * Wdim + w_off;
+        const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + w_off;
 
         for (int co = 0; co < Cout; co++) {
             const float* go_ptr = grad_shared + co * n_out;
@@ -234,8 +301,8 @@ __global__ void backward_features_m0_kernel(
             #pragma unroll 4
             for (int o = 0; o < n_out; o++) {
                 const int w_idx = w_co_off + o * n_in + i;
-                const float w = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx]));
+                const float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                            interp.t, interp.one_minus_t);
                 grad += w * go_ptr[o];
             }
         }
@@ -247,6 +314,13 @@ __global__ void backward_features_m0_kernel(
 
 /**
  * Backward kernel for m>0: compute grad_features.
+ *
+ * The gradient w.r.t. input features uses the transpose of the 2x2 rotation:
+ *   [a  -b]^T   [a   b]
+ *   [b   a]   = [-b  a]
+ *
+ * So: grad_f_re = a * go_re - b * go_im
+ *     grad_f_im = b * go_re + a * go_im
  */
 template <typename scalar_t>
 __global__ void backward_features_mpos_kernel(
@@ -286,11 +360,8 @@ __global__ void backward_features_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute grad_features
@@ -301,8 +372,8 @@ __global__ void backward_features_mpos_kernel(
         const int i_idx = i_local / 2;
 
         float grad = 0.0f;
-        const int w_base_lo = idx_lo * table_stride + ci * Wdim + w_off;
-        const int w_base_hi = idx_hi * table_stride + ci * Wdim + w_off;
+        const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + w_off;
 
         for (int co = 0; co < Cout; co++) {
             const float* go_ptr = grad_shared + co * out_size;
@@ -314,11 +385,12 @@ __global__ void backward_features_mpos_kernel(
                 const float go_im = go_ptr[2 * o + 1];
                 const int w_idx = w_co_off + (o * n_in + i_idx) * 2;
 
-                const float a = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx]));
-                const float b = one_minus_t * static_cast<float>(__ldg(&radial_table[w_base_lo + w_idx + 1]))
-                              + t * static_cast<float>(__ldg(&radial_table[w_base_hi + w_idx + 1]));
+                const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                            interp.t, interp.one_minus_t);
+                const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                                            interp.t, interp.one_minus_t);
 
+                // Transpose of 2x2 rotation applied to gradient
                 if (is_real) {
                     grad += a * go_re - b * go_im;
                 } else {
@@ -380,11 +452,8 @@ __global__ void backward_table_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
 
     float local_grad_t = 0.0f;
 
@@ -401,19 +470,19 @@ __global__ void backward_table_m0_kernel(
         const float grad_w = f * go;
 
         const int table_idx = co * Cin * Wdim + ci * Wdim + w_off + w_local;
-        atomicAdd(&grad_radial_table[idx_lo * table_stride + table_idx], one_minus_t * grad_w);
-        atomicAdd(&grad_radial_table[idx_hi * table_stride + table_idx], t * grad_w);
+        const int addr_lo = interp.idx_lo * table_stride + table_idx;
+        const int addr_hi = interp.idx_hi * table_stride + table_idx;
 
-        const float w_lo = static_cast<float>(__ldg(&radial_table[idx_lo * table_stride + table_idx]));
-        const float w_hi = static_cast<float>(__ldg(&radial_table[idx_hi * table_stride + table_idx]));
+        atomicAdd(&grad_radial_table[addr_lo], interp.one_minus_t * grad_w);
+        atomicAdd(&grad_radial_table[addr_hi], interp.t * grad_w);
+
+        const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
+        const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
         local_grad_t += (w_hi - w_lo) * grad_w;
     }
 
-    // Warp reduction for grad_interp_weight
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_grad_t += __shfl_down_sync(0xffffffff, local_grad_t, offset);
-    }
+    // Warp reduction and atomic add for grad_interp_weight
+    local_grad_t = warp_reduce_sum(local_grad_t);
     if ((tid % 32) == 0) {
         atomicAdd(&grad_interp_weight[edge], local_grad_t);
     }
@@ -422,6 +491,10 @@ __global__ void backward_table_m0_kernel(
 
 /**
  * Backward kernel for m>0: compute grad_radial_table and grad_interp_weight.
+ *
+ * Weight gradient computation for 2x2 rotation [a, b; -b, a]:
+ *   grad_a = f_re * go_re + f_im * go_im  (from both diagonal elements)
+ *   grad_b = f_im * go_re - f_re * go_im  (from both off-diagonal elements)
  */
 template <typename scalar_t>
 __global__ void backward_table_mpos_kernel(
@@ -476,11 +549,8 @@ __global__ void backward_table_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation
-    const int idx_lo = bin_lo[edge];
-    const int idx_hi = min(idx_lo + 1, num_bins);
-    const float t = static_cast<float>(interp_weight[edge]);
-    const float one_minus_t = 1.0f - t;
+    // Interpolation state
+    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
 
     float local_grad_t = 0.0f;
 
@@ -491,7 +561,7 @@ __global__ void backward_table_mpos_kernel(
         const int w_local = w_idx % w_block_size;
 
         const int temp = w_local / 2;
-        const int ab = w_local % 2;
+        const int is_b = w_local % 2;  // 0 = 'a' weight, 1 = 'b' weight
         const int o = temp / n_in;
         const int i = temp % n_in;
 
@@ -503,23 +573,24 @@ __global__ void backward_table_mpos_kernel(
         const float go_re = go_ptr[2 * o];
         const float go_im = go_ptr[2 * o + 1];
 
-        const float grad_w = (ab == 0) ? (f_re * go_re + f_im * go_im)
-                                       : (f_im * go_re - f_re * go_im);
+        // Gradient w.r.t. 'a' or 'b' weight
+        const float grad_w = (is_b == 0) ? (f_re * go_re + f_im * go_im)
+                                         : (f_im * go_re - f_re * go_im);
 
         const int table_idx = co * Cin * Wdim + ci * Wdim + w_off + w_local;
-        atomicAdd(&grad_radial_table[idx_lo * table_stride + table_idx], one_minus_t * grad_w);
-        atomicAdd(&grad_radial_table[idx_hi * table_stride + table_idx], t * grad_w);
+        const int addr_lo = interp.idx_lo * table_stride + table_idx;
+        const int addr_hi = interp.idx_hi * table_stride + table_idx;
 
-        const float w_lo = static_cast<float>(__ldg(&radial_table[idx_lo * table_stride + table_idx]));
-        const float w_hi = static_cast<float>(__ldg(&radial_table[idx_hi * table_stride + table_idx]));
+        atomicAdd(&grad_radial_table[addr_lo], interp.one_minus_t * grad_w);
+        atomicAdd(&grad_radial_table[addr_hi], interp.t * grad_w);
+
+        const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
+        const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
         local_grad_t += (w_hi - w_lo) * grad_w;
     }
 
-    // Warp reduction for grad_interp_weight
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_grad_t += __shfl_down_sync(0xffffffff, local_grad_t, offset);
-    }
+    // Warp reduction and atomic add for grad_interp_weight
+    local_grad_t = warp_reduce_sum(local_grad_t);
     if ((tid % 32) == 0) {
         atomicAdd(&grad_interp_weight[edge], local_grad_t);
     }

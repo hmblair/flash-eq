@@ -11,7 +11,8 @@ from scipy.spatial.transform import Rotation
 
 from flash_eq import (
     Repr, WignerD,
-    RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm
+    RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm,
+    GraphPooling,
 )
 
 
@@ -328,3 +329,192 @@ class TestReprMethods:
         count, locs = repr.find_scalar()
         assert count == 1
         assert locs == [3]  # After l=1 (3 dims)
+
+
+class TestGraphPooling:
+    """Tests for GraphPooling layer."""
+
+    @pytest.mark.parametrize("reduce", ["sum", "mean", "max"])
+    def test_output_shape(self, device, reduce):
+        """Test that output shape is correct."""
+        pool = GraphPooling(reduce=reduce)
+
+        num_nodes, num_edges, channels, dim = 10, 100, 8, 9
+        edge_features = torch.randn(num_edges, channels, dim, device=device)
+        dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes)
+
+        assert out.shape == (num_nodes, channels, dim)
+
+    @pytest.mark.parametrize("reduce", ["sum", "mean", "max"])
+    def test_dtype_preservation(self, device, reduce):
+        """Test that output dtype matches input dtype."""
+        pool = GraphPooling(reduce=reduce)
+
+        for dtype in [torch.float32, torch.float64]:
+            edge_features = torch.randn(50, 4, 9, device=device, dtype=dtype)
+            dst_indices = torch.randint(0, 10, (50,), device=device)
+
+            out = pool(edge_features, dst_indices, 10)
+            assert out.dtype == dtype
+
+    def test_sum_correctness(self, device):
+        """Test that sum pooling produces correct results."""
+        pool = GraphPooling(reduce='sum')
+
+        # Simple case: 4 edges -> 2 nodes
+        edge_features = torch.tensor([
+            [[1.0, 2.0]],  # edge 0 -> node 0
+            [[3.0, 4.0]],  # edge 1 -> node 0
+            [[5.0, 6.0]],  # edge 2 -> node 1
+            [[7.0, 8.0]],  # edge 3 -> node 1
+        ], device=device)
+        dst_indices = torch.tensor([0, 0, 1, 1], device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=2)
+
+        expected = torch.tensor([
+            [[4.0, 6.0]],   # 1+3, 2+4
+            [[12.0, 14.0]], # 5+7, 6+8
+        ], device=device)
+
+        assert torch.allclose(out, expected)
+
+    def test_mean_correctness(self, device):
+        """Test that mean pooling produces correct results."""
+        pool = GraphPooling(reduce='mean')
+
+        edge_features = torch.tensor([
+            [[2.0, 4.0]],  # edge 0 -> node 0
+            [[4.0, 8.0]],  # edge 1 -> node 0
+            [[9.0, 3.0]],  # edge 2 -> node 1
+        ], device=device)
+        dst_indices = torch.tensor([0, 0, 1], device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=2)
+
+        expected = torch.tensor([
+            [[3.0, 6.0]],  # mean of [2,4] and [4,8]
+            [[9.0, 3.0]],  # single edge
+        ], device=device)
+
+        assert torch.allclose(out, expected)
+
+    def test_max_correctness(self, device):
+        """Test that max pooling produces correct results."""
+        pool = GraphPooling(reduce='max')
+
+        edge_features = torch.tensor([
+            [[1.0, 5.0]],  # edge 0 -> node 0
+            [[3.0, 2.0]],  # edge 1 -> node 0
+            [[7.0, 8.0]],  # edge 2 -> node 1
+        ], device=device)
+        dst_indices = torch.tensor([0, 0, 1], device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=2)
+
+        expected = torch.tensor([
+            [[3.0, 5.0]],  # max(1,3), max(5,2)
+            [[7.0, 8.0]],  # single edge
+        ], device=device)
+
+        assert torch.allclose(out, expected)
+
+    def test_zero_edges(self, device):
+        """Test with zero edges (empty graph)."""
+        pool = GraphPooling(reduce='sum')
+
+        edge_features = torch.zeros(0, 4, 9, device=device)
+        dst_indices = torch.zeros(0, dtype=torch.long, device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=5)
+
+        assert out.shape == (5, 4, 9)
+        assert (out == 0).all()
+
+    def test_nodes_with_no_edges(self, device):
+        """Test that nodes with no incoming edges get zeros."""
+        pool_sum = GraphPooling(reduce='sum')
+        pool_mean = GraphPooling(reduce='mean')
+        pool_max = GraphPooling(reduce='max')
+
+        # All edges go to node 0, nodes 1-4 have no edges
+        edge_features = torch.randn(10, 4, 9, device=device)
+        dst_indices = torch.zeros(10, dtype=torch.long, device=device)
+
+        for pool in [pool_sum, pool_mean, pool_max]:
+            out = pool(edge_features, dst_indices, num_nodes=5)
+
+            # Nodes 1-4 should be zero
+            assert (out[1:] == 0).all()
+            # Node 0 should be non-zero (with high probability)
+            assert out[0].abs().sum() > 0
+
+    def test_all_edges_to_one_node(self, device):
+        """Test when all edges point to a single node."""
+        pool = GraphPooling(reduce='sum')
+
+        num_edges = 100
+        edge_features = torch.ones(num_edges, 2, 3, device=device)
+        dst_indices = torch.zeros(num_edges, dtype=torch.long, device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=10)
+
+        # Node 0 should have sum = num_edges
+        assert torch.allclose(out[0], torch.full((2, 3), float(num_edges), device=device))
+        # Other nodes should be zero
+        assert (out[1:] == 0).all()
+
+    def test_single_edge(self, device):
+        """Test with a single edge."""
+        pool = GraphPooling(reduce='sum')
+
+        edge_features = torch.tensor([[[1.0, 2.0, 3.0]]], device=device)
+        dst_indices = torch.tensor([2], device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=5)
+
+        assert out.shape == (5, 1, 3)
+        assert torch.allclose(out[2], edge_features[0])
+        assert (out[:2] == 0).all()
+        assert (out[3:] == 0).all()
+
+    def test_invalid_reduce_raises(self):
+        """Test that invalid reduce parameter raises ValueError."""
+        with pytest.raises(ValueError, match="reduce must be one of"):
+            GraphPooling(reduce='invalid')
+
+    def test_extra_repr(self):
+        """Test string representation."""
+        pool = GraphPooling(reduce='mean')
+        assert "mean" in pool.extra_repr()
+
+    @pytest.mark.parametrize("reduce", ["sum", "mean", "max"])
+    def test_gradient_flow(self, device, reduce):
+        """Test that gradients flow through pooling."""
+        pool = GraphPooling(reduce=reduce)
+
+        edge_features = torch.randn(50, 4, 9, device=device, requires_grad=True)
+        dst_indices = torch.randint(0, 10, (50,), device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes=10)
+        loss = out.sum()
+        loss.backward()
+
+        assert edge_features.grad is not None
+        assert edge_features.grad.shape == edge_features.shape
+
+    def test_large_scale(self, device):
+        """Test with large number of edges."""
+        pool = GraphPooling(reduce='sum')
+
+        num_nodes, num_edges = 1000, 100000
+        edge_features = torch.randn(num_edges, 32, 9, device=device)
+        dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+
+        out = pool(edge_features, dst_indices, num_nodes)
+
+        assert out.shape == (num_nodes, 32, 9)
+        # Verify it ran without error and produced finite values
+        assert torch.isfinite(out).all()

@@ -21,7 +21,7 @@ from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .layer import EquivariantEdgewiseLinear
 from .basis import WignerDBasis
 from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
-from .layers import RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm
+from .layers import RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm, GraphPooling
 from .block_diagonal_cuda import CUDANotAvailableError
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "EquivariantLinear",
     "EquivariantGating",
     "EquivariantLayerNorm",
+    "GraphPooling",
     # Basis
     "WignerDBasis",
     # Radial weights

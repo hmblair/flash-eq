@@ -15,7 +15,7 @@ Flash-eq approach:
 import torch
 import torch.nn as nn
 import gc
-from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr
+from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr, GraphPooling
 
 
 class RadialMLP(nn.Module):
@@ -270,6 +270,252 @@ def run_benchmark(dtype, use_amp, num_bins=100):
     return results
 
 
+def benchmark_basis_computation(lmax, num_edges, dtype, n_warmup=3, n_iter=10):
+    """
+    Benchmark WignerDBasis P/Q matrix computation.
+
+    Measures:
+    - Runtime to compute P and Q matrices from directions
+    - Memory footprint of the resulting P and Q tensors
+    """
+    clear_memory()
+    device = torch.device("cuda")
+
+    lvals = list(range(lmax + 1))
+    dim = sum(2 * l + 1 for l in lvals)
+
+    # Create representations and basis
+    repr_in = Repr(lvals=lvals, mult=1)
+    repr_out = Repr(lvals=lvals, mult=1)
+    basis = WignerDBasis(repr_in, repr_out).to(device)
+
+    # Random directions (unit vectors)
+    directions = torch.randn(num_edges, 3, device=device, dtype=dtype)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    # Warmup
+    for _ in range(n_warmup):
+        P, Q = basis(directions)
+        del P, Q
+    torch.cuda.synchronize()
+    clear_memory()
+
+    # Benchmark runtime
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(n_iter):
+        P, Q = basis(directions)
+    end.record()
+    torch.cuda.synchronize()
+
+    time_ms = start.elapsed_time(end) / n_iter
+
+    # Measure memory of P and Q tensors
+    P_mem_mb = P.numel() * P.element_size() / 1024**2
+    Q_mem_mb = Q.numel() * Q.element_size() / 1024**2
+
+    return {
+        'time_ms': time_ms,
+        'P_mem_mb': P_mem_mb,
+        'Q_mem_mb': Q_mem_mb,
+        'total_mem_mb': P_mem_mb + Q_mem_mb,
+        'P_shape': tuple(P.shape),
+        'Q_shape': tuple(Q.shape),
+        'dim': dim,
+    }
+
+
+def run_basis_benchmark(dtype):
+    """Run benchmark suite for P/Q basis matrix computation."""
+    dtype_name = "float32" if dtype == torch.float32 else "float16"
+
+    print(f"\n{'='*100}")
+    print(f"Benchmark: WignerDBasis P/Q Computation ({dtype_name})")
+    print("=" * 100)
+
+    # Configs: (lmax, num_edges)
+    configs = [
+        # Varying edges at fixed lmax
+        (2, 1000),
+        (2, 5000),
+        (2, 10000),
+        (2, 50000),
+        (2, 100000),
+        # Varying lmax at fixed edges
+        (1, 50000),
+        (2, 50000),
+        (3, 50000),
+        (4, 50000),
+        (6, 50000),
+        # Large scale
+        (4, 100000),
+        (6, 100000),
+        (4, 200000),
+        (6, 200000),
+    ]
+
+    print(f"\n{'Config':<25} {'P/Q Shape':<25} {'Time (ms)':<15} {'Memory (MB)':<15}")
+    print("-" * 80)
+
+    results = []
+
+    for lmax, num_edges in configs:
+        config_str = f"L={lmax}, E={num_edges}"
+
+        try:
+            r = benchmark_basis_computation(lmax, num_edges, dtype)
+            shape_str = f"({num_edges}, {r['dim']}, {r['dim']})"
+            time_str = f"{r['time_ms']:.2f}"
+            mem_str = f"{r['total_mem_mb']:.2f}"
+            results.append((config_str, r))
+        except torch.cuda.OutOfMemoryError:
+            shape_str = "OOM"
+            time_str = "OOM"
+            mem_str = "OOM"
+            results.append((config_str, None))
+        clear_memory()
+
+        print(f"{config_str:<25} {shape_str:<25} {time_str:<15} {mem_str:<15}")
+
+    # Summary: memory scaling analysis
+    print(f"\nMemory Scaling Analysis:")
+    print(f"{'Config':<25} {'Bytes/Edge':<15} {'ms/1K Edges':<15}")
+    print("-" * 55)
+
+    for config_str, r in results:
+        if r:
+            num_edges = int(config_str.split("E=")[1])
+            bytes_per_edge = r['total_mem_mb'] * 1024**2 / num_edges
+            ms_per_1k = r['time_ms'] / (num_edges / 1000)
+            print(f"{config_str:<25} {bytes_per_edge:<15.0f} {ms_per_1k:<15.3f}")
+
+    return results
+
+
+def benchmark_graph_pooling(num_nodes, num_edges, channels, dim, dtype, n_warmup=3, n_iter=10):
+    """
+    Benchmark GraphPooling operations (sum, mean, max).
+
+    Compares against a baseline using index_add for reference.
+    """
+    clear_memory()
+    device = torch.device("cuda")
+
+    # Create pooling modules
+    pool_sum = GraphPooling(reduce='sum')
+    pool_mean = GraphPooling(reduce='mean')
+    pool_max = GraphPooling(reduce='max')
+
+    # Random edge features and destination indices
+    edge_features = torch.randn(num_edges, channels, dim, device=device, dtype=dtype)
+    dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+
+    results = {}
+
+    for name, pool in [('sum', pool_sum), ('mean', pool_mean), ('max', pool_max)]:
+        # Warmup
+        for _ in range(n_warmup):
+            out = pool(edge_features, dst_indices, num_nodes)
+        torch.cuda.synchronize()
+        clear_memory()
+
+        # Benchmark
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        for _ in range(n_iter):
+            out = pool(edge_features, dst_indices, num_nodes)
+        end.record()
+        torch.cuda.synchronize()
+
+        results[name] = {
+            'time_ms': start.elapsed_time(end) / n_iter,
+            'output_shape': tuple(out.shape),
+        }
+        clear_memory()
+
+    return results
+
+
+def run_pooling_benchmark(dtype):
+    """Run benchmark suite for GraphPooling operations."""
+    dtype_name = "float32" if dtype == torch.float32 else "float16"
+
+    print(f"\n{'='*100}")
+    print(f"Benchmark: GraphPooling ({dtype_name})")
+    print("=" * 100)
+
+    # Configs: (num_nodes, num_edges, channels, dim)
+    configs = [
+        # Varying edges
+        (1000, 5000, 32, 9),
+        (1000, 10000, 32, 9),
+        (1000, 50000, 32, 9),
+        (1000, 100000, 32, 9),
+        # Varying nodes (affects sparsity)
+        (100, 50000, 32, 9),
+        (1000, 50000, 32, 9),
+        (10000, 50000, 32, 9),
+        # Varying channels
+        (1000, 50000, 16, 9),
+        (1000, 50000, 32, 9),
+        (1000, 50000, 64, 9),
+        # Varying dim (lmax)
+        (1000, 50000, 32, 4),   # lmax=1
+        (1000, 50000, 32, 9),   # lmax=2
+        (1000, 50000, 32, 16),  # lmax=3
+        (1000, 50000, 32, 49),  # lmax=6
+        # Large scale
+        (5000, 200000, 32, 9),
+        (10000, 500000, 32, 9),
+    ]
+
+    print(f"\n{'Config':<35} {'Sum (ms)':<12} {'Mean (ms)':<12} {'Max (ms)':<12}")
+    print("-" * 75)
+
+    all_results = []
+
+    for num_nodes, num_edges, channels, dim in configs:
+        config_str = f"N={num_nodes}, E={num_edges}, C={channels}, D={dim}"
+
+        try:
+            r = benchmark_graph_pooling(num_nodes, num_edges, channels, dim, dtype)
+            sum_str = f"{r['sum']['time_ms']:.3f}"
+            mean_str = f"{r['mean']['time_ms']:.3f}"
+            max_str = f"{r['max']['time_ms']:.3f}"
+            all_results.append((config_str, r))
+        except torch.cuda.OutOfMemoryError:
+            sum_str = mean_str = max_str = "OOM"
+            all_results.append((config_str, None))
+        clear_memory()
+
+        print(f"{config_str:<35} {sum_str:<12} {mean_str:<12} {max_str:<12}")
+
+    # Throughput analysis
+    print(f"\nThroughput Analysis (sum pooling):")
+    print(f"{'Config':<35} {'Edges/ms':<15} {'GB/s':<15}")
+    print("-" * 65)
+
+    for config_str, r in all_results:
+        if r:
+            # Parse config
+            parts = config_str.split(', ')
+            num_edges = int(parts[1].split('=')[1])
+            channels = int(parts[2].split('=')[1])
+            dim = int(parts[3].split('=')[1])
+
+            edges_per_ms = num_edges / r['sum']['time_ms']
+            bytes_per_edge = channels * dim * (4 if dtype == torch.float32 else 2)
+            gb_per_s = (num_edges * bytes_per_edge / 1e9) / (r['sum']['time_ms'] / 1000)
+
+            print(f"{config_str:<35} {edges_per_ms:<15.0f} {gb_per_s:<15.1f}")
+
+    return all_results
+
+
 def main():
     print("=" * 100)
     print("Benchmark: SE3-Transformer (dense matmuls) vs Flash-eq (public API)")
@@ -282,6 +528,16 @@ def main():
 
     # Run float16 with AMP benchmark
     results_fp16 = run_benchmark(torch.float32, use_amp=True)
+
+    print("\n" + "=" * 100)
+
+    # Run P/Q basis computation benchmark
+    basis_results_fp32 = run_basis_benchmark(torch.float32)
+
+    print("\n" + "=" * 100)
+
+    # Run graph pooling benchmark
+    pooling_results_fp32 = run_pooling_benchmark(torch.float32)
 
     print("\n" + "=" * 100)
 

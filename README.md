@@ -168,16 +168,39 @@ y = ln(x)  # (batch, 8, 9)
 
 ## Benchmark Results
 
-Comparison with SE3-Transformer on NVIDIA H100 (80GB):
+Comparison with SE3-Transformer on NVIDIA H100 (80GB). Forward + backward pass with 32 input/output channels.
+
+### FP32
 
 | Config | SE3-Transformer | Flash-eq | Memory Savings | Speedup |
 |--------|-----------------|----------|----------------|---------|
-| L=4, E=5k | 10.6ms / 4.7GB | 6.7ms / 0.3GB | 14.8x | 1.6x |
-| L=6, E=5k | 35.9ms / 20.7GB | 15.0ms / 0.7GB | 30.5x | 2.4x |
-| L=4, E=20k | 40.2ms / 18.4GB | 21.9ms / 0.8GB | 24.0x | 1.8x |
-| L=6, E=20k | OOM | 53.9ms / 1.7GB | - | - |
-| L=4, E=50k | 136ms / 45.8GB | 52.7ms / 1.7GB | 27.7x | 2.6x |
-| L=6, E=50k | OOM | 130.8ms / 3.7GB | - | - |
+| L=1, E=32k | 5.8ms / 1.7GB | 5.3ms / 0.2GB | 8.1x | 1.1x |
+| L=2, E=32k | 14.9ms / 4.9GB | 11.5ms / 0.4GB | 12.3x | 1.3x |
+| L=4, E=5k | 10.6ms / 4.7GB | 7.1ms / 0.3GB | 13.9x | 1.5x |
+| L=6, E=5k | 35.8ms / 20.7GB | 14.7ms / 0.7GB | 28.1x | 2.4x |
+| L=4, E=20k | 40.1ms / 18.4GB | 21.5ms / 0.8GB | 24.0x | 1.9x |
+| L=6, E=20k | OOM | 50.6ms / 1.7GB | - | - |
+| L=4, E=50k | 135.0ms / 45.8GB | 50.1ms / 1.7GB | 27.7x | 2.7x |
+| L=6, E=50k | OOM | 123.5ms / 3.7GB | - | - |
+| L=4, E=128k | OOM | 125.6ms / 3.9GB | - | - |
+| L=6, E=128k | OOM | 309.7ms / 8.9GB | - | - |
+
+### FP16 (AMP)
+
+| Config | SE3-Transformer | Flash-eq | Memory Savings | Speedup |
+|--------|-----------------|----------|----------------|---------|
+| L=1, E=32k | 2.5ms / 1.0GB | 5.4ms / 0.2GB | 5.1x | 0.5x |
+| L=2, E=32k | 7.6ms / 2.7GB | 10.5ms / 0.4GB | 7.2x | 0.7x |
+| L=4, E=5k | 6.1ms / 3.1GB | 6.6ms / 0.3GB | 9.9x | 0.9x |
+| L=6, E=5k | 22.8ms / 16.8GB | 13.6ms / 0.7GB | 24.6x | 1.7x |
+| L=4, E=20k | 22.5ms / 12.0GB | 19.7ms / 0.7GB | 16.0x | 1.1x |
+| L=6, E=20k | 128.7ms / 66.8GB | 46.2ms / 1.7GB | 38.6x | 2.8x |
+| L=4, E=50k | 53.9ms / 29.7GB | 45.3ms / 1.6GB | 18.4x | 1.2x |
+| L=6, E=50k | OOM | 110.9ms / 3.9GB | - | - |
+| L=4, E=128k | 189.7ms / 76.0GB | 112.9ms / 3.8GB | 19.7x | 1.7x |
+| L=6, E=128k | OOM | 279.8ms / 9.3GB | - | - |
+
+Note: Flash-eq is optimized for high angular momentum (L≥4) and large edge counts. At low L with FP16, SE3-Transformer's Tensor Core utilization gives it an advantage. Improving FP16 performance at low L is an active area of development.
 
 ## Theory
 

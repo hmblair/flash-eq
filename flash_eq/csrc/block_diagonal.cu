@@ -26,8 +26,16 @@ constexpr int THREADS = 256;
 
 
 //------------------------------------------------------------------------------
-// Device Helper Functions
+// Device Helper Types
 //------------------------------------------------------------------------------
+
+/**
+ * Complex number stored as real/imaginary pair.
+ * Used for m>0 spherical harmonic components.
+ */
+struct Complex {
+    float re, im;
+};
 
 /**
  * Interpolation state for binned radial weights.
@@ -38,6 +46,58 @@ struct InterpState {
     float t;
     float one_minus_t;
 };
+
+/**
+ * Block parameters for m>0 blocks.
+ * Describes the layout of one (l_in, l_out, m) block in the weight matrix.
+ */
+struct BlockParams {
+    int n_in;      // Number of input l-values contributing to this m
+    int n_out;     // Number of output l-values contributing to this m
+    int in_off;    // Offset into input feature vector
+    int out_off;   // Offset into output feature vector
+    int w_off;     // Offset into weight vector
+};
+
+
+//------------------------------------------------------------------------------
+// Device Helper Functions
+//------------------------------------------------------------------------------
+
+/**
+ * Load a complex number from interleaved storage.
+ * Storage format: [re_0, im_0, re_1, im_1, ...]
+ */
+__device__ __forceinline__ Complex load_complex(const float* ptr, int idx) {
+    return {ptr[2 * idx], ptr[2 * idx + 1]};
+}
+
+/**
+ * Store a complex number to interleaved storage.
+ */
+template <typename scalar_t>
+__device__ __forceinline__ void store_complex(scalar_t* ptr, int idx, Complex c) {
+    ptr[2 * idx] = static_cast<scalar_t>(c.re);
+    ptr[2 * idx + 1] = static_cast<scalar_t>(c.im);
+}
+
+/**
+ * Store a complex number directly to a pointer (no indexing).
+ */
+template <typename scalar_t>
+__device__ __forceinline__ void store_complex_direct(scalar_t* ptr, Complex c) {
+    ptr[0] = static_cast<scalar_t>(c.re);
+    ptr[1] = static_cast<scalar_t>(c.im);
+}
+
+/**
+ * Load block parameters from device memory.
+ * block_data layout: [n_in, n_out, in_off, out_off, w_off] per block.
+ */
+__device__ __forceinline__ BlockParams load_block_params(const int* block_data, int blk) {
+    const int* ptr = block_data + blk * 5;
+    return {ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]};
+}
 
 /**
  * Load interpolation state for an edge.
@@ -73,21 +133,59 @@ __device__ __forceinline__ float lerp_weight(
 }
 
 /**
- * Complex multiply-accumulate for m>0 blocks.
- * Computes: (acc_re, acc_im) += (a + bi) * (f_re + f_im*i)
- *         = (a*f_re + b*f_im, a*f_im - b*f_re)
+ * Compute weight index for 2x2 rotation block.
+ * Weights are stored as [a_00, b_00, a_01, b_01, ...] where each (a,b) pair
+ * defines the 2x2 rotation matrix [[a, b], [-b, a]].
  *
- * Note: The sign pattern comes from the 2x2 rotation matrix structure:
- *       [a  b] [f_re]   [a*f_re + b*f_im]
- *       [-b a] [f_im] = [a*f_im - b*f_re]
+ * @param o Output index within this m-block
+ * @param i Input index within this m-block
+ * @param n_in Number of input indices
+ * @param component 0 for 'a' weight, 1 for 'b' weight
  */
-__device__ __forceinline__ void complex_mul_add(
-    float a, float b,
-    float f_re, float f_im,
-    float& acc_re, float& acc_im
-) {
-    acc_re += a * f_re + b * f_im;
-    acc_im += a * f_im - b * f_re;
+__device__ __forceinline__ int weight_idx_2x2(int o, int i, int n_in, int component) {
+    return (o * n_in + i) * 2 + component;
+}
+
+/**
+ * Complex multiply-accumulate for m>0 blocks (forward pass).
+ * Computes: acc += rotation(a, b) * f
+ *
+ * The 2x2 rotation matrix structure:
+ *   [a  b] [f.re]   [a*f.re + b*f.im]
+ *   [-b a] [f.im] = [a*f.im - b*f.re]
+ */
+__device__ __forceinline__ void complex_mul_add(float a, float b, Complex f, Complex& acc) {
+    acc.re += a * f.re + b * f.im;
+    acc.im += a * f.im - b * f.re;
+}
+
+/**
+ * Transpose rotation multiply-accumulate (backward pass for features).
+ * Computes: acc += rotation(a, b)^T * grad_out
+ *
+ * Transpose of rotation matrix:
+ *   [a  b]^T   [a  -b]
+ *   [-b a]   = [b   a]
+ *
+ * So: grad_f.re += a * go.re - b * go.im
+ *     grad_f.im += b * go.re + a * go.im
+ */
+__device__ __forceinline__ void complex_mul_add_transpose(float a, float b, Complex go, Complex& grad) {
+    grad.re += a * go.re - b * go.im;
+    grad.im += b * go.re + a * go.im;
+}
+
+/**
+ * Compute gradient w.r.t. rotation weights (backward pass for table).
+ * Given: out = rotation(a, b) * f, and grad_out
+ * Returns: (grad_a, grad_b)
+ *
+ * grad_a = f.re * go.re + f.im * go.im  (derivative of both diagonal terms)
+ * grad_b = f.im * go.re - f.re * go.im  (derivative of both off-diagonal terms)
+ */
+__device__ __forceinline__ void compute_weight_gradient(Complex f, Complex go, float& grad_a, float& grad_b) {
+    grad_a = f.re * go.re + f.im * go.im;
+    grad_b = f.im * go.re - f.re * go.im;
 }
 
 /**
@@ -178,7 +276,7 @@ __global__ void forward_mpos_kernel(
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
     scalar_t* __restrict__ output,
-    const int* __restrict__ block_data,  // (num_mpos_blocks, 5): [n_in, n_out, in_off, out_off, w_off]
+    const int* __restrict__ block_data,
     int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim,
     int num_mpos_blocks, int num_bins
 ) {
@@ -188,23 +286,18 @@ __global__ void forward_mpos_kernel(
 
     const int tid = threadIdx.x;
 
-    // Unpack block parameters
-    const int* blk_ptr = block_data + blk * 5;
-    const int n_in = blk_ptr[0];
-    const int n_out = blk_ptr[1];
-    const int in_off = blk_ptr[2];
-    const int out_off = blk_ptr[3];
-    const int w_off = blk_ptr[4];
-    const int in_size = 2 * n_in;
+    // Load block parameters
+    const BlockParams bp = load_block_params(block_data, blk);
+    const int in_size = 2 * bp.n_in;  // Complex pairs
 
     // Load features into shared memory
     extern __shared__ float feat_shared[];
-    const int64_t feat_base = edge * Cin * Din;
+    const int64_t feat_base = edge * Cin * Din + bp.in_off;
 
     for (int i = tid; i < Cin * in_size; i += THREADS) {
         const int ci = i / in_size;
         const int local_idx = i % in_size;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
+        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + local_idx]);
     }
     __syncthreads();
 
@@ -212,38 +305,36 @@ __global__ void forward_mpos_kernel(
     const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
-    // Compute outputs
-    for (int out_idx = tid; out_idx < Cout * n_out; out_idx += THREADS) {
-        const int co = out_idx / n_out;
-        const int o = out_idx % n_out;
+    // Compute outputs: out[o] = sum over channels and inputs of rotation(a,b) * f[i]
+    for (int out_idx = tid; out_idx < Cout * bp.n_out; out_idx += THREADS) {
+        const int co = out_idx / bp.n_out;
+        const int o = out_idx % bp.n_out;
 
-        float acc_re = 0.0f;
-        float acc_im = 0.0f;
-        const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + w_off;
-        const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + w_off;
+        Complex acc = {0.0f, 0.0f};
+        const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + bp.w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + bp.w_off;
 
         for (int ci = 0; ci < Cin; ci++) {
             const float* f_ptr = feat_shared + ci * in_size;
             const int w_ci_off = ci * Wdim;
 
             #pragma unroll 4
-            for (int i = 0; i < n_in; i++) {
-                const float f_re = f_ptr[2 * i];
-                const float f_im = f_ptr[2 * i + 1];
-                const int w_idx = w_ci_off + (o * n_in + i) * 2;
+            for (int i = 0; i < bp.n_in; i++) {
+                const Complex f = load_complex(f_ptr, i);
+                const int w_idx = w_ci_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
                 const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                             interp.t, interp.one_minus_t);
                 const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
                                             interp.t, interp.one_minus_t);
 
-                complex_mul_add(a, b, f_re, f_im, acc_re, acc_im);
+                complex_mul_add(a, b, f, acc);
             }
         }
 
-        const int64_t out_base = edge * Cout * Dout + co * Dout + out_off;
-        output[out_base + 2 * o] = static_cast<scalar_t>(acc_re);
-        output[out_base + 2 * o + 1] = static_cast<scalar_t>(acc_im);
+        // Store output: output[edge, co, out_off + 2*o : out_off + 2*o + 2]
+        scalar_t* out_ptr = &output[edge * Cout * Dout + co * Dout + bp.out_off];
+        store_complex(out_ptr, o, acc);
     }
 }
 
@@ -314,13 +405,7 @@ __global__ void backward_features_m0_kernel(
 
 /**
  * Backward kernel for m>0: compute grad_features.
- *
- * The gradient w.r.t. input features uses the transpose of the 2x2 rotation:
- *   [a  -b]^T   [a   b]
- *   [b   a]   = [-b  a]
- *
- * So: grad_f_re = a * go_re - b * go_im
- *     grad_f_im = b * go_re + a * go_im
+ * Computes: grad_f = W^T @ grad_out (transpose of rotation).
  */
 template <typename scalar_t>
 __global__ void backward_features_mpos_kernel(
@@ -339,24 +424,18 @@ __global__ void backward_features_mpos_kernel(
 
     const int tid = threadIdx.x;
 
-    // Unpack block parameters
-    const int* blk_ptr = block_data + blk * 5;
-    const int n_in = blk_ptr[0];
-    const int n_out = blk_ptr[1];
-    const int in_off = blk_ptr[2];
-    const int out_off = blk_ptr[3];
-    const int w_off = blk_ptr[4];
-    const int out_size = 2 * n_out;
-    const int in_size = 2 * n_in;
+    // Load block parameters
+    const BlockParams bp = load_block_params(block_data, blk);
+    const int out_size = 2 * bp.n_out;
 
     // Load grad_output into shared memory
     extern __shared__ float grad_shared[];
-    const int64_t grad_base = edge * Cout * Dout;
+    const int64_t grad_base = edge * Cout * Dout + bp.out_off;
 
     for (int i = tid; i < Cout * out_size; i += THREADS) {
         const int co = i / out_size;
         const int local_idx = i % out_size;
-        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
+        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + local_idx]);
     }
     __syncthreads();
 
@@ -364,42 +443,36 @@ __global__ void backward_features_mpos_kernel(
     const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
-    // Compute grad_features
-    for (int in_idx = tid; in_idx < Cin * in_size; in_idx += THREADS) {
-        const int ci = in_idx / in_size;
-        const int i_local = in_idx % in_size;
-        const bool is_real = (i_local % 2 == 0);
-        const int i_idx = i_local / 2;
+    // Compute grad_features for each complex input
+    for (int in_idx = tid; in_idx < Cin * bp.n_in; in_idx += THREADS) {
+        const int ci = in_idx / bp.n_in;
+        const int i = in_idx % bp.n_in;
 
-        float grad = 0.0f;
-        const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + w_off;
-        const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + w_off;
+        Complex grad_f = {0.0f, 0.0f};
+        const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + bp.w_off;
+        const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + bp.w_off;
 
         for (int co = 0; co < Cout; co++) {
             const float* go_ptr = grad_shared + co * out_size;
             const int w_co_off = co * Cin * Wdim;
 
             #pragma unroll 4
-            for (int o = 0; o < n_out; o++) {
-                const float go_re = go_ptr[2 * o];
-                const float go_im = go_ptr[2 * o + 1];
-                const int w_idx = w_co_off + (o * n_in + i_idx) * 2;
+            for (int o = 0; o < bp.n_out; o++) {
+                const Complex go = load_complex(go_ptr, o);
+                const int w_idx = w_co_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
                 const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                             interp.t, interp.one_minus_t);
                 const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
                                             interp.t, interp.one_minus_t);
 
-                // Transpose of 2x2 rotation applied to gradient
-                if (is_real) {
-                    grad += a * go_re - b * go_im;
-                } else {
-                    grad += b * go_re + a * go_im;
-                }
+                complex_mul_add_transpose(a, b, go, grad_f);
             }
         }
 
-        grad_features[edge * Cin * Din + ci * Din + in_off + i_local] = static_cast<scalar_t>(grad);
+        // Store both real and imaginary gradients
+        scalar_t* gf_ptr = &grad_features[edge * Cin * Din + ci * Din + bp.in_off];
+        store_complex(gf_ptr, i, grad_f);
     }
 }
 
@@ -491,10 +564,7 @@ __global__ void backward_table_m0_kernel(
 
 /**
  * Backward kernel for m>0: compute grad_radial_table and grad_interp_weight.
- *
- * Weight gradient computation for 2x2 rotation [a, b; -b, a]:
- *   grad_a = f_re * go_re + f_im * go_im  (from both diagonal elements)
- *   grad_b = f_im * go_re - f_re * go_im  (from both off-diagonal elements)
+ * Each thread computes gradient for one weight element (either 'a' or 'b').
  */
 template <typename scalar_t>
 __global__ void backward_table_mpos_kernel(
@@ -515,16 +585,12 @@ __global__ void backward_table_mpos_kernel(
 
     const int tid = threadIdx.x;
 
-    // Unpack block parameters
-    const int* blk_ptr = block_data + blk * 5;
-    const int n_in = blk_ptr[0];
-    const int n_out = blk_ptr[1];
-    const int in_off = blk_ptr[2];
-    const int out_off = blk_ptr[3];
-    const int w_off = blk_ptr[4];
-    const int in_size = 2 * n_in;
-    const int out_size = 2 * n_out;
-    const int w_block_size = 2 * n_out * n_in;
+    // Load block parameters
+    const BlockParams bp = load_block_params(block_data, blk);
+    const int in_size = 2 * bp.n_in;
+    const int out_size = 2 * bp.n_out;
+    const int weights_per_pair = 2;  // 'a' and 'b' for each (o, i) pair
+    const int num_weights = weights_per_pair * bp.n_out * bp.n_in;
     const int table_stride = Cout * Cin * Wdim;
 
     // Shared memory: features + grad_output
@@ -533,19 +599,19 @@ __global__ void backward_table_mpos_kernel(
     float* grad_shared = shared + Cin * in_size;
 
     // Load features
-    const int64_t feat_base = edge * Cin * Din;
-    for (int i = tid; i < Cin * in_size; i += THREADS) {
-        const int ci = i / in_size;
-        const int local_idx = i % in_size;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * Din + in_off + local_idx]);
+    const int64_t feat_base = edge * Cin * Din + bp.in_off;
+    for (int idx = tid; idx < Cin * in_size; idx += THREADS) {
+        const int ci = idx / in_size;
+        const int local_idx = idx % in_size;
+        feat_shared[idx] = static_cast<float>(features[feat_base + ci * Din + local_idx]);
     }
 
     // Load grad_output
-    const int64_t grad_base = edge * Cout * Dout;
-    for (int i = tid; i < Cout * out_size; i += THREADS) {
-        const int co = i / out_size;
-        const int local_idx = i % out_size;
-        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * Dout + out_off + local_idx]);
+    const int64_t grad_base = edge * Cout * Dout + bp.out_off;
+    for (int idx = tid; idx < Cout * out_size; idx += THREADS) {
+        const int co = idx / out_size;
+        const int local_idx = idx % out_size;
+        grad_shared[idx] = static_cast<float>(grad_output[grad_base + co * Dout + local_idx]);
     }
     __syncthreads();
 
@@ -554,36 +620,36 @@ __global__ void backward_table_mpos_kernel(
 
     float local_grad_t = 0.0f;
 
-    // Compute weight gradients
-    for (int w_idx = tid; w_idx < Cout * Cin * w_block_size; w_idx += THREADS) {
-        const int co = w_idx / (Cin * w_block_size);
-        const int ci = (w_idx / w_block_size) % Cin;
-        const int w_local = w_idx % w_block_size;
+    // Iterate over all weight elements: (co, ci, o, i, component)
+    // Each weight pair (a, b) corresponds to one (output, input) connection
+    for (int w_idx = tid; w_idx < Cout * Cin * num_weights; w_idx += THREADS) {
+        // Decode flat index into (co, ci, o, i, is_b)
+        const int co = w_idx / (Cin * num_weights);
+        const int ci = (w_idx / num_weights) % Cin;
+        const int w_local = w_idx % num_weights;
+        const int pair_idx = w_local / 2;
+        const int is_b = w_local % 2;  // 0 = 'a' (diagonal), 1 = 'b' (off-diagonal)
+        const int o = pair_idx / bp.n_in;
+        const int i = pair_idx % bp.n_in;
 
-        const int temp = w_local / 2;
-        const int is_b = w_local % 2;  // 0 = 'a' weight, 1 = 'b' weight
-        const int o = temp / n_in;
-        const int i = temp % n_in;
+        // Load feature and gradient
+        const Complex f = load_complex(feat_shared + ci * in_size, i);
+        const Complex go = load_complex(grad_shared + co * out_size, o);
 
-        const float* f_ptr = feat_shared + ci * in_size;
-        const float* go_ptr = grad_shared + co * out_size;
+        // Compute gradient for this weight component
+        float grad_a, grad_b;
+        compute_weight_gradient(f, go, grad_a, grad_b);
+        const float grad_w = (is_b == 0) ? grad_a : grad_b;
 
-        const float f_re = f_ptr[2 * i];
-        const float f_im = f_ptr[2 * i + 1];
-        const float go_re = go_ptr[2 * o];
-        const float go_im = go_ptr[2 * o + 1];
-
-        // Gradient w.r.t. 'a' or 'b' weight
-        const float grad_w = (is_b == 0) ? (f_re * go_re + f_im * go_im)
-                                         : (f_im * go_re - f_re * go_im);
-
-        const int table_idx = co * Cin * Wdim + ci * Wdim + w_off + w_local;
+        // Accumulate to table gradient with interpolation
+        const int table_idx = co * Cin * Wdim + ci * Wdim + bp.w_off + w_local;
         const int addr_lo = interp.idx_lo * table_stride + table_idx;
         const int addr_hi = interp.idx_hi * table_stride + table_idx;
 
         atomicAdd(&grad_radial_table[addr_lo], interp.one_minus_t * grad_w);
         atomicAdd(&grad_radial_table[addr_hi], interp.t * grad_w);
 
+        // Gradient w.r.t. interpolation weight
         const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
         const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
         local_grad_t += (w_hi - w_lo) * grad_w;

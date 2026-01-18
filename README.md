@@ -104,6 +104,68 @@ output = layer(P, Q, node_features, distances, src_indices)
 **Returns:**
 - `output`: `(num_edges, channels_out, dim_out)` edge features
 
+### Equivariant Layers
+
+Basic building blocks for SO(3)-equivariant networks that operate on spherical tensors.
+
+#### RepNorm
+
+Computes rotation-invariant norms for each irrep component.
+
+```python
+from flash_eq import RepNorm, Repr
+
+repr = Repr(lvals=[0, 1, 2], mult=8)
+norm = RepNorm(repr)
+
+x = torch.randn(batch, 8, 9)  # (batch, mult, dim)
+norms = norm(x)               # (batch, 8, 3) - one norm per irrep
+```
+
+#### EquivariantLinear
+
+Linear layer that changes multiplicity while preserving angular momentum structure.
+
+```python
+from flash_eq import EquivariantLinear, Repr
+
+in_repr = Repr(lvals=[0, 1, 2], mult=8)
+out_repr = Repr(lvals=[0, 1, 2], mult=16)  # Must have same lvals
+
+layer = EquivariantLinear(in_repr, out_repr, bias=True)
+
+x = torch.randn(batch, 8, 9)
+y = layer(x)  # (batch, 16, 9)
+```
+
+#### EquivariantGating
+
+Norm-based gating nonlinearity that preserves equivariance.
+
+```python
+from flash_eq import EquivariantGating, Repr
+
+repr = Repr(lvals=[0, 1, 2], mult=8)
+gate = EquivariantGating(repr)
+
+x = torch.randn(batch, 8, 9)
+y = gate(x)  # (batch, 8, 9)
+```
+
+#### EquivariantLayerNorm
+
+Layer normalization that preserves SO(3) equivariance.
+
+```python
+from flash_eq import EquivariantLayerNorm, Repr
+
+repr = Repr(lvals=[0, 1, 2], mult=8)
+ln = EquivariantLayerNorm(repr)
+
+x = torch.randn(batch, 8, 9)
+y = ln(x)  # (batch, 8, 9)
+```
+
 ## Benchmark Results
 
 Comparison with SE3-Transformer on NVIDIA H100 (80GB):

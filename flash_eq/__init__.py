@@ -21,6 +21,7 @@ from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .layer import EquivariantEdgewiseLinear
 from .basis import WignerDBasis
 from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
+from .layers import RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm
 
 __all__ = [
     # Representations
@@ -31,6 +32,10 @@ __all__ = [
     "WignerD",
     # Layers
     "EquivariantEdgewiseLinear",
+    "RepNorm",
+    "EquivariantLinear",
+    "EquivariantGating",
+    "EquivariantLayerNorm",
     # Basis
     "WignerDBasis",
     # Radial weights

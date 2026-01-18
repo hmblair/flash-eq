@@ -250,6 +250,45 @@ class Repr:
         """
         return torch.cat([irrep.mvals() for irrep in self.irreps])
 
+    def indices(self) -> List[int]:
+        """Return irrep index for each dimension.
+
+        Maps each dimension of the representation to its corresponding
+        irrep index. Useful for scatter/gather operations.
+
+        Example:
+            >>> Repr(lvals=[0, 1, 2]).indices()
+            [0, 1, 1, 1, 2, 2, 2, 2, 2]
+        """
+        result = []
+        for i, irrep in enumerate(self.irreps):
+            result.extend([i] * irrep.dim())
+        return result
+
+    def find_scalar(self) -> tuple[int, List[int]]:
+        """Find l=0 (scalar) components in the representation.
+
+        Returns:
+            Tuple of (count, locations) where count is the number of
+            scalar components and locations is the list of dimension
+            indices where scalars appear.
+
+        Example:
+            >>> Repr(lvals=[0, 1, 2]).find_scalar()
+            (1, [0])
+            >>> Repr(lvals=[1, 2]).find_scalar()
+            (0, [])
+        """
+        count = 0
+        locations = []
+        offset = 0
+        for irrep in self.irreps:
+            if irrep.l == 0:
+                locations.append(offset)
+                count += 1
+            offset += irrep.dim()
+        return count, locations
+
     def __str__(self) -> str:
         degrees = ', '.join(str(rep.l) for rep in self.irreps)
         return f"Repr(lvals=[{degrees}])"

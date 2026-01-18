@@ -39,7 +39,7 @@ def clear_memory():
     torch.cuda.reset_peak_memory_stats()
 
 
-def benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, n_warmup=3, n_iter=10):
+def benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, use_amp=False, n_warmup=3, n_iter=10):
     """
     Benchmark SE3-Transformer style: two dense matmuls with per-edge weights.
 
@@ -61,6 +61,7 @@ def benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, n_warmup=3, n_i
     # Radial MLP outputs per-edge weights
     mlp = RadialMLP(cout * cin * freq_sum).to(device).to(dtype)
     optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     # Edge-level features
     features = torch.randn(num_edges, cin, in_dim, device=device, dtype=dtype, requires_grad=True)
@@ -74,16 +75,19 @@ def benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, n_warmup=3, n_i
     def train_step():
         optimizer.zero_grad()
 
-        # Per-edge radial weights from MLP
-        radial_weights = mlp(distances).view(num_edges, cout, cin * freq_sum)
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            # Per-edge radial weights from MLP
+            radial_weights = mlp(distances).view(num_edges, cout, cin * freq_sum)
 
-        # Two matmuls (SE3-Transformer style)
-        tmp = (features @ basis).view(num_edges, cin * freq_sum, out_dim)
-        output = radial_weights @ tmp
+            # Two matmuls (SE3-Transformer style)
+            tmp = (features @ basis).view(num_edges, cin * freq_sum, out_dim)
+            output = radial_weights @ tmp
 
-        loss = ((output - target) ** 2).mean()
-        loss.backward()
-        optimizer.step()
+            loss = ((output - target) ** 2).mean()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         return loss.item()
 
     # Warmup
@@ -110,7 +114,7 @@ def benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, n_warmup=3, n_i
     }
 
 
-def benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, n_warmup=3, n_iter=10):
+def benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, use_amp=False, n_warmup=3, n_iter=10):
     """
     Benchmark Flash-eq using the public API: EquivariantEdgewiseLinear + WignerDBasis.
     """
@@ -135,6 +139,7 @@ def benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, n
     basis = WignerDBasis(in_repr, out_repr).to(device)
 
     optimizer = torch.optim.Adam(layer.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     # Node features
     node_features = torch.randn(num_nodes, cin, dim, device=device, dtype=dtype, requires_grad=True)
@@ -153,12 +158,15 @@ def benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, n
     def train_step():
         optimizer.zero_grad()
 
-        # Forward pass using public API
-        output = layer(P, Q, node_features, distances, src_indices)
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            # Forward pass using public API
+            output = layer(P, Q, node_features, distances, src_indices)
 
-        loss = ((output - target) ** 2).mean()
-        loss.backward()
-        optimizer.step()
+            loss = ((output - target) ** 2).mean()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         return loss.item()
 
     # Warmup
@@ -185,15 +193,13 @@ def benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, n
     }
 
 
-def main():
-    print("=" * 100)
-    print("Benchmark: SE3-Transformer (dense matmuls) vs Flash-eq (public API)")
-    print("=" * 100)
-    print(f"\nDevice: {torch.cuda.get_device_name()}")
-    print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+def run_benchmark(dtype, use_amp, num_bins=100):
+    """Run benchmark suite for a given precision setting."""
+    precision_name = "float16 (AMP)" if use_amp else ("float16" if dtype == torch.float16 else "float32")
 
-    dtype = torch.float32
-    num_bins = 100
+    print(f"\n{'='*100}")
+    print(f"Precision: {precision_name}")
+    print("=" * 100)
 
     # Configs: (lmax, num_nodes, num_edges, cin, cout)
     configs = [
@@ -211,7 +217,6 @@ def main():
         (6, 5000, 128000, 32, 32),
     ]
 
-    print(f"\nSettings: num_bins={num_bins}, dtype=float32")
     print(f"\n{'Config':<40} {'SE3-Transformer':>25} {'Flash-eq':>25}")
     print("-" * 100)
 
@@ -222,7 +227,7 @@ def main():
 
         # SE3-Transformer approach
         try:
-            r_se3 = benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype)
+            r_se3 = benchmark_se3_transformer(lmax, num_edges, cin, cout, dtype, use_amp)
             se3_str = f"{r_se3['time_ms']:.1f}ms / {r_se3['peak_mem_mb']:.0f}MB"
         except torch.cuda.OutOfMemoryError:
             r_se3 = None
@@ -231,7 +236,7 @@ def main():
 
         # Flash-eq approach
         try:
-            r_flash = benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype)
+            r_flash = benchmark_flash_eq(lmax, num_nodes, num_edges, cin, cout, num_bins, dtype, use_amp)
             flash_str = f"{r_flash['time_ms']:.1f}ms / {r_flash['peak_mem_mb']:.0f}MB"
         except torch.cuda.OutOfMemoryError:
             r_flash = None
@@ -242,11 +247,9 @@ def main():
         results.append((config_str, r_se3, r_flash))
 
     # Summary table with ratios
-    print(f"\n{'='*100}")
-    print("Summary: Flash-eq vs SE3-Transformer")
-    print("=" * 100)
-    print(f"\n{'Config':<40} {'Memory Savings':>15} {'Speedup':>15}")
-    print("-" * 100)
+    print(f"\nSummary ({precision_name}):")
+    print(f"{'Config':<40} {'Memory Savings':>15} {'Speedup':>15}")
+    print("-" * 70)
 
     for config_str, r_se3, r_flash in results:
         if r_se3 and r_flash:
@@ -260,6 +263,22 @@ def main():
             speedup = "N/A"
 
         print(f"{config_str:<40} {mem_savings:>15} {speedup:>15}")
+
+    return results
+
+
+def main():
+    print("=" * 100)
+    print("Benchmark: SE3-Transformer (dense matmuls) vs Flash-eq (public API)")
+    print("=" * 100)
+    print(f"\nDevice: {torch.cuda.get_device_name()}")
+    print(f"Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+    # Run float32 benchmark
+    results_fp32 = run_benchmark(torch.float32, use_amp=False)
+
+    # Run float16 with AMP benchmark
+    results_fp16 = run_benchmark(torch.float32, use_amp=True)
 
     print("\n" + "=" * 100)
 

@@ -23,6 +23,7 @@ Supports FP32, FP64, and FP16.
 import os
 import torch
 from torch.autograd import Function
+from torch.autograd.function import FunctionCtx
 from torch.utils.cpp_extension import load
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,18 +57,38 @@ def _get_cuda_module():
 # =============================================================================
 
 class _BlockDiagonalFunction(Function):
-    """Autograd function wrapping the CUDA kernel."""
+    """Autograd function wrapping the CUDA kernel with bin-sorted edges."""
 
     @staticmethod
-    def forward(ctx, features, radial_table, bin_lo, interp_weight,
-                channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size):
+    def forward(
+        ctx: FunctionCtx,
+        features: torch.Tensor,
+        radial_table: torch.Tensor,
+        bin_lo: torch.Tensor,
+        interp_weight: torch.Tensor,
+        channels_out: int,
+        num_bins: int,
+        lvals_in: torch.Tensor,
+        lvals_out: torch.Tensor,
+        dim_out: int,
+        max_in_size: int,
+        max_out_size: int,
+    ) -> torch.Tensor:
         cuda_module = _get_cuda_module()
 
-        output, = cuda_module.forward(
-            features.contiguous(),
-            radial_table.contiguous(),
-            bin_lo.contiguous().int(),
-            interp_weight.contiguous(),
+        # Sort edges by bin for better memory access patterns
+        sort_idx = torch.argsort(bin_lo)
+        unsort_idx = torch.argsort(sort_idx)
+
+        features_sorted = features[sort_idx]
+        bin_lo_sorted = bin_lo[sort_idx]
+        interp_weight_sorted = interp_weight[sort_idx]
+
+        output_sorted, = cuda_module.forward(
+            features_sorted,
+            radial_table,
+            bin_lo_sorted,
+            interp_weight_sorted,
             lvals_in,
             lvals_out,
             channels_out,
@@ -76,7 +97,11 @@ class _BlockDiagonalFunction(Function):
             max_in_size
         )
 
-        ctx.save_for_backward(features, radial_table, bin_lo, interp_weight, lvals_in, lvals_out)
+        # Unsort output back to original edge order
+        output = output_sorted[unsort_idx]
+
+        ctx.save_for_backward(features_sorted, radial_table, bin_lo_sorted,
+                              interp_weight_sorted, lvals_in, lvals_out, sort_idx, unsort_idx)
         ctx.dim_in = features.size(2)
         ctx.max_in_size = max_in_size
         ctx.max_out_size = max_out_size
@@ -84,22 +109,33 @@ class _BlockDiagonalFunction(Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
-        features, radial_table, bin_lo, interp_weight, lvals_in, lvals_out = ctx.saved_tensors
+    def backward(
+        ctx: FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, ...]:
+        (features_sorted, radial_table, bin_lo_sorted, interp_weight_sorted,
+         lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors
         cuda_module = _get_cuda_module()
 
-        grad_features, grad_radial_table, grad_interp_weight = cuda_module.backward(
-            grad_output.contiguous(),
-            features.contiguous(),
-            radial_table.contiguous(),
-            bin_lo.contiguous().int(),
-            interp_weight.contiguous(),
+        # Sort grad_output to match the sorted forward pass order
+        grad_output_sorted = grad_output[sort_idx]
+
+        grad_features_sorted, grad_radial_table, grad_interp_weight_sorted = cuda_module.backward(
+            grad_output_sorted,
+            features_sorted,
+            radial_table,
+            bin_lo_sorted,
+            interp_weight_sorted,
             lvals_in,
             lvals_out,
             ctx.dim_in,
             ctx.max_in_size,
             ctx.max_out_size
         )
+
+        # Unsort gradients back to original edge order
+        grad_features = grad_features_sorted[unsort_idx]
+        grad_interp_weight = grad_interp_weight_sorted[unsort_idx]
 
         return (grad_features, grad_radial_table, None, grad_interp_weight,
                 None, None, None, None, None, None, None)
@@ -166,6 +202,12 @@ def block_diagonal_cuda(
     num_bins = radial_table.size(0) - 1
     channels_out = radial_table.size(1)
 
+    # Ensure contiguous memory layout for CUDA kernel
+    features = features.contiguous()
+    radial_table = radial_table.contiguous()
+    bin_lo = bin_lo.contiguous()
+    interp_weight = interp_weight.to(features.dtype).contiguous()
+
     # Extract lvals tensors from representations
     lvals_in = product_repr.rep1.lvals.to(device=device, dtype=torch.int32).contiguous()
     lvals_out = product_repr.rep2.lvals.to(device=device, dtype=torch.int32).contiguous()
@@ -176,6 +218,6 @@ def block_diagonal_cuda(
 
     # Run kernel
     return _BlockDiagonalFunction.apply(
-        features, radial_table, bin_lo, interp_weight.to(features.dtype),
+        features, radial_table, bin_lo, interp_weight,
         channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size
     )

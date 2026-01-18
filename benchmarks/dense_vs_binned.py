@@ -203,6 +203,9 @@ def run_benchmark(dtype, use_amp, num_bins=100):
 
     # Configs: (lmax, num_nodes, num_edges, cin, cout)
     configs = [
+        # Low lmax at 32K edges
+        (1, 3000, 32000, 32, 32),
+        (2, 3000, 32000, 32, 32),
         # Small scale
         (4, 1000, 5000, 32, 32),
         (6, 1000, 5000, 32, 32),

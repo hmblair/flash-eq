@@ -304,8 +304,14 @@ def block_diagonal_cuda(
             Output features in m-first diagonal basis.
     """
     device = features.device
+    num_edges = features.size(0)
     num_bins = radial_table.size(0) - 1
     channels_out = radial_table.size(1)
+    dim_out = product_repr.rep2.dim()
+
+    # Handle empty input
+    if num_edges == 0:
+        return torch.zeros(0, channels_out, dim_out, device=device, dtype=features.dtype)
 
     # Ensure contiguous memory layout for CUDA kernel
     features = features.contiguous()
@@ -318,7 +324,6 @@ def block_diagonal_cuda(
     lvals_out = product_repr.rep2.lvals.to(device=device, dtype=torch.int32).contiguous()
 
     # Compute block sizes for shared memory allocation
-    dim_out = product_repr.rep2.dim()
     max_in_size, max_out_size = _compute_block_sizes(lvals_in, lvals_out)
 
     # Run kernel

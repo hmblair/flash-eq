@@ -22,6 +22,7 @@ from .layer import EquivariantEdgewiseLinear
 from .basis import WignerDBasis
 from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
 from .layers import RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm
+from .block_diagonal_cuda import CUDANotAvailableError
 
 __all__ = [
     # Representations
@@ -42,5 +43,7 @@ __all__ = [
     "RadialBasisFunctions",
     "RadialMLP",
     "BinnedModule",
+    # Exceptions
+    "CUDANotAvailableError",
 ]
 __version__ = "0.1.0"

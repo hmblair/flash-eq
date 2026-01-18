@@ -21,34 +21,136 @@ Supports FP32, FP64, and FP16.
 """
 
 import os
+import logging
 import torch
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
-from torch.utils.cpp_extension import load
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .representations import ProductRepr
 
-# Set CUDA_HOME if available
-if os.path.exists("/usr/local/cuda-12.6"):
-    os.environ["CUDA_HOME"] = "/usr/local/cuda-12.6"
+logger = logging.getLogger(__name__)
 
 _cuda_module = None
+_cuda_available = None
+
+
+class CUDANotAvailableError(RuntimeError):
+    """Raised when CUDA is required but not available."""
+    pass
+
+
+def _check_cuda_available() -> None:
+    """Check if CUDA is available and raise a clear error if not."""
+    global _cuda_available
+
+    if _cuda_available is not None:
+        if not _cuda_available:
+            raise CUDANotAvailableError(
+                "flash-eq requires a CUDA-capable GPU. No CUDA device was detected.\n\n"
+                "To use flash-eq, you need:\n"
+                "  1. An NVIDIA GPU with CUDA support\n"
+                "  2. CUDA toolkit installed (set CUDA_HOME environment variable)\n"
+                "  3. PyTorch with CUDA support (torch.cuda.is_available() == True)\n\n"
+                "If you have a GPU but see this error, check:\n"
+                "  - CUDA_HOME is set correctly (current: {cuda_home})\n"
+                "  - nvidia-smi shows your GPU\n"
+                "  - PyTorch was installed with CUDA support".format(
+                    cuda_home=os.environ.get("CUDA_HOME", "not set")
+                )
+            )
+        return
+
+    if not torch.cuda.is_available():
+        _cuda_available = False
+        raise CUDANotAvailableError(
+            "flash-eq requires a CUDA-capable GPU. No CUDA device was detected.\n\n"
+            "To use flash-eq, you need:\n"
+            "  1. An NVIDIA GPU with CUDA support\n"
+            "  2. CUDA toolkit installed (set CUDA_HOME environment variable)\n"
+            "  3. PyTorch with CUDA support (torch.cuda.is_available() == True)\n\n"
+            "If you have a GPU but see this error, check:\n"
+            "  - CUDA_HOME is set correctly (current: {cuda_home})\n"
+            "  - nvidia-smi shows your GPU\n"
+            "  - PyTorch was installed with CUDA support".format(
+                cuda_home=os.environ.get("CUDA_HOME", "not set")
+            )
+        )
+
+    _cuda_available = True
 
 
 def _get_cuda_module():
     """JIT compile and load the CUDA extension."""
     global _cuda_module
-    if _cuda_module is None:
-        csrc_dir = Path(__file__).parent / "csrc"
+
+    _check_cuda_available()
+
+    if _cuda_module is not None:
+        return _cuda_module
+
+    # Import here to avoid issues on CPU-only systems
+    from torch.utils.cpp_extension import load
+
+    # Check CUDA_HOME
+    cuda_home = os.environ.get("CUDA_HOME")
+    if cuda_home is None:
+        # Try common CUDA installation paths
+        common_paths = [
+            "/usr/local/cuda",
+            "/usr/local/cuda-12",
+            "/usr/local/cuda-12.6",
+            "/usr/local/cuda-12.4",
+            "/usr/local/cuda-11",
+        ]
+        for path in common_paths:
+            if os.path.exists(path):
+                cuda_home = path
+                os.environ["CUDA_HOME"] = cuda_home
+                logger.info(f"CUDA_HOME not set, using detected path: {cuda_home}")
+                break
+
+    if cuda_home is None:
+        raise CUDANotAvailableError(
+            "CUDA_HOME environment variable is not set and no CUDA installation "
+            "was found in common locations.\n\n"
+            "Please set CUDA_HOME to your CUDA toolkit installation, e.g.:\n"
+            "  export CUDA_HOME=/usr/local/cuda"
+        )
+
+    csrc_dir = Path(__file__).parent / "csrc"
+    kernel_path = csrc_dir / "block_diagonal.cu"
+
+    if not kernel_path.exists():
+        raise FileNotFoundError(
+            f"CUDA kernel source not found at {kernel_path}. "
+            "This may indicate a corrupted installation."
+        )
+
+    logger.info(f"JIT compiling CUDA kernel from {kernel_path}")
+
+    try:
         _cuda_module = load(
             name="block_diagonal_cuda",
-            sources=[str(csrc_dir / "block_diagonal.cu")],
-            verbose=False,
+            sources=[str(kernel_path)],
+            verbose=True,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
+        logger.info("CUDA kernel compiled successfully")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to compile CUDA kernel.\n\n"
+            f"CUDA_HOME: {cuda_home}\n"
+            f"Kernel source: {kernel_path}\n\n"
+            f"Compilation error:\n{e}\n\n"
+            "Common fixes:\n"
+            "  - Ensure CUDA toolkit version matches PyTorch CUDA version\n"
+            "  - Check that nvcc is in your PATH\n"
+            "  - Verify you have write permissions to the torch extensions cache"
+        ) from e
+
     return _cuda_module
 
 

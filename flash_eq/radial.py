@@ -13,6 +13,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .utils import get_epsilon
+
 
 def _init_weights(module: nn.Module) -> None:
     """Initialize weights using Xavier uniform for linear layers."""
@@ -65,7 +67,8 @@ class RadialBasisFunctions(nn.Module):
         if x.dim() > 1 and x.size(-1) == 1:
             x = x.squeeze(-1)
 
-        diff = (x[..., None] - self.mu) / self.sigma.abs().clamp(min=1e-6)
+        eps = get_epsilon(self.sigma.dtype)
+        diff = (x[..., None] - self.mu) / self.sigma.abs().clamp(min=eps)
         return torch.exp(-diff ** 2)
 
 

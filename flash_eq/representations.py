@@ -23,10 +23,12 @@ Classes:
 """
 from __future__ import annotations
 
-from typing import Generator, Any, Sequence
+from typing import Generator, Any, List, Sequence
 
 import torch
 import torch.nn as nn
+
+from .utils import get_epsilon
 
 
 class Irrep:
@@ -114,8 +116,10 @@ class Irrep:
         return torch.stack([Lz, Lx, Ly], dim=0)
 
     def toreal(self) -> torch.Tensor:
-        """
-        Get the conversion matrix from complex to real spherical harmonics.
+        """Get the conversion matrix from complex to real spherical harmonics.
+
+        Returns:
+            Unitary matrix Q of shape (2l+1, 2l+1) such that Y_real = Q @ Y_complex.
         """
         SQRT2 = 2 ** -0.5
 
@@ -382,8 +386,10 @@ class WignerD(nn.Module):
         Returns:
             D: (..., dim, dim) Wigner D-matrix
         """
+        eps = get_epsilon(directions.dtype)
+
         # Normalize direction
-        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + 1e-8)
+        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + eps)
 
         # Rotation axis is perpendicular to both e_z and d
         # axis = e_z × d = (-d_y, d_x, 0)
@@ -395,10 +401,10 @@ class WignerD(nn.Module):
 
         # Normalize axis (handle d ≈ ±e_z case)
         axis_norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
-        axis = axis / (axis_norm + 1e-8)
+        axis = axis / (axis_norm + eps)
 
         # Angle is arccos(e_z · d) = arccos(d_z)
-        angle = torch.arccos(d[..., 2].clamp(-1 + 1e-7, 1 - 1e-7))
+        angle = torch.arccos(d[..., 2].clamp(-1 + eps, 1 - eps))
 
         return self.rot(axis, angle, cartesian).mT
 

@@ -32,8 +32,7 @@ from .radial import RadialMLP, BinnedModule
 
 
 class EquivariantEdgewiseLinear(nn.Module):
-    """
-    SO(3)-equivariant linear layer with distance-dependent weights.
+    """SO(3)-equivariant linear layer with distance-dependent weights.
 
     Computes: out = Q @ Λ(r) @ P^T @ f
 
@@ -113,8 +112,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         distances: torch.Tensor,
         src_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Apply SO(3)-equivariant linear transformation.
+        """Apply SO(3)-equivariant linear transformation.
 
         Computes: out = Q @ Λ(r) @ P^T @ node_features[src_indices]
 

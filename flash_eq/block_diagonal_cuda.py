@@ -250,8 +250,12 @@ class _BlockDiagonalFunction(Function):
 def _compute_block_sizes(lvals_in: torch.Tensor, lvals_out: torch.Tensor) -> tuple[int, int]:
     """Compute max block sizes for shared memory allocation.
 
+    Args:
+        lvals_in: Angular momentum values for input representation.
+        lvals_out: Angular momentum values for output representation.
+
     Returns:
-        (max_in_size, max_out_size): Maximum block sizes across all m values.
+        Tuple of (max_in_size, max_out_size) for shared memory allocation.
     """
     m_max = max(int(lvals_in.max()), int(lvals_out.max()))
     max_in_size, max_out_size = 0, 0
@@ -275,8 +279,7 @@ def block_diagonal_cuda(
     interp_weight: torch.Tensor,
     product_repr: "ProductRepr",
 ) -> torch.Tensor:
-    """
-    Apply block-diagonal multiplication with binned radial weights.
+    """Apply block-diagonal multiplication with binned radial weights.
 
     This is the core computational kernel for SO(3)-equivariant layers.
     It computes: out[e] = Λ(r[e]) @ f[e] for each edge e, where Λ(r) is

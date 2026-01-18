@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from .representations import Repr
+from .utils import get_epsilon
 
 
 def _init_weights(module: nn.Module) -> None:
@@ -254,12 +255,10 @@ class EquivariantLayerNorm(nn.Module):
         >>> y = ln(x)
     """
 
-    EPSILON = 1e-8
-
     def __init__(
         self,
         repr: Repr,
-        epsilon: float = EPSILON,
+        epsilon: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -267,7 +266,7 @@ class EquivariantLayerNorm(nn.Module):
         self.norm = RepNorm(repr)
         # LayerNorm(1) is degenerate, so skip it for mult=1
         self.lnorm = nn.LayerNorm(repr.mult) if repr.mult > 1 else None
-        self.epsilon = epsilon
+        self._epsilon = epsilon  # None means dtype-aware default
 
         self.register_buffer('ix', torch.tensor(repr.indices(), dtype=torch.long))
 
@@ -280,12 +279,14 @@ class EquivariantLayerNorm(nn.Module):
         Returns:
             Normalized tensor of shape (..., mult, dim).
         """
+        epsilon = self._epsilon if self._epsilon is not None else get_epsilon(f.dtype)
+
         # Compute norms: shape (..., mult, nreps)
         norms = self.norm(f)
 
         # For mult=1, just normalize by the norm
         if self.lnorm is None:
-            norms_r = 1.0 / (norms + self.epsilon)
+            norms_r = 1.0 / (norms + epsilon)
             return f * norms_r[..., self.ix]
 
         # LayerNorm over mult dimension
@@ -294,5 +295,5 @@ class EquivariantLayerNorm(nn.Module):
         lnorms = lnorms_t.transpose(-2, -1)  # (..., mult, nreps)
 
         # Renormalize features
-        norms_r = lnorms / (norms + self.epsilon)
+        norms_r = lnorms / (norms + epsilon)
         return f * norms_r[..., self.ix]

@@ -23,7 +23,7 @@ Classes:
 """
 from __future__ import annotations
 
-from typing import Generator, Any, List
+from typing import Generator, Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -182,7 +182,7 @@ class Repr:
     computing rotation matrices.
 
     Args:
-        lvals: List of degrees to include. Defaults to [1] (vectors only).
+        lvals: Sequence of degrees to include.
         mult: Multiplicity for all irreps.
 
     Example:
@@ -191,19 +191,16 @@ class Repr:
         9
     """
 
-    def __init__(self, lvals: List[int] = None, mult: int = 1) -> None:
-        if lvals is None:
-            lvals = [1]
-
-        if not isinstance(lvals, (list, tuple)):
-            raise TypeError(f"lvals must be a list or tuple, got {type(lvals).__name__}")
+    def __init__(self, lvals: Sequence[int], mult: int = 1) -> None:
+        if not hasattr(lvals, '__len__'):
+            raise TypeError(f"lvals must be a sequence, got {type(lvals).__name__}")
         if len(lvals) == 0:
             raise ValueError("lvals must contain at least one degree")
         if not isinstance(mult, int) or mult < 1:
             raise ValueError(f"Multiplicity must be a positive integer, got {mult}")
 
         self.irreps = [Irrep(l, mult) for l in lvals]
-        self.lvals = torch.tensor([irrep.l for irrep in self.irreps])
+        self.lvals = torch.tensor([irrep.l for irrep in self.irreps], dtype=torch.long)
         self.mult = mult
 
         self._cumdims = torch.tensor([
@@ -446,58 +443,6 @@ class ProductRepr:
     def nreps(self) -> int:
         """Return total number of irreps in the tensor product."""
         return sum(rep.nreps() for rep in self.reps)
-
-    def block_metadata(self, device: torch.device) -> tuple:
-        """Build metadata tensors for CUDA kernel.
-
-        Computes block structure from input/output lvals. For each m from 0 to
-        lmax, we have a block of size:
-        - m=0: n_in × n_out (real scalars)
-        - m>0: 2*n_in × 2*n_out (interleaved +m/-m pairs)
-
-        where n_in/n_out = number of l-values with l >= m.
-
-        Args:
-            device: Target device for metadata tensors.
-
-        Returns:
-            Tuple of (block_data, dim_out, max_in_size, max_out_size) where:
-            - block_data: (num_blocks, 6) int32 tensor with columns
-              [m, n_in, n_out, in_off, out_off, w_off]
-            - dim_out: Total output dimension
-            - max_in_size: Maximum input block size (for shared memory)
-            - max_out_size: Maximum output block size (for shared memory)
-        """
-        m_max = max(self.rep1.lmax(), self.rep2.lmax())
-        lvals_in = self.rep1.lvals
-        lvals_out = self.rep2.lvals
-
-        # Build blocks, tracking offsets as we go
-        blocks = []
-        in_off, out_off, w_off = 0, 0, 0
-        max_in_size, max_out_size = 0, 0
-
-        for m in range(m_max + 1):
-            n_in = int((lvals_in >= m).sum())
-            n_out = int((lvals_out >= m).sum())
-
-            if n_in > 0 and n_out > 0:
-                m_mult = 1 if m == 0 else 2
-                in_size = m_mult * n_in
-                out_size = m_mult * n_out
-
-                blocks.append([m, n_in, n_out, in_off, out_off, w_off])
-
-                max_in_size = max(max_in_size, in_size)
-                max_out_size = max(max_out_size, out_size)
-
-                in_off += in_size
-                out_off += out_size
-                w_off += m_mult * n_out * n_in
-
-        block_data = torch.tensor(blocks, dtype=torch.int32, device=device)
-
-        return (block_data, self.rep2.dim(), max_in_size, max_out_size)
 
     def __str__(self) -> str:
         return f"ProductRepr({self.rep1} x {self.rep2})"

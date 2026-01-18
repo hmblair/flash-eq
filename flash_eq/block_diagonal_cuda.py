@@ -60,7 +60,7 @@ class _BlockDiagonalFunction(Function):
 
     @staticmethod
     def forward(ctx, features, radial_table, bin_lo, interp_weight,
-                channels_out, num_bins, block_data, dim_out, max_in_size, max_out_size):
+                channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size):
         cuda_module = _get_cuda_module()
 
         output, = cuda_module.forward(
@@ -68,14 +68,15 @@ class _BlockDiagonalFunction(Function):
             radial_table.contiguous(),
             bin_lo.contiguous().int(),
             interp_weight.contiguous(),
-            block_data,
+            lvals_in,
+            lvals_out,
             channels_out,
             dim_out,
             num_bins,
             max_in_size
         )
 
-        ctx.save_for_backward(features, radial_table, bin_lo, interp_weight, block_data)
+        ctx.save_for_backward(features, radial_table, bin_lo, interp_weight, lvals_in, lvals_out)
         ctx.dim_in = features.size(2)
         ctx.max_in_size = max_in_size
         ctx.max_out_size = max_out_size
@@ -84,7 +85,7 @@ class _BlockDiagonalFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        features, radial_table, bin_lo, interp_weight, block_data = ctx.saved_tensors
+        features, radial_table, bin_lo, interp_weight, lvals_in, lvals_out = ctx.saved_tensors
         cuda_module = _get_cuda_module()
 
         grad_features, grad_radial_table, grad_interp_weight = cuda_module.backward(
@@ -93,19 +94,41 @@ class _BlockDiagonalFunction(Function):
             radial_table.contiguous(),
             bin_lo.contiguous().int(),
             interp_weight.contiguous(),
-            block_data.contiguous(),
+            lvals_in,
+            lvals_out,
             ctx.dim_in,
             ctx.max_in_size,
             ctx.max_out_size
         )
 
         return (grad_features, grad_radial_table, None, grad_interp_weight,
-                None, None, None, None, None, None)
+                None, None, None, None, None, None, None)
 
 
 # =============================================================================
 # Main Public API
 # =============================================================================
+
+def _compute_block_sizes(lvals_in: torch.Tensor, lvals_out: torch.Tensor) -> tuple[int, int]:
+    """Compute max block sizes for shared memory allocation.
+
+    Returns:
+        (max_in_size, max_out_size): Maximum block sizes across all m values.
+    """
+    m_max = max(int(lvals_in.max()), int(lvals_out.max()))
+    max_in_size, max_out_size = 0, 0
+
+    for m in range(m_max + 1):
+        n_in = int((lvals_in >= m).sum())
+        n_out = int((lvals_out >= m).sum())
+
+        if n_in > 0 and n_out > 0:
+            m_mult = 1 if m == 0 else 2
+            max_in_size = max(max_in_size, m_mult * n_in)
+            max_out_size = max(max_out_size, m_mult * n_out)
+
+    return max_in_size, max_out_size
+
 
 def block_diagonal_cuda(
     features: torch.Tensor,
@@ -143,11 +166,16 @@ def block_diagonal_cuda(
     num_bins = radial_table.size(0) - 1
     channels_out = radial_table.size(1)
 
-    # Build block metadata from ProductRepr
-    block_data, dim_out, max_in_size, max_out_size = product_repr.block_metadata(device)
+    # Extract lvals tensors from representations
+    lvals_in = product_repr.rep1.lvals.to(device=device, dtype=torch.int32).contiguous()
+    lvals_out = product_repr.rep2.lvals.to(device=device, dtype=torch.int32).contiguous()
+
+    # Compute block sizes for shared memory allocation
+    dim_out = product_repr.rep2.dim()
+    max_in_size, max_out_size = _compute_block_sizes(lvals_in, lvals_out)
 
     # Run kernel
     return _BlockDiagonalFunction.apply(
         features, radial_table, bin_lo, interp_weight.to(features.dtype),
-        channels_out, num_bins, block_data, dim_out, max_in_size, max_out_size
+        channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size
     )

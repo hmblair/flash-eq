@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from ..representations import Repr, ProductRepr
 from ..cuda.block_diagonal import block_diagonal_cuda
-from ..radial import BinnedModule, BinnedRadialBasis
+from .radial import BinnedModule, BinnedRadialBasis
 
 
 class EquivariantEdgewiseLinear(nn.Module):

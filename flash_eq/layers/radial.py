@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .utils import get_epsilon
+from ..utils import get_epsilon
 
 
 def _init_weights(module: nn.Module) -> None:

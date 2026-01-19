@@ -20,7 +20,7 @@ Radial weights:
 
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .basis import WignerDBasis
-from .radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
+from .layers.radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 from .layers import (
     EquivariantEdgewiseLinear,
     EquivariantAttention,

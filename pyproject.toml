@@ -22,6 +22,8 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "sphericart-torch>=1.0",
+    "h5py",
+    "ciffy",
 ]
 
 [project.optional-dependencies]

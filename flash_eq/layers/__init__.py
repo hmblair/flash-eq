@@ -34,6 +34,7 @@ from .pooling import GraphPooling
 from .gating import EquivariantGating
 from .s2_activation import S2Activation
 from .transformer import EquivariantTransformerBlock, EquivariantTransformer
+from .radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 
 __all__ = [
     # Linear
@@ -55,4 +56,9 @@ __all__ = [
     # Transformer
     "EquivariantTransformerBlock",
     "EquivariantTransformer",
+    # Radial
+    "RadialBasisFunctions",
+    "RadialMLP",
+    "BinnedModule",
+    "BinnedRadialBasis",
 ]

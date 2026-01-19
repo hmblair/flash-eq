@@ -27,6 +27,8 @@ class S2Activation(nn.Module):
         2. f_grid = MLP(f_grid)     (channel-wise nonlinearity)
         3. f_out = f_grid @ Y_inv^T (grid → SH, shape: ..., mult, dim)
 
+    Supports non-contiguous l values (e.g., lvals=[1, 2] without l=0).
+
     Args:
         repr: The representation of input tensors.
         hidden_mult: Hidden layer size as multiple of channels (default: 2).
@@ -60,9 +62,28 @@ class S2Activation(nn.Module):
         grid = S2Grid(l_max=l_max, precision=precision)
         self.n_points = grid.n_points
         self.precision = precision
+
+        # Extract only the columns of Y corresponding to the l values in repr.
+        # For each l, columns l² to (l+1)²-1 contain the 2l+1 SH coefficients.
+        lvals = repr.lvals.tolist()
+        indices = []
+        for l in lvals:
+            start = l * l
+            end = (l + 1) * (l + 1)
+            indices.extend(range(start, end))
+
+        Y_subset = grid.Y[:, indices]  # (n_points, dim)
+        weights = grid.weights
+
+        # Recompute inverse transform for the subset
+        W = torch.diag(weights)
+        YtW = Y_subset.T @ W
+        YtWY = YtW @ Y_subset
+        Y_inv_subset = torch.linalg.solve(YtWY, YtW)  # (dim, n_points)
+
         # Store transposed matrices to avoid transpose in forward pass
-        self.register_buffer('Y_T', grid.Y.T.contiguous())        # (dim, n_points)
-        self.register_buffer('Y_inv_T', grid.Y_inv.T.contiguous())  # (n_points, dim)
+        self.register_buffer('Y_T', Y_subset.T.float().contiguous())        # (dim, n_points)
+        self.register_buffer('Y_inv_T', Y_inv_subset.T.float().contiguous())  # (n_points, dim)
 
         # Channel-wise MLP using Conv1d (avoids transpose operations)
         # Conv1d with kernel_size=1 mixes channels at each grid point

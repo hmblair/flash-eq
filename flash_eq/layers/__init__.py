@@ -21,6 +21,10 @@ Pooling:
 Gating:
     - EquivariantGating: Norm-based gating nonlinearity
 
+Transformer:
+    - EquivariantTransformerBlock: Single transformer block
+    - EquivariantTransformer: Full transformer stack
+
 Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from .linear import EquivariantEdgewiseLinear, EquivariantLinear
@@ -29,6 +33,7 @@ from .norm import RepNorm, EquivariantLayerNorm, SeparableEquivariantLayerNorm
 from .pooling import GraphPooling
 from .gating import EquivariantGating
 from .s2_activation import S2Activation
+from .transformer import EquivariantTransformerBlock, EquivariantTransformer
 
 __all__ = [
     # Linear
@@ -47,4 +52,7 @@ __all__ = [
     "EquivariantGating",
     # S² Activation
     "S2Activation",
+    # Transformer
+    "EquivariantTransformerBlock",
+    "EquivariantTransformer",
 ]

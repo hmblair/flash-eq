@@ -1,0 +1,342 @@
+"""SO(3)-equivariant transformer blocks.
+
+This module implements equivariant transformer blocks that combine
+attention, normalization, and feed-forward layers while preserving
+SO(3) equivariance.
+
+Author: Hamish M. Blair <hmblair@stanford.edu>
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from ..representations import Repr
+from .attention import EquivariantAttention
+from .linear import EquivariantLinear
+from .norm import SeparableEquivariantLayerNorm
+from .gating import EquivariantGating
+
+
+class EquivariantTransformerBlock(nn.Module):
+    """SO(3)-equivariant transformer block.
+
+    Combines self-attention with a feed-forward network while preserving
+    SO(3) equivariance. Supports different input and output representations,
+    allowing the block to change both multiplicity and angular momentum.
+
+    Architecture:
+        x_norm = LayerNorm(x)
+        attn_out = Attention(x_norm, graph)
+        x = x + attn_out  (residual, only if in_repr == out_repr)
+
+        x_norm = LayerNorm(x)
+        mlp_out = MLP(x_norm)
+        x = x + mlp_out  (residual)
+
+    When in_repr != out_repr:
+        - The attention layer transforms from in_repr to out_repr
+        - No residual connection around attention (shapes don't match)
+        - MLP operates on out_repr with residual
+
+    Args:
+        in_repr: Input representation.
+        out_repr: Output representation.
+        num_heads: Number of attention heads. Must divide out_repr.mult.
+        num_bins: Number of distance bins for radial weights.
+        min_dist: Minimum distance for binning.
+        max_dist: Maximum distance for binning.
+        log_bins: Use logarithmic bin spacing.
+        sigma: Gaussian smoothing for radial weights.
+        mlp_ratio: Hidden dimension multiplier for MLP (default 2).
+        dropout: Dropout rate for attention weights.
+        use_gating: Use EquivariantGating in MLP (default True).
+
+    Example:
+        >>> from flash_eq import Repr, WignerDBasis
+        >>> from flash_eq.layers import EquivariantTransformerBlock
+        >>>
+        >>> in_repr = Repr(lvals=[0, 1], mult=32)
+        >>> out_repr = Repr(lvals=[0, 1, 2], mult=64)
+        >>>
+        >>> block = EquivariantTransformerBlock(in_repr, out_repr, num_heads=8).cuda()
+        >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
+        >>>
+        >>> P, Q = basis(directions)
+        >>> output = block(P, Q, node_features, distances, src, dst, num_nodes)
+    """
+
+    def __init__(
+        self,
+        in_repr: Repr,
+        out_repr: Repr,
+        num_heads: int = 1,
+        num_bins: int = 100,
+        min_dist: float = 0.0,
+        max_dist: float = 10.0,
+        log_bins: bool = False,
+        sigma: float = 1.0,
+        mlp_ratio: int = 2,
+        dropout: float = 0.0,
+        use_gating: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.in_repr = in_repr
+        self.out_repr = out_repr
+
+        # Check if we can use residual connections
+        self._use_attn_residual = (
+            torch.equal(in_repr.lvals, out_repr.lvals) and
+            in_repr.mult == out_repr.mult
+        )
+
+        # Pre-attention normalization
+        self.norm1 = SeparableEquivariantLayerNorm(in_repr)
+
+        # Attention layer (transforms in_repr -> out_repr)
+        self.attn = EquivariantAttention(
+            in_repr=in_repr,
+            out_repr=out_repr,
+            num_heads=num_heads,
+            num_bins=num_bins,
+            min_dist=min_dist,
+            max_dist=max_dist,
+            log_bins=log_bins,
+            sigma=sigma,
+            use_layer_norm=True,
+            dropout=dropout,
+            reduce='sum',
+        )
+
+        # Pre-MLP normalization (operates on out_repr)
+        self.norm2 = SeparableEquivariantLayerNorm(out_repr)
+
+        # MLP: out_repr -> expanded -> out_repr
+        mlp_hidden_mult = out_repr.mult * mlp_ratio
+        mlp_hidden_repr = Repr(lvals=out_repr.lvals.tolist(), mult=mlp_hidden_mult)
+
+        self.mlp_up = EquivariantLinear(out_repr, mlp_hidden_repr, bias=True)
+        self.mlp_gate = EquivariantGating(mlp_hidden_repr) if use_gating else nn.Identity()
+        self.mlp_down = EquivariantLinear(mlp_hidden_repr, out_repr, bias=True)
+
+    def forward(
+        self,
+        P: torch.Tensor,
+        Q: torch.Tensor,
+        node_features: torch.Tensor,
+        distances: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """Apply equivariant transformer block.
+
+        Args:
+            P: (num_edges, dim_in, dim_in) input basis matrix from WignerDBasis.
+            Q: (num_edges, dim_out, dim_out) output basis matrix from WignerDBasis.
+            node_features: (num_nodes, mult_in, dim_in) input node features.
+            distances: (num_edges,) edge distances.
+            src_indices: (num_edges,) source node index for each edge.
+            dst_indices: (num_edges,) destination node index for each edge.
+            num_nodes: Total number of nodes.
+
+        Returns:
+            (num_nodes, mult_out, dim_out) transformed node features.
+        """
+        # Self-attention block
+        x_norm = self.norm1(node_features)
+        attn_out = self.attn(
+            P, Q, x_norm, distances, src_indices, dst_indices, num_nodes
+        )
+
+        if self._use_attn_residual:
+            x = node_features + attn_out
+        else:
+            x = attn_out
+
+        # MLP block (always has residual since shapes match)
+        x_norm = self.norm2(x)
+        mlp_out = self.mlp_down(self.mlp_gate(self.mlp_up(x_norm)))
+        x = x + mlp_out
+
+        return x
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
+            f"attn_residual={self._use_attn_residual}"
+        )
+
+
+class EquivariantTransformer(nn.Module):
+    """Stack of equivariant transformer blocks.
+
+    A full equivariant transformer with input projection, multiple transformer
+    blocks, and output projection. Handles different representations at each
+    stage efficiently by computing basis matrices once and sharing them.
+
+    Args:
+        in_repr: Input representation.
+        hidden_repr: Hidden representation for intermediate layers.
+        out_repr: Output representation.
+        num_layers: Number of transformer blocks.
+        num_heads: Number of attention heads.
+        num_bins: Number of distance bins for radial weights.
+        min_dist: Minimum distance for binning.
+        max_dist: Maximum distance for binning.
+        log_bins: Use logarithmic bin spacing.
+        sigma: Gaussian smoothing for radial weights.
+        mlp_ratio: Hidden dimension multiplier for MLP.
+        dropout: Dropout rate for attention.
+
+    Example:
+        >>> from flash_eq import Repr, WignerDBasis
+        >>> from flash_eq.layers import EquivariantTransformer
+        >>>
+        >>> in_repr = Repr(lvals=[0, 1], mult=32)
+        >>> hidden_repr = Repr(lvals=[0, 1, 2, 3, 4], mult=64)
+        >>> out_repr = Repr(lvals=[0], mult=1)
+        >>>
+        >>> model = EquivariantTransformer(
+        ...     in_repr, hidden_repr, out_repr,
+        ...     num_layers=6, num_heads=8
+        ... ).cuda()
+        >>>
+        >>> # Model provides method to get all needed reprs for basis computation
+        >>> basis = WignerDBasis(model.get_basis_reprs()).cuda()
+        >>> matrices = basis(directions)
+        >>>
+        >>> output = model(matrices, node_features, distances, src, dst, num_nodes)
+    """
+
+    def __init__(
+        self,
+        in_repr: Repr,
+        hidden_repr: Repr,
+        out_repr: Repr,
+        num_layers: int = 6,
+        num_heads: int = 1,
+        num_bins: int = 100,
+        min_dist: float = 0.0,
+        max_dist: float = 10.0,
+        log_bins: bool = False,
+        sigma: float = 1.0,
+        mlp_ratio: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.in_repr = in_repr
+        self.hidden_repr = hidden_repr
+        self.out_repr = out_repr
+        self.num_layers = num_layers
+
+        # Build layers list with their repr configurations
+        # Layer 0: in_repr -> hidden_repr
+        # Layers 1 to num_layers-2: hidden_repr -> hidden_repr
+        # Layer num_layers-1: hidden_repr -> out_repr
+        self.layers = nn.ModuleList()
+
+        for i in range(num_layers):
+            # Determine input repr for this layer
+            if i == 0:
+                layer_in = in_repr
+            else:
+                layer_in = hidden_repr
+
+            # Determine output repr for this layer
+            if i == num_layers - 1:
+                layer_out = out_repr
+            elif i == 0 and num_layers > 1:
+                layer_out = hidden_repr
+            else:
+                layer_out = hidden_repr
+
+            self.layers.append(
+                EquivariantTransformerBlock(
+                    in_repr=layer_in,
+                    out_repr=layer_out,
+                    num_heads=num_heads,
+                    num_bins=num_bins,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    log_bins=log_bins,
+                    sigma=sigma,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                )
+            )
+
+        # Final normalization
+        self.final_norm = SeparableEquivariantLayerNorm(out_repr)
+
+        # Store repr indices for basis matrix selection
+        # We need: in_repr, hidden_repr, out_repr
+        # Layer 0: P=in, Q=hidden
+        # Layers 1 to num_layers-2: P=hidden, Q=hidden
+        # Layer num_layers-1: P=hidden, Q=out
+        self._basis_reprs = [in_repr, hidden_repr, out_repr]
+
+    def get_basis_reprs(self) -> list[Repr]:
+        """Get list of representations needed for WignerDBasis.
+
+        Returns:
+            List of [in_repr, hidden_repr, out_repr] for computing basis matrices.
+
+        Example:
+            >>> basis = WignerDBasis(model.get_basis_reprs())
+            >>> M_in, M_hidden, M_out = basis(directions)
+        """
+        return self._basis_reprs
+
+    def forward(
+        self,
+        basis_matrices: tuple[torch.Tensor, ...],
+        node_features: torch.Tensor,
+        distances: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """Apply equivariant transformer.
+
+        Args:
+            basis_matrices: Tuple of (M_in, M_hidden, M_out) from WignerDBasis.
+            node_features: (num_nodes, mult_in, dim_in) input features.
+            distances: (num_edges,) edge distances.
+            src_indices: (num_edges,) source node index for each edge.
+            dst_indices: (num_edges,) destination node index for each edge.
+            num_nodes: Total number of nodes.
+
+        Returns:
+            (num_nodes, mult_out, dim_out) transformed features.
+        """
+        M_in, M_hidden, M_out = basis_matrices
+
+        x = node_features
+
+        for i, layer in enumerate(self.layers):
+            # Select P based on input repr
+            if i == 0:
+                P = M_in
+            else:
+                P = M_hidden
+
+            # Select Q based on output repr
+            if i == self.num_layers - 1:
+                Q = M_out
+            elif i == 0 and self.num_layers > 1:
+                Q = M_hidden
+            else:
+                Q = M_hidden
+
+            x = layer(P, Q, x, distances, src_indices, dst_indices, num_nodes)
+
+        return self.final_norm(x)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_repr={self.in_repr}, hidden_repr={self.hidden_repr}, "
+            f"out_repr={self.out_repr}, num_layers={self.num_layers}"
+        )

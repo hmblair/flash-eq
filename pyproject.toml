@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash-eq"
@@ -29,8 +29,8 @@ dev = [
     "scipy",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["flash_eq"]
+[tool.setuptools.packages.find]
+include = ["flash_eq*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

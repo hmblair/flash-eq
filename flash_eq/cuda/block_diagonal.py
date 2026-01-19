@@ -83,7 +83,7 @@ def _check_cuda_available() -> None:
 
 
 def _get_cuda_module():
-    """JIT compile and load the CUDA extension."""
+    """Load the CUDA extension (pre-built or JIT compiled)."""
     global _cuda_module
 
     _check_cuda_available()
@@ -91,7 +91,16 @@ def _get_cuda_module():
     if _cuda_module is not None:
         return _cuda_module
 
-    # Import here to avoid issues on CPU-only systems
+    # Try to import pre-built extension first
+    try:
+        from .. import _block_diagonal_cuda
+        _cuda_module = _block_diagonal_cuda
+        logger.debug("Loaded pre-built CUDA extension")
+        return _cuda_module
+    except ImportError:
+        logger.debug("Pre-built CUDA extension not found, falling back to JIT compilation")
+
+    # Fall back to JIT compilation
     from torch.utils.cpp_extension import load
 
     # Check CUDA_HOME

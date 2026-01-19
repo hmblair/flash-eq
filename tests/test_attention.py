@@ -238,7 +238,8 @@ class TestFullPipeline:
 
         # Method 1: Forward then rotate output
         P, Q = basis(directions)
-        edge_feat = linear(P, Q, node_features, distances, src)
+        edge_feat = node_features[src]  # gather to edges
+        edge_feat = linear(P, Q, edge_feat, distances)
         edge_feat = attn(edge_feat, dst, num_nodes)
         out_original = pool(edge_feat, dst, num_nodes)
         out_then_rotate = torch.einsum('ij,...j->...i', D, out_original)
@@ -248,7 +249,8 @@ class TestFullPipeline:
         directions_rot = torch.einsum('ij,...j->...i', R, directions)
 
         P_rot, Q_rot = basis(directions_rot)
-        edge_feat_rot = linear(P_rot, Q_rot, node_features_rot, distances, src)
+        edge_feat_rot = node_features_rot[src]  # gather to edges
+        edge_feat_rot = linear(P_rot, Q_rot, edge_feat_rot, distances)
         edge_feat_rot = attn(edge_feat_rot, dst, num_nodes)
         rotate_then_out = pool(edge_feat_rot, dst, num_nodes)
 

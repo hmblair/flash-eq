@@ -26,7 +26,7 @@ basis = WignerDBasis([in_repr, out_repr]).cuda()
 
 # Input data
 num_nodes, num_edges = 1000, 5000
-node_features = torch.randn(num_nodes, 32, in_repr.dim, device='cuda')
+node_features = torch.randn(num_nodes, 32, in_repr.dim(), device='cuda')
 src_indices = torch.randint(0, num_nodes, (num_edges,), device='cuda')
 directions = torch.randn(num_edges, 3, device='cuda')
 directions = directions / directions.norm(dim=-1, keepdim=True)
@@ -35,9 +35,10 @@ distances = torch.rand(num_edges, device='cuda') * 10.0
 # Compute basis matrices (once per forward pass, shared across layers)
 P, Q = basis(directions)  # One matrix per repr in the input list
 
-# Apply layer
-output = layer(P, Q, node_features, distances, src_indices)
-# output.shape = (num_edges, 32, out_repr.dim)
+# Gather node features to edges, then apply layer
+edge_features = node_features[src_indices]
+output = layer(P, Q, edge_features, distances)
+# output.shape = (num_edges, 32, out_repr.dim())
 ```
 
 ## API Reference
@@ -86,7 +87,8 @@ The basis matrices are computed once and shared across all layers in a network.
 
 ### EquivariantEdgewiseLinear
 
-SO(3)-equivariant linear layer with distance-dependent weights.
+SO(3)-equivariant linear layer with distance-dependent weights. This is an edge-to-edge
+transformation; callers are responsible for gathering node features to edges if needed.
 
 ```python
 from flash_eq import EquivariantEdgewiseLinear
@@ -97,22 +99,21 @@ layer = EquivariantEdgewiseLinear(
     num_bins=100,           # Distance bins for radial weights (default: 100)
     min_dist=0.0,           # Minimum distance (default: 0.0)
     max_dist=10.0,          # Maximum distance (default: 10.0)
-    radial_hidden=64,       # Hidden dim for radial MLP (default: 64)
-    radial_layers=2,        # Hidden layers in radial MLP (default: 2)
 )
 
-output = layer(P, Q, node_features, distances, src_indices)
+# Gather node features to edges, then apply transformation
+edge_features = node_features[src_indices]
+output = layer(P, Q, edge_features, distances)
 ```
 
 **Arguments:**
 - `P`: Input basis matrix from `WignerDBasis`
 - `Q`: Output basis matrix from `WignerDBasis`
-- `node_features`: `(num_nodes, channels_in, dim_in)` node features
+- `edge_features`: `(num_edges, channels_in, dim_in)` edge features
 - `distances`: `(num_edges,)` edge distances
-- `src_indices`: `(num_edges,)` source node index for each edge
 
 **Returns:**
-- `output`: `(num_edges, channels_out, dim_out)` edge features
+- `output`: `(num_edges, channels_out, dim_out)` transformed edge features
 
 ### Equivariant Layers
 

@@ -306,8 +306,9 @@ class EquivariantAttention(nn.Module):
         Returns:
             output: (num_nodes, channels_out, dim_out) updated node features.
         """
-        # Transform to edge features
-        edge_features = self.linear(P, Q, node_features, distances, src_indices)
+        # Gather node features to edges, then transform
+        edge_features = node_features[src_indices]
+        edge_features = self.linear(P, Q, edge_features, distances)
 
         # Apply attention weighting
         edge_features = self.attention(edge_features, dst_indices, num_nodes)

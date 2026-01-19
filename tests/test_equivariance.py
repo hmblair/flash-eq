@@ -77,15 +77,19 @@ def test_equivariance(cuda_device, lvals_in, lvals_out):
 
     P, Q = basis(directions)
 
+    # Gather node features to edges
+    edge_features = node_features[src_indices]
+
     # Method 1: Apply layer, then rotate output
-    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1 = layer(P, Q, edge_features, distances)
     output1_rotated = torch.einsum('ij,ecj->eci', D_out, output1)
 
     # Method 2: Rotate input features and directions, then apply layer
     node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
+    edge_features_rotated = node_features_rotated[src_indices]
     directions_rotated = torch.einsum('ij,ej->ei', R, directions)
     P_rot, Q_rot = basis(directions_rotated)
-    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+    output2 = layer(P_rot, Q_rot, edge_features_rotated, distances)
 
     # Check output is non-trivial
     output_mag = output1.abs().mean().item()
@@ -120,19 +124,23 @@ def test_equivariance_multiple_rotations(cuda_device, lvals_in, lvals_out):
     directions = torch.randn(num_edges, 3, device=cuda_device)
     directions = directions / directions.norm(dim=-1, keepdim=True)
 
+    # Gather node features to edges
+    edge_features = node_features[src_indices]
+
     for i in range(3):
         axis, angle, R = random_rotation(cuda_device)
         D_in = wigner_in.rot(axis, angle)
         D_out = wigner_out.rot(axis, angle)
 
         P, Q = basis(directions)
-        output1 = layer(P, Q, node_features, distances, src_indices)
+        output1 = layer(P, Q, edge_features, distances)
         output1_rotated = torch.einsum('ij,ecj->eci', D_out, output1)
 
         node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
+        edge_features_rotated = node_features_rotated[src_indices]
         directions_rotated = torch.einsum('ij,ej->ei', R, directions)
         P_rot, Q_rot = basis(directions_rotated)
-        output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+        output2 = layer(P_rot, Q_rot, edge_features_rotated, distances)
 
         check_equivariance(output1_rotated, output2, rtol=1e-4, msg=f"Rotation {i+1}")
 
@@ -163,14 +171,18 @@ def test_equivariance_high_lmax(cuda_device):
     axis, angle, R = random_rotation(cuda_device)
     D = wigner.rot(axis, angle)
 
+    # Gather node features to edges
+    edge_features = node_features[src_indices]
+
     P, Q = basis(directions)
-    output1 = layer(P, Q, node_features, distances, src_indices)
+    output1 = layer(P, Q, edge_features, distances)
     output1_rotated = torch.einsum('ij,ecj->eci', D, output1)
 
     node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+    edge_features_rotated = node_features_rotated[src_indices]
     directions_rotated = torch.einsum('ij,ej->ei', R, directions)
     P_rot, Q_rot = basis(directions_rotated)
-    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+    output2 = layer(P_rot, Q_rot, edge_features_rotated, distances)
 
     check_equivariance(output1_rotated, output2, rtol=1e-4, msg="High lmax equivariance")
 
@@ -217,7 +229,8 @@ def test_gradient_equivariance(cuda_device, lvals):
 
     # Method 1: Compute gradient, then rotate
     node_features = torch.randn(num_nodes, mult, dim, device=cuda_device, requires_grad=True)
-    output1 = layer(P, Q, node_features, distances, src_indices)
+    edge_features = node_features[src_indices]
+    output1 = layer(P, Q, edge_features, distances)
     # Use squared norm loss - invariant under rotation
     loss1 = (output1 ** 2).sum()
     loss1.backward()
@@ -233,11 +246,12 @@ def test_gradient_equivariance(cuda_device, lvals):
     # Method 2: Rotate input (as new leaf tensor), compute gradient w.r.t. rotated input
     node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features.detach())
     node_features_rotated = node_features_rotated.clone().requires_grad_(True)
+    edge_features_rotated = node_features_rotated[src_indices]
 
     directions_rotated = torch.einsum('ij,ej->ei', R, directions)
     P_rot, Q_rot = basis(directions_rotated)
 
-    output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
+    output2 = layer(P_rot, Q_rot, edge_features_rotated, distances)
     # Use squared norm loss - invariant under rotation
     loss2 = (output2 ** 2).sum()
     loss2.backward()

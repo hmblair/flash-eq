@@ -242,15 +242,14 @@ def benchmark_edgewise_linear(
     optimizer = torch.optim.Adam(layer.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    node_features = torch.randn(
-        scenario.num_nodes,
+    edge_features = torch.randn(
+        scenario.num_edges,
         scenario.mult,
         scenario.dim,
         device=device,
         dtype=dtype,
         requires_grad=True,
     )
-    src_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
     directions = torch.randn(scenario.num_edges, 3, device=device, dtype=dtype)
     directions = directions / directions.norm(dim=-1, keepdim=True)
     distances = torch.rand(scenario.num_edges, device=device, dtype=dtype) * 10.0
@@ -263,7 +262,7 @@ def benchmark_edgewise_linear(
     def train_step():
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = layer(P, Q, node_features, distances, src_indices)
+            output = layer(P, Q, edge_features, distances)
             loss = ((output - target) ** 2).mean()
         scaler.scale(loss).backward()
         scaler.step(optimizer)

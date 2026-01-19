@@ -60,7 +60,8 @@ class EquivariantEdgewiseLinear(nn.Module):
         >>>
         >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>> P, Q = basis(directions)
-        >>> output = layer(P, Q, node_features, distances, src_indices)
+        >>> edge_features = node_features[src_indices]  # gather to edges
+        >>> output = layer(P, Q, edge_features, distances)
     """
 
     radial_weights: BinnedModule | BinnedRadialBasis
@@ -116,13 +117,15 @@ class EquivariantEdgewiseLinear(nn.Module):
         self,
         P: torch.Tensor,
         Q: torch.Tensor,
-        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
         distances: torch.Tensor,
-        src_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Apply SO(3)-equivariant linear transformation.
 
-        Computes: out = Q @ Λ(r) @ P^T @ node_features[src_indices]
+        Computes: out = Q @ Λ(r) @ P^T @ edge_features
+
+        This is an edge-to-edge transformation. Callers are responsible for
+        gathering node features to edges if needed (e.g., edge_features = node_features[src_indices]).
 
         Args:
             P: (num_edges, dim_in, dim_in)
@@ -131,30 +134,24 @@ class EquivariantEdgewiseLinear(nn.Module):
             Q: (num_edges, dim_out, dim_out)
                 Output basis matrix from WignerDBasis.
                 Columns are permuted to m-first order.
-            node_features: (num_nodes, channels_in, dim_in)
-                Node features in standard SH basis.
+            edge_features: (num_edges, channels_in, dim_in)
+                Edge features in standard SH basis.
             distances: (num_edges,)
                 Edge distances for radial weight interpolation.
-            src_indices: (num_edges,)
-                Source node index for each edge.
 
         Returns:
             output: (num_edges, channels_out, dim_out)
                 Edge features in standard SH basis.
         """
-        # =====================================================================
-        # Step 1: Gather node features to edges (PyTorch)
-        # =====================================================================
-        edge_features = node_features[src_indices]  # (num_edges, channels, dim_in)
 
         # =====================================================================
-        # Step 2: Transform to m-first diagonal basis (PyTorch matmul)
+        # Step 1: Transform to m-first diagonal basis (PyTorch matmul)
         # f_diag = P^T @ edge_features, equivalent to edge_features @ P
         # =====================================================================
         f_diag = torch.bmm(edge_features, P)
 
         # =====================================================================
-        # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)
+        # Step 2: Block-diagonal multiply with radial weights (CUDA kernel)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
         bin_lo, interp_weight = self.radial_weights.bin_indices(distances)
@@ -167,7 +164,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         )
 
         # =====================================================================
-        # Step 4: Transform back to standard SH basis (PyTorch matmul)
+        # Step 3: Transform back to standard SH basis (PyTorch matmul)
         # out = Q @ out_diag, equivalent to out_diag @ Q^T
         # =====================================================================
         return torch.bmm(out_diag, Q.mT)

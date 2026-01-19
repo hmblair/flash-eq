@@ -25,16 +25,14 @@ class TestEmptyInputs:
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
-        num_nodes = 10
         num_edges = 0
 
-        node_features = torch.randn(num_nodes, 4, 9, device=cuda_device)
+        edge_features = torch.randn(num_edges, 4, 9, device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         distances = torch.randn(num_edges, device=cuda_device)
-        src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert output.shape == (0, 4, 9)
 
@@ -46,16 +44,14 @@ class TestEmptyInputs:
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
-        num_nodes = 10
         num_edges = 1
 
-        node_features = torch.randn(num_nodes, 4, 9, device=cuda_device)
+        edge_features = torch.randn(num_edges, 4, 9, device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         distances = torch.rand(num_edges, device=cuda_device) * 5.0
-        src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert output.shape == (1, 4, 9)
         assert torch.isfinite(output).all()
@@ -76,8 +72,11 @@ class TestEmptyInputs:
         distances = torch.rand(num_edges, device=cuda_device) * 5.0
         src_indices = torch.zeros(num_edges, device=cuda_device, dtype=torch.long)
 
+        # Gather node features to edges
+        edge_features = node_features[src_indices]
+
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert output.shape == (5, 2, 4)
         assert torch.isfinite(output).all()
@@ -147,13 +146,12 @@ class TestNumericalEdgeCases:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 5
-        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        edge_features = torch.randn(num_edges, 2, 4, device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         distances = torch.zeros(num_edges, device=cuda_device)  # All zero
-        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all(), "Output contains NaN/Inf for zero distance"
 
@@ -169,14 +167,13 @@ class TestNumericalEdgeCases:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 4
-        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        edge_features = torch.randn(num_edges, 2, 4, device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         # Distances: negative, zero, in range, above range
         distances = torch.tensor([-5.0, 0.0, 5.0, 100.0], device=cuda_device)
-        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all(), "Output contains NaN/Inf for out-of-range distance"
 
@@ -224,14 +221,13 @@ class TestDtypes:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 50
-        node_features = torch.randn(20, 4, 9, device=cuda_device, dtype=torch.float16)
+        edge_features = torch.randn(num_edges, 4, 9, device=cuda_device, dtype=torch.float16)
         directions = torch.randn(num_edges, 3, device=cuda_device, dtype=torch.float16)
         distances = torch.rand(num_edges, device=cuda_device, dtype=torch.float16) * 5.0
-        src_indices = torch.randint(0, 20, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions.float())  # Basis computed in FP32
         P, Q = P.half(), Q.half()
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert output.dtype == torch.float16
         assert torch.isfinite(output).all(), "FP16 output contains NaN/Inf"
@@ -263,13 +259,12 @@ class TestDtypes:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device).double()
 
         num_edges = 20
-        node_features = torch.randn(10, 2, 4, device=cuda_device, dtype=torch.float64)
+        edge_features = torch.randn(num_edges, 2, 4, device=cuda_device, dtype=torch.float64)
         directions = torch.randn(num_edges, 3, device=cuda_device, dtype=torch.float64)
         distances = torch.rand(num_edges, device=cuda_device, dtype=torch.float64) * 5.0
-        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert output.dtype == torch.float64
         assert torch.isfinite(output).all()
@@ -379,8 +374,11 @@ class TestDegenerateGraphs:
         # All edges from node i to node i
         src_indices = torch.arange(num_edges, device=cuda_device) % num_nodes
 
+        # Gather node features to edges
+        edge_features = node_features[src_indices]
+
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all()
 
@@ -400,8 +398,11 @@ class TestDegenerateGraphs:
         distances = torch.rand(num_edges, device=cuda_device) * 5.0
         src_indices = torch.zeros(num_edges, device=cuda_device, dtype=torch.long)  # All from node 0
 
+        # Gather node features to edges
+        edge_features = node_features[src_indices]
+
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all()
 
@@ -414,14 +415,13 @@ class TestDegenerateGraphs:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 20
-        node_features = torch.randn(10, 4, 9, device=cuda_device)
+        edge_features = torch.randn(num_edges, 4, 9, device=cuda_device)
         # All same direction
         directions = torch.tensor([[1.0, 0.0, 0.0]], device=cuda_device).expand(num_edges, 3)
         distances = torch.rand(num_edges, device=cuda_device) * 5.0
-        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all()
 
@@ -434,12 +434,11 @@ class TestDegenerateGraphs:
         basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 20
-        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        edge_features = torch.randn(num_edges, 2, 4, device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         distances = torch.full((num_edges,), 5.0, device=cuda_device)  # All same distance
-        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
-        output = layer(P, Q, node_features, distances, src_indices)
+        output = layer(P, Q, edge_features, distances)
 
         assert torch.isfinite(output).all()

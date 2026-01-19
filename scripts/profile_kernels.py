@@ -5,7 +5,7 @@ import torch.nn as nn
 from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr
 
 
-def profile_kernels(lmax, num_nodes, num_edges, cin, cout, num_bins=100, dtype=torch.float16, n_warmup=5, n_iter=20):
+def profile_kernels(lmax, num_edges, cin, cout, num_bins=100, dtype=torch.float16, n_warmup=5, n_iter=20):
     """Profile forward pass kernel timing using CUDA events."""
     device = torch.device("cuda")
 
@@ -24,8 +24,7 @@ def profile_kernels(lmax, num_nodes, num_edges, cin, cout, num_bins=100, dtype=t
 
     basis = WignerDBasis([in_repr, out_repr]).to(device)
 
-    node_features = torch.randn(num_nodes, cin, dim, device=device, dtype=dtype)
-    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)
+    edge_features = torch.randn(num_edges, cin, dim, device=device, dtype=dtype)
 
     directions = torch.randn(num_edges, 3, device=device, dtype=dtype)
     directions = directions / directions.norm(dim=-1, keepdim=True)
@@ -36,7 +35,7 @@ def profile_kernels(lmax, num_nodes, num_edges, cin, cout, num_bins=100, dtype=t
     # Warmup
     for _ in range(n_warmup):
         with torch.amp.autocast('cuda'):
-            _ = layer(P, Q, node_features, distances, src_indices)
+            _ = layer(P, Q, edge_features, distances)
     torch.cuda.synchronize()
 
     # Profile with nsys markers or just total time
@@ -46,7 +45,7 @@ def profile_kernels(lmax, num_nodes, num_edges, cin, cout, num_bins=100, dtype=t
     start.record()
     for _ in range(n_iter):
         with torch.amp.autocast('cuda'):
-            _ = layer(P, Q, node_features, distances, src_indices)
+            _ = layer(P, Q, edge_features, distances)
     end.record()
     torch.cuda.synchronize()
 
@@ -85,19 +84,19 @@ def main():
     print()
 
     configs = [
-        (1, 3000, 32000, 32, 32),
-        (2, 3000, 32000, 32, 32),
-        (4, 1000, 5000, 32, 32),
-        (6, 1000, 5000, 32, 32),
-        (4, 2000, 20000, 32, 32),
-        (6, 2000, 20000, 32, 32),
+        (1, 32000, 32, 32),
+        (2, 32000, 32, 32),
+        (4, 5000, 32, 32),
+        (6, 5000, 32, 32),
+        (4, 20000, 32, 32),
+        (6, 20000, 32, 32),
     ]
 
     print(f"{'Config':<30} {'Time (ms)':<12} {'m=0 work %':<12} {'m>0 work %':<12}")
     print("-" * 80)
 
-    for lmax, num_nodes, num_edges, cin, cout in configs:
-        r = profile_kernels(lmax, num_nodes, num_edges, cin, cout)
+    for lmax, num_edges, cin, cout in configs:
+        r = profile_kernels(lmax, num_edges, cin, cout)
         config_str = f"L={lmax}, E={num_edges}"
         print(f"{config_str:<30} {r['total_ms']:<12.2f} {r['m0_work_frac']*100:<12.1f} {r['mpos_work_frac']*100:<12.1f}")
 

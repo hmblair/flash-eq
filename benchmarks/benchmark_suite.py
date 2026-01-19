@@ -361,9 +361,9 @@ def benchmark_s2_activation(
     optimizer = torch.optim.Adam(act.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # Use num_edges as batch size for S2Activation
+    # S2Activation operates on node features, not edge features
     features = torch.randn(
-        scenario.num_edges,
+        scenario.num_nodes,
         scenario.mult,
         scenario.dim,
         device=device,
@@ -371,7 +371,7 @@ def benchmark_s2_activation(
         requires_grad=True,
     )
     target = torch.randn(
-        scenario.num_edges, scenario.mult, scenario.dim, device=device, dtype=dtype
+        scenario.num_nodes, scenario.mult, scenario.dim, device=device, dtype=dtype
     )
 
     def train_step():
@@ -633,7 +633,7 @@ def run_component_benchmarks(
             print(
                 f"{str(s):<{scenario_w}} {fmt_time(r.time_ms):<{time_w}} "
                 f"{fmt_mem(r.peak_mem_mb):<{mem_w}} "
-                f"{fmt_throughput(s.num_edges, r.time_ms, 'samples'):<{tput_w}}"
+                f"{fmt_throughput(s.num_nodes, r.time_ms, 'nodes'):<{tput_w}}"
             )
         else:
             print(f"{str(s):<{scenario_w}} {'OOM':<{time_w}}")

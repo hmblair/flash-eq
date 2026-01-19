@@ -31,7 +31,6 @@ from .layers import (
     SeparableEquivariantLayerNorm,
     GraphPooling,
     S2Activation,
-    SeparableS2Activation,
 )
 from .spherical import S2Grid, real_spherical_harmonics, lebedev_grid
 from .cuda import CUDANotAvailableError
@@ -54,7 +53,6 @@ __all__ = [
     "GraphPooling",
     "EquivariantEdgeAttention",
     "S2Activation",
-    "SeparableS2Activation",
     # Basis
     "WignerDBasis",
     # Radial weights

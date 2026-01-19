@@ -25,7 +25,6 @@ from flash_eq import (
     Repr,
     WignerDBasis,
     S2Activation,
-    SeparableS2Activation,
 )
 
 
@@ -391,48 +390,6 @@ def benchmark_s2_activation(
     return result
 
 
-def benchmark_separable_s2_activation(
-    lmax: int,
-    mult: int,
-    batch_size: int,
-    dtype: torch.dtype,
-    use_amp: bool = False,
-) -> BenchmarkResult:
-    """Benchmark SeparableS2Activation forward + backward."""
-    clear_memory()
-    device = torch.device("cuda")
-
-    lvals = list(range(lmax + 1))
-    repr = Repr(lvals=lvals, mult=mult)
-    dim = repr.dim()
-
-    act = SeparableS2Activation(repr).to(device).to(dtype)
-    optimizer = torch.optim.Adam(act.parameters(), lr=1e-4)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
-    features = torch.randn(
-        batch_size, mult, dim, device=device, dtype=dtype, requires_grad=True
-    )
-    target = torch.randn(batch_size, mult, dim, device=device, dtype=dtype)
-
-    def train_step():
-        optimizer.zero_grad()
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            output = act(features)
-            loss = ((output - target) ** 2).mean()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-    result = run_timed_iterations(train_step)
-    result.extra = {
-        "n_points": act.s2_act.n_points if act.s2_act else 0,
-        "nscalar": act.nscalar,
-        "nhigher": act.nhigher,
-    }
-    return result
-
-
 # =============================================================================
 # Benchmark Runners
 # =============================================================================
@@ -729,40 +686,6 @@ def run_s2_activation_benchmark(dtype: torch.dtype, use_amp: bool = False):
             print_table_row([
                 (config_str, 30), (f"{gflops:.1f}", 12)
             ])
-
-    # SeparableS2Activation comparison
-    print(f"\n--- SeparableS2Activation vs S2Activation ---")
-    cols = [("Config", 30), ("S2", 18), ("Separable", 18), ("Speedup", 12)]
-    print_table_header(cols)
-
-    sep_configs = [(4, 64, 10000), (6, 64, 10000), (6, 128, 5000)]
-    for lmax, mult, batch_size in sep_configs:
-        config_str = f"L={lmax}, M={mult}, B={batch_size}"
-
-        try:
-            r_s2 = benchmark_s2_activation(lmax, mult, batch_size, dtype, use_amp=use_amp)
-            s2_str = f"{r_s2.time_ms:.2f}ms"
-        except torch.cuda.OutOfMemoryError:
-            r_s2 = None
-            s2_str = "OOM"
-        clear_memory()
-
-        try:
-            r_sep = benchmark_separable_s2_activation(lmax, mult, batch_size, dtype, use_amp=use_amp)
-            sep_str = f"{r_sep.time_ms:.2f}ms"
-        except torch.cuda.OutOfMemoryError:
-            r_sep = None
-            sep_str = "OOM"
-        clear_memory()
-
-        if r_s2 and r_sep:
-            speedup = f"{r_s2.time_ms / r_sep.time_ms:.2f}x"
-        else:
-            speedup = "N/A"
-
-        print_table_row([
-            (config_str, 30), (s2_str, 18), (sep_str, 18), (speedup, 12)
-        ])
 
     return results
 

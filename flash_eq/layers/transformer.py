@@ -137,6 +137,7 @@ class EquivariantTransformerBlock(nn.Module):
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
         num_nodes: int,
+        edge_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply equivariant transformer block.
 
@@ -148,6 +149,9 @@ class EquivariantTransformerBlock(nn.Module):
             src_indices: (num_edges,) source node index for each edge.
             dst_indices: (num_edges,) destination node index for each edge.
             num_nodes: Total number of nodes.
+            edge_features: Optional (num_edges, mult_in, dim_in) edge features
+                to add to gathered node features before the linear transformation.
+                Useful for injecting edge-level information like positional encodings.
 
         Returns:
             (num_nodes, mult_out, dim_out) transformed node features.
@@ -155,7 +159,8 @@ class EquivariantTransformerBlock(nn.Module):
         # Self-attention block
         x_norm = self.norm1(node_features)
         attn_out = self.attn(
-            P, Q, x_norm, distances, src_indices, dst_indices, num_nodes
+            P, Q, x_norm, distances, src_indices, dst_indices, num_nodes,
+            edge_features=edge_features,
         )
 
         if self._use_attn_residual:

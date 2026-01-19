@@ -291,6 +291,7 @@ class EquivariantAttention(nn.Module):
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
         num_nodes: int,
+        edge_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply equivariant attention layer.
 
@@ -302,19 +303,28 @@ class EquivariantAttention(nn.Module):
             src_indices: (num_edges,) source node for each edge.
             dst_indices: (num_edges,) destination node for each edge.
             num_nodes: Total number of nodes.
+            edge_features: Optional (num_edges, channels_in, dim_in) edge features
+                to add to gathered node features before the linear transformation.
+                Useful for injecting edge-level information like positional encodings.
 
         Returns:
             output: (num_nodes, channels_out, dim_out) updated node features.
         """
-        # Gather node features to edges, then transform
-        edge_features = node_features[src_indices]
-        edge_features = self.linear(P, Q, edge_features, distances)
+        # Gather node features to edges
+        gathered = node_features[src_indices]
+
+        # Add optional edge features (e.g., positional encodings)
+        if edge_features is not None:
+            gathered = gathered + edge_features
+
+        # Transform through equivariant linear
+        out = self.linear(P, Q, gathered, distances)
 
         # Apply attention weighting
-        edge_features = self.attention(edge_features, dst_indices, num_nodes)
+        out = self.attention(out, dst_indices, num_nodes)
 
         # Aggregate to nodes
-        return self.pool(edge_features, dst_indices, num_nodes)
+        return self.pool(out, dst_indices, num_nodes)
 
     def extra_repr(self) -> str:
         return (

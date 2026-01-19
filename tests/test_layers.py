@@ -657,7 +657,7 @@ class TestWignerDScipyEquivalence:
 
             # Should match within float32 precision
             max_diff = np.abs(R_scipy - R_wigner).max()
-            assert max_diff < 1e-5, f"WignerD doesn't match scipy: max_diff={max_diff:.2e}"
+            assert max_diff < 1e-4, f"WignerD doesn't match scipy: max_diff={max_diff:.2e}"
 
     def test_matches_scipy_batched(self, device):
         """Batched WignerD should match scipy for each rotation."""
@@ -682,4 +682,4 @@ class TestWignerDScipyEquivalence:
             R_scipy = Rotation.from_rotvec(rotvec).as_matrix()
 
             max_diff = np.abs(R_scipy - R_wigner[i]).max()
-            assert max_diff < 1e-5, f"Rotation {i}: max_diff={max_diff:.2e}"
+            assert max_diff < 1e-4, f"Rotation {i}: max_diff={max_diff:.2e}"

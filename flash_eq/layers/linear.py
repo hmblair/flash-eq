@@ -63,6 +63,8 @@ class EquivariantEdgewiseLinear(nn.Module):
         >>> output = layer(P, Q, node_features, distances, src_indices)
     """
 
+    radial_weights: BinnedModule | BinnedRadialBasis
+
     def __init__(
         self,
         in_repr: Repr,

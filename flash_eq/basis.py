@@ -11,7 +11,7 @@ we avoid redundant computation in multi-layer networks.
 Reference: docs/theory.tex, Section 2
 """
 
-from typing import Sequence
+from typing import Sequence, cast
 
 import torch
 import torch.nn as nn
@@ -139,7 +139,8 @@ class WignerDBasis(nn.Module):
         for i in range(self._num_unique):
             # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
             # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
-            M_std = self._wigner_modules[i].rot_to_ez(directions).mT
+            wigner = cast(WignerD, self._wigner_modules[i])
+            M_std = wigner.rot_to_ez(directions).mT
             perm = getattr(self, f'_perm_{i}')
             M = M_std[..., perm]
             unique_matrices.append(M)

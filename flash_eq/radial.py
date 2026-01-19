@@ -292,6 +292,10 @@ class BinnedRadialBasis(nn.Module):
         >>> table = binned()  # (101, 64, 64, 85) - same interface as BinnedModule
     """
 
+    centers: torch.Tensor
+    widths: torch.Tensor
+    bin_edges: torch.Tensor
+
     def __init__(
         self,
         num_bins: int = 100,

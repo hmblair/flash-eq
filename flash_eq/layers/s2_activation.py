@@ -44,6 +44,9 @@ class S2Activation(nn.Module):
         >>> y = act(x)  # same shape
     """
 
+    Y_T: torch.Tensor
+    Y_inv_T: torch.Tensor
+
     def __init__(
         self,
         repr: Repr,
@@ -66,7 +69,7 @@ class S2Activation(nn.Module):
         # Extract only the columns of Y corresponding to the l values in repr.
         # For each l, columns l² to (l+1)²-1 contain the 2l+1 SH coefficients.
         lvals = repr.lvals.tolist()
-        indices = []
+        indices: list[int] = []
         for l in lvals:
             start = l * l
             end = (l + 1) * (l + 1)

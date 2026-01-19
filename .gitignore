@@ -8,6 +8,7 @@ build/
 *.so
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 debug_sizes*.py
 # LaTeX build artifacts
 *.aux

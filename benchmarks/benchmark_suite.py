@@ -21,6 +21,8 @@ import torch.nn as nn
 from flash_eq import (
     EquivariantEdgeAttention,
     EquivariantEdgewiseLinear,
+    EquivariantTransformerBlock,
+    EquivariantTransformer,
     GraphPooling,
     Repr,
     WignerDBasis,
@@ -391,6 +393,126 @@ def benchmark_s2_activation(
 
 
 # =============================================================================
+# EquivariantTransformerBlock
+# =============================================================================
+
+
+def benchmark_transformer_block(
+    in_lvals: list[int],
+    out_lvals: list[int],
+    in_mult: int,
+    out_mult: int,
+    num_nodes: int,
+    num_edges: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    use_amp: bool = False,
+) -> BenchmarkResult:
+    """Benchmark EquivariantTransformerBlock forward + backward."""
+    clear_memory()
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=in_lvals, mult=in_mult)
+    out_repr = Repr(lvals=out_lvals, mult=out_mult)
+
+    block = EquivariantTransformerBlock(
+        in_repr, out_repr, num_heads=num_heads, dropout=0.0
+    ).to(device).to(dtype)
+    basis = WignerDBasis([in_repr, out_repr]).to(device)
+
+    optimizer = torch.optim.Adam(block.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    node_features = torch.randn(
+        num_nodes, in_mult, in_repr.dim(), device=device, dtype=dtype, requires_grad=True
+    )
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+    dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+    directions = torch.randn(num_edges, 3, device=device, dtype=dtype)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    distances = torch.rand(num_edges, device=device, dtype=dtype) * 10.0
+    target = torch.randn(num_nodes, out_mult, out_repr.dim(), device=device, dtype=dtype)
+
+    P, Q = basis(directions)
+
+    def train_step():
+        optimizer.zero_grad()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            output = block(P, Q, node_features, distances, src_indices, dst_indices, num_nodes)
+            loss = ((output - target) ** 2).mean()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+    return run_timed_iterations(train_step)
+
+
+# =============================================================================
+# EquivariantTransformer (Full Stack)
+# =============================================================================
+
+
+def benchmark_transformer(
+    in_lvals: list[int],
+    hidden_lvals: list[int],
+    out_lvals: list[int],
+    in_mult: int,
+    hidden_mult: int,
+    out_mult: int,
+    num_layers: int,
+    num_nodes: int,
+    num_edges: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    use_amp: bool = False,
+) -> BenchmarkResult:
+    """Benchmark EquivariantTransformer forward + backward."""
+    clear_memory()
+    device = torch.device("cuda")
+
+    in_repr = Repr(lvals=in_lvals, mult=in_mult)
+    hidden_repr = Repr(lvals=hidden_lvals, mult=hidden_mult)
+    out_repr = Repr(lvals=out_lvals, mult=out_mult)
+
+    model = EquivariantTransformer(
+        in_repr, hidden_repr, out_repr,
+        num_layers=num_layers, num_heads=num_heads, dropout=0.0
+    ).to(device).to(dtype)
+    basis = WignerDBasis(model.get_basis_reprs()).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    node_features = torch.randn(
+        num_nodes, in_mult, in_repr.dim(), device=device, dtype=dtype, requires_grad=True
+    )
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+    dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+    directions = torch.randn(num_edges, 3, device=device, dtype=dtype)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    distances = torch.rand(num_edges, device=device, dtype=dtype) * 10.0
+    target = torch.randn(num_nodes, out_mult, out_repr.dim(), device=device, dtype=dtype)
+
+    matrices = basis(directions)
+
+    def train_step():
+        optimizer.zero_grad()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            output = model(matrices, node_features, distances, src_indices, dst_indices, num_nodes)
+            loss = ((output - target) ** 2).mean()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+    result = run_timed_iterations(train_step)
+    result.extra = {
+        "num_params": sum(p.numel() for p in model.parameters()),
+        "num_layers": num_layers,
+    }
+    return result
+
+
+# =============================================================================
 # Benchmark Runners
 # =============================================================================
 
@@ -690,6 +812,132 @@ def run_s2_activation_benchmark(dtype: torch.dtype, use_amp: bool = False):
     return results
 
 
+def run_transformer_block_benchmark(dtype: torch.dtype, use_amp: bool = False):
+    """Benchmark EquivariantTransformerBlock."""
+    precision = "AMP" if use_amp else ("FP16" if dtype == torch.float16 else "FP32")
+    print_header(f"EquivariantTransformerBlock ({precision})")
+
+    # Configurations: (in_lvals, out_lvals, in_mult, out_mult, num_nodes, num_edges, num_heads)
+    configs = [
+        # Same repr (with residual)
+        ([0, 1, 2], [0, 1, 2], 32, 32, 1000, 10000, 4),
+        ([0, 1, 2], [0, 1, 2], 64, 64, 1000, 10000, 8),
+        ([0, 1, 2, 3, 4], [0, 1, 2, 3, 4], 32, 32, 1000, 10000, 4),
+        # Different repr (no residual)
+        ([0, 1], [0, 1, 2], 32, 64, 1000, 10000, 8),
+        ([0, 1, 2], [0], 64, 32, 1000, 10000, 4),
+        # Scaling with edges
+        ([0, 1, 2], [0, 1, 2], 32, 32, 1000, 5000, 4),
+        ([0, 1, 2], [0, 1, 2], 32, 32, 1000, 20000, 4),
+        ([0, 1, 2], [0, 1, 2], 32, 32, 1000, 50000, 4),
+        # Scaling with nodes
+        ([0, 1, 2], [0, 1, 2], 32, 32, 500, 10000, 4),
+        ([0, 1, 2], [0, 1, 2], 32, 32, 2000, 10000, 4),
+        ([0, 1, 2], [0, 1, 2], 32, 32, 5000, 10000, 4),
+    ]
+
+    cols = [("Config", 55), ("Time (ms)", 15), ("Memory (MB)", 15)]
+    print_table_header(cols)
+
+    results = []
+    for in_lvals, out_lvals, in_mult, out_mult, num_nodes, num_edges, num_heads in configs:
+        in_str = "".join(str(l) for l in in_lvals)
+        out_str = "".join(str(l) for l in out_lvals)
+        config_str = f"L:{in_str}->{out_str}, M:{in_mult}->{out_mult}, N={num_nodes}, E={num_edges}"
+
+        try:
+            r = benchmark_transformer_block(
+                in_lvals, out_lvals, in_mult, out_mult,
+                num_nodes, num_edges, num_heads, dtype, use_amp
+            )
+            time_str = f"{r.time_ms:.2f}"
+            mem_str = f"{r.peak_mem_mb:.0f}"
+            results.append((config_str, r))
+        except torch.cuda.OutOfMemoryError:
+            time_str = mem_str = "OOM"
+            results.append((config_str, None))
+        clear_memory()
+
+        print_table_row([(config_str, 55), (time_str, 15), (mem_str, 15)])
+
+    return results
+
+
+def run_transformer_benchmark(dtype: torch.dtype, use_amp: bool = False):
+    """Benchmark EquivariantTransformer (full stack)."""
+    precision = "AMP" if use_amp else ("FP16" if dtype == torch.float16 else "FP32")
+    print_header(f"EquivariantTransformer ({precision})")
+
+    # Configurations: (in_lvals, hidden_lvals, out_lvals, in_mult, hidden_mult, out_mult,
+    #                  num_layers, num_nodes, num_edges, num_heads)
+    configs = [
+        # Small model
+        ([0, 1], [0, 1, 2], [0], 16, 32, 8, 2, 500, 5000, 4),
+        ([0, 1], [0, 1, 2], [0], 16, 32, 8, 4, 500, 5000, 4),
+        # Medium model
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 4, 1000, 10000, 8),
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 6, 1000, 10000, 8),
+        # Larger hidden lmax
+        ([0, 1], [0, 1, 2, 3, 4], [0], 32, 64, 16, 4, 1000, 10000, 8),
+        # Scaling with layers
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 2, 1000, 10000, 8),
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 4, 1000, 10000, 8),
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 8, 1000, 10000, 8),
+        # Scaling with graph size
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 4, 500, 5000, 8),
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 4, 1000, 10000, 8),
+        ([0, 1], [0, 1, 2], [0], 32, 64, 16, 4, 2000, 20000, 8),
+    ]
+
+    cols = [("Config", 70), ("Time (ms)", 12), ("Mem (MB)", 12), ("Params", 12)]
+    print_table_header(cols)
+
+    results = []
+    for (in_lvals, hidden_lvals, out_lvals, in_mult, hidden_mult, out_mult,
+         num_layers, num_nodes, num_edges, num_heads) in configs:
+
+        in_str = "".join(str(l) for l in in_lvals)
+        hid_str = "".join(str(l) for l in hidden_lvals)
+        out_str = "".join(str(l) for l in out_lvals)
+        config_str = (f"L:{in_str}->{hid_str}->{out_str}, M:{in_mult}/{hidden_mult}/{out_mult}, "
+                      f"D={num_layers}, N={num_nodes}, E={num_edges}")
+
+        try:
+            r = benchmark_transformer(
+                in_lvals, hidden_lvals, out_lvals,
+                in_mult, hidden_mult, out_mult,
+                num_layers, num_nodes, num_edges, num_heads, dtype, use_amp
+            )
+            time_str = f"{r.time_ms:.1f}"
+            mem_str = f"{r.peak_mem_mb:.0f}"
+            params_str = f"{r.extra['num_params'] / 1e6:.2f}M"
+            results.append((config_str, r))
+        except torch.cuda.OutOfMemoryError:
+            time_str = mem_str = params_str = "OOM"
+            results.append((config_str, None))
+        clear_memory()
+
+        print_table_row([(config_str, 70), (time_str, 12), (mem_str, 12), (params_str, 12)])
+
+    # Scaling analysis
+    print("\nScaling Analysis:")
+    cols = [("Config", 70), ("ms/layer", 12), ("ms/1K edges", 12)]
+    print_table_header(cols)
+
+    for config_str, r in results:
+        if r:
+            ms_per_layer = r.time_ms / r.extra["num_layers"]
+            # Parse edges from config string
+            e_part = [p for p in config_str.split(", ") if p.startswith("E=")][0]
+            num_edges = int(e_part.split("=")[1])
+            ms_per_1k = r.time_ms / (num_edges / 1000)
+            print_table_row([
+                (config_str, 70), (f"{ms_per_layer:.2f}", 12), (f"{ms_per_1k:.3f}", 12)
+            ])
+
+    return results
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -713,6 +961,12 @@ def main():
     # S2Activation benchmarks
     run_s2_activation_benchmark(torch.float32)
     run_s2_activation_benchmark(torch.float32, use_amp=True)
+
+    # Transformer benchmarks
+    run_transformer_block_benchmark(torch.float32)
+    run_transformer_block_benchmark(torch.float32, use_amp=True)
+    run_transformer_benchmark(torch.float32)
+    run_transformer_benchmark(torch.float32, use_amp=True)
 
 
 if __name__ == "__main__":

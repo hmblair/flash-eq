@@ -34,19 +34,115 @@ cuBLAS GEMMs with AMP use Tensor Cores efficiently, giving SE3-Transformer a sig
 
 **RESOLVED:** FP16 inputs are now promoted to FP32 for `matrix_exp`, then cast back. The `_apply` override keeps generators in FP32 when `.half()` is called, while FP64 inputs use FP64 generators for full precision. See commit `2ce4693`.
 
-## Add S2Activation to EquivariantTransformerBlock
+## Integrate Separable S² Activation into Transformer Block
 
-The current `EquivariantTransformerBlock` uses `EquivariantGating` for nonlinearity, but `S2Activation` (spherical grid sampling + MLP) may provide better expressivity as used in EquiformerV2.
+The current `EquivariantTransformerBlock` uses `EquivariantGating` for nonlinearity, but EquiformerV2 demonstrates that **Separable S² activation** improves force MAE by ~5% on OC20 S2EF.
 
-**Options:**
-1. Replace `EquivariantGating` with `S2Activation` in the MLP
-2. Add `S2Activation` as an optional nonlinearity (configurable)
-3. Use both: gating for the attention path, S2Activation for the MLP
+**Current state:** `S2Activation` exists in `flash_eq/layers/s2_activation.py` but is not integrated into the transformer.
+
+**EquiformerV2's Separable S² pattern:**
+1. **Separate scalar and higher-degree paths:**
+   - Scalars (l=0): Standard SiLU activation
+   - Higher degrees (l>0): S²[MLP → SiLU → MLP] on spherical grid
+2. **Gate higher degrees by scalar features** after S² activation
+
+**Implementation options:**
+1. Replace `EquivariantGating` with Separable S² in the MLP (recommended)
+2. Add as configurable option (`activation="s2"` vs `activation="gate"`)
+3. Use both: gating for attention path, S² for MLP
 
 **Considerations:**
-- S2Activation has higher memory cost due to grid expansion (770 points at precision=47)
+- S²Activation has higher memory cost due to grid expansion (770 points at precision=47)
 - Benchmark shows ~2-5ms per 1K-2K nodes, adding ~15-25% overhead to block time
 - May need gradient checkpointing for large graphs
+- The separable design reduces cost vs applying S² to all degrees
+
+**Sources:**
+- EquiformerV2 (ICLR 2024), Section 3.3: https://arxiv.org/abs/2306.12059
+- Complete Guide to Spherical Equivariant Graph Transformers: https://arxiv.org/abs/2512.13927
+
+## Add Stochastic Depth Regularization
+
+EquiformerV2 uses stochastic depth (drop path) for regularization, which is standard in modern vision transformers but missing from the current implementation.
+
+**What it does:** Randomly drops entire residual blocks during training with probability p, scaling surviving paths by 1/(1-p). At inference, all paths are active.
+
+**EquiformerV2 settings:**
+- Drop rate: 0.05-0.1 (increases linearly with depth)
+- Applied to both attention and MLP residual paths
+
+**Implementation:**
+```python
+class StochasticDepth(nn.Module):
+    def __init__(self, drop_prob: float = 0.1):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x + residual
+        keep_prob = 1.0 - self.drop_prob
+        mask = torch.rand(x.shape[0], 1, 1, device=x.device) < keep_prob
+        return x + residual * mask / keep_prob
+```
+
+**In EquivariantTransformerBlock:**
+- Add `drop_path` parameter (default 0.0 for backward compatibility)
+- Apply to `h = h + attn_out` and `h = h + mlp_out` lines
+- In `EquivariantTransformer`, compute drop rates per layer: `[drop_path * i / (num_layers - 1) for i in range(num_layers)]`
+
+**Sources:**
+- EquiformerV2 (ICLR 2024): https://arxiv.org/abs/2306.12059
+- Deep Networks with Stochastic Depth (Huang et al., 2016): https://arxiv.org/abs/1603.09382
+
+## Redesign FFN with Separable Pattern
+
+The current MLP in `EquivariantTransformerBlock` applies `EquivariantLinear → EquivariantGating → EquivariantLinear` uniformly to all degrees. EquiformerV2 uses a more expressive separable design.
+
+**Current implementation:**
+```python
+self.mlp = nn.Sequential(
+    EquivariantLinear(repr, hidden_repr),
+    EquivariantGating(hidden_repr),
+    EquivariantLinear(hidden_repr, repr),
+)
+```
+
+**EquiformerV2's separable FFN:**
+1. **Split features by degree:**
+   - Extract scalar (l=0) and higher-degree (l>0) components
+2. **Process separately:**
+   - Scalars: Linear → SiLU → Linear (standard MLP)
+   - Higher degrees: Linear → S²[MLP → SiLU → MLP] → Linear
+3. **Gate higher degrees by scalars** (optional, adds expressivity)
+4. **Concatenate outputs**
+
+**Benefits:**
+- More expressive nonlinearity for higher degrees via S² sampling
+- Scalars get efficient standard activation (no grid overhead)
+- Better gradient flow through scalar path
+
+**Implementation sketch:**
+```python
+class SeparableFFN(nn.Module):
+    def __init__(self, repr: Repr, hidden_mult: int = 4):
+        # Scalar MLP
+        scalar_dim = repr.mult  # l=0 has mult channels
+        self.scalar_mlp = nn.Sequential(
+            nn.Linear(scalar_dim, scalar_dim * hidden_mult),
+            nn.SiLU(),
+            nn.Linear(scalar_dim * hidden_mult, scalar_dim),
+        )
+        # Higher-degree path with S² activation
+        higher_repr = Repr(lvals=repr.lvals[repr.lvals > 0], mult=repr.mult)
+        self.higher_linear1 = EquivariantLinear(higher_repr, higher_repr)
+        self.s2_act = S2Activation(higher_repr, hidden_mult=2)
+        self.higher_linear2 = EquivariantLinear(higher_repr, higher_repr)
+```
+
+**Sources:**
+- EquiformerV2 (ICLR 2024), Section 3.3: https://arxiv.org/abs/2306.12059
+- EGraFFBench (2024): https://pubs.rsc.org/en/content/articlehtml/2024/dd/d4dd00027g
 
 ## NVIDIA SE3-Transformer Weight Transfer
 

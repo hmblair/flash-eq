@@ -184,7 +184,7 @@ class BinnedModule(nn.Module):
         Returns:
             Table of shape (num_bins+1, ...) where ... is the module output shape.
         """
-        return self.module(self.bin_edges.unsqueeze(-1))
+        return self.module(self.bin_edges.unsqueeze(-1))  # type: ignore[operator]
 
     def bin_indices(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute bin indices and interpolation weights for given values.

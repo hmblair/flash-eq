@@ -126,8 +126,8 @@ class WignerDBasis(nn.Module):
         Q_std = self._wigner_out.rot_to_ez(directions).mT
 
         # Permute to m-first order for block-diagonal structure
-        P = P_std[..., self._perm_in]
-        Q = Q_std[..., self._perm_out]
+        P = P_std[..., self._perm_in]  # type: ignore[index]
+        Q = Q_std[..., self._perm_out]  # type: ignore[index]
 
         return P, Q
 

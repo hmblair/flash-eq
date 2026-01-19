@@ -7,7 +7,7 @@ Tests rotation invariance (RepNorm) and equivariance (other layers).
 import math
 import torch
 import pytest
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from flash_eq import (
     Repr, WignerD,

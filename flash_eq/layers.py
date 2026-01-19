@@ -72,7 +72,7 @@ class RepNorm(nn.Module):
             *sq.shape[:-1], self.num_reps,
             device=sq.device, dtype=sq.dtype
         )
-        ix = self.indices.expand(sq.shape)
+        ix = self.indices.expand(sq.shape)  # type: ignore[operator]
         result.scatter_add_(-1, ix, sq)
 
         return result.sqrt()
@@ -136,6 +136,7 @@ class EquivariantLinear(nn.Module):
         # Bias only for scalar (degree-0) components
         nscalar, scalar_locs = in_repr.find_scalar()
         self.scalar_locs = scalar_locs
+        self.bias: nn.Parameter | None
 
         if nscalar > 0 and bias:
             self.bias = nn.Parameter(
@@ -164,7 +165,7 @@ class EquivariantLinear(nn.Module):
         out = (self.weight @ f).view(*b, *self.outdims)
 
         # Gather components for each degree
-        ix = self.indices.expand(*b, *self.expanddims)
+        ix = self.indices.expand(*b, *self.expanddims)  # type: ignore[operator]
         out = out.gather(dim=GATHER_DIM, index=ix).squeeze(GATHER_DIM)
 
         # Add bias and activation to scalar components
@@ -406,7 +407,7 @@ class SeparableEquivariantLayerNorm(nn.Module):
             out[..., self.scalar_locs] = self.scalar_norm(f[..., self.scalar_locs])
 
         if self.nhigher > 0:
-            out[..., self.higher_mask] = self.higher_norm(f[..., self.higher_mask])
+            out[..., self.higher_mask] = self.higher_norm(f[..., self.higher_mask])  # type: ignore[index]
 
         return out
 

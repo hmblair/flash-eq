@@ -127,7 +127,7 @@ class Irrep:
 
         for m in range(-self.l, 0):
             q[self.l + m, self.l + abs(m)] = SQRT2
-            q[self.l + m, self.l - abs(m)] = -1j * SQRT2
+            q[self.l + m, self.l - abs(m)] = -1j * SQRT2  # type: ignore[assignment]
 
         for m in range(1, self.l + 1):
             q[self.l + m, self.l + abs(m)] = (-1)**m * SQRT2
@@ -359,7 +359,7 @@ class WignerD(nn.Module):
 
         dim = self.repr.dim()
         *b, _ = axis.size()
-        gens = (axis @ self.generators).view(*b, dim, dim)
+        gens = (axis @ self.generators).view(*b, dim, dim)  # type: ignore[operator]
 
         rot = torch.linalg.matrix_exp(angle[..., None, None] * gens)
         rot = torch.nan_to_num(rot, 0.0)

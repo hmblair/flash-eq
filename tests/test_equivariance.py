@@ -11,7 +11,7 @@ import math
 import numpy as np
 import torch
 import pytest
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from flash_eq import Repr, WignerD, EquivariantEdgewiseLinear, WignerDBasis
 

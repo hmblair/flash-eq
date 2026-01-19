@@ -204,9 +204,9 @@ class _BlockDiagonalFunction(Function):
 
         ctx.save_for_backward(features_sorted, radial_table, bin_lo_sorted,
                               interp_weight_sorted, lvals_in, lvals_out, sort_idx, unsort_idx)
-        ctx.dim_in = features.size(2)
-        ctx.max_in_size = max_in_size
-        ctx.max_out_size = max_out_size
+        ctx.dim_in = features.size(2)  # type: ignore[attr-defined]
+        ctx.max_in_size = max_in_size  # type: ignore[attr-defined]
+        ctx.max_out_size = max_out_size  # type: ignore[attr-defined]
 
         return output
 
@@ -216,7 +216,7 @@ class _BlockDiagonalFunction(Function):
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, ...]:
         (features_sorted, radial_table, bin_lo_sorted, interp_weight_sorted,
-         lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors
+         lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors  # type: ignore[attr-defined]
         cuda_module = _get_cuda_module()
 
         # Sort grad_output to match the sorted forward pass order
@@ -230,9 +230,9 @@ class _BlockDiagonalFunction(Function):
             interp_weight_sorted,
             lvals_in,
             lvals_out,
-            ctx.dim_in,
-            ctx.max_in_size,
-            ctx.max_out_size
+            ctx.dim_in,  # type: ignore[attr-defined]
+            ctx.max_in_size,  # type: ignore[attr-defined]
+            ctx.max_out_size,  # type: ignore[attr-defined]
         )
 
         # Unsort gradients back to original edge order

@@ -30,7 +30,10 @@ def random_rotation(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate random SO(3) rotation(s) as axis-angle representation.
+    """Generate random SO(3) rotation(s) uniform w.r.t. Haar measure.
+
+    Samples rotations uniformly on SO(3) by generating unit quaternions
+    uniformly on S³, then converting to axis-angle representation.
 
     Args:
         shape: Batch shape for the output tensors. Default () returns unbatched.
@@ -39,7 +42,7 @@ def random_rotation(
 
     Returns:
         axis: (*shape, 3) unit vectors representing rotation axes
-        angle: (*shape,) rotation angles in radians [0, 2π)
+        angle: (*shape,) rotation angles in radians [0, π]
 
     Example:
         >>> axis, angle = random_rotation()  # Single rotation
@@ -54,12 +57,39 @@ def random_rotation(
         >>> axis.shape, angle.shape
         (torch.Size([2, 3, 3]), torch.Size([2, 3]))
     """
-    # Random unit vector (uniform on sphere)
-    axis = torch.randn((*shape, 3), device=device, dtype=dtype)
-    axis = axis / axis.norm(dim=-1, keepdim=True)
+    # Sample unit quaternion uniformly on S³ (gives Haar measure on SO(3))
+    # Quaternion: q = [w, x, y, z] = [cos(θ/2), sin(θ/2) * axis]
+    q = torch.randn((*shape, 4), device=device, dtype=dtype)
+    q = q / q.norm(dim=-1, keepdim=True)
 
-    # Random angle in [0, 2π)
-    angle = torch.rand(shape, device=device, dtype=dtype) * 2 * math.pi
+    # Ensure w >= 0 (choose canonical quaternion, since q and -q represent same rotation)
+    sign = torch.sign(q[..., 0:1])
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    q = q * sign
+
+    # Convert to axis-angle
+    w = q[..., 0]
+    xyz = q[..., 1:]
+
+    # angle = 2 * arccos(w), but w is clamped for numerical stability
+    half_angle = torch.acos(w.clamp(-1.0, 1.0))
+    angle = 2 * half_angle
+
+    # axis = xyz / sin(θ/2), with special handling for small angles
+    sin_half = torch.sin(half_angle)
+    # For small angles, sin(θ/2) ≈ θ/2, and axis direction doesn't matter much
+    # Use a default axis [0, 0, 1] when sin_half is too small
+    small_angle = sin_half < 1e-6
+    safe_sin_half = torch.where(small_angle, torch.ones_like(sin_half), sin_half)
+    axis = xyz / safe_sin_half[..., None]
+
+    # For small angles, set axis to [0, 0, 1] (arbitrary but consistent)
+    default_axis = torch.zeros_like(axis)
+    default_axis[..., 2] = 1.0
+    axis = torch.where(small_angle[..., None], default_axis, axis)
+
+    # Normalize axis (should already be unit, but ensure numerical stability)
+    axis = axis / (axis.norm(dim=-1, keepdim=True) + 1e-8)
 
     return axis, angle
 

@@ -7,35 +7,12 @@ Tests that the layer satisfies SO(3)-equivariance:
 where D_in, D_out are Wigner-D rotation matrices and R is the 3x3 rotation matrix.
 """
 
-import math
-import numpy as np
 import torch
 import pytest
-from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from flash_eq import Repr, WignerD, EquivariantEdgewiseLinear, WignerDBasis
 
-
-def random_rotation(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate a random rotation.
-
-    Returns:
-        axis: (1, 3) rotation axis
-        angle: (1,) rotation angle
-        R: (3, 3) rotation matrix
-    """
-    axis_np = torch.randn(3).numpy()
-    axis_np = axis_np / (axis_np ** 2).sum() ** 0.5
-    angle_np = float(torch.rand(1) * 2 * math.pi)
-
-    rotvec = axis_np * angle_np
-    R_np = Rotation.from_rotvec(rotvec).as_matrix()
-
-    axis = torch.tensor(axis_np, device=device, dtype=torch.float32).unsqueeze(0)
-    angle = torch.tensor([angle_np], device=device, dtype=torch.float32)
-    R = torch.tensor(R_np, device=device, dtype=torch.float32)
-
-    return axis, angle, R
+from .helpers import random_rotation, check_equivariance
 
 
 # Test configurations: (lvals_in, lvals_out)
@@ -108,8 +85,7 @@ def test_equivariance(cuda_device, lvals_in, lvals_out):
     assert output_mag > 0.01, f"Output too small: {output_mag:.2e}"
 
     # Check equivariance
-    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
-    assert rel_diff < 1e-4, f"Equivariance failed: rel_diff={rel_diff:.2e}"
+    check_equivariance(output1_rotated, output2, rtol=1e-4)
 
 
 @pytest.mark.parametrize("lvals_in,lvals_out", LVALS_CONFIGS[:5])  # Subset for speed
@@ -151,8 +127,7 @@ def test_equivariance_multiple_rotations(cuda_device, lvals_in, lvals_out):
         P_rot, Q_rot = basis(directions_rotated)
         output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
 
-        rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
-        assert rel_diff < 1e-4, f"Rotation {i+1} failed: rel_diff={rel_diff:.2e}"
+        check_equivariance(output1_rotated, output2, rtol=1e-4, msg=f"Rotation {i+1}")
 
 
 def test_equivariance_high_lmax(cuda_device):
@@ -190,8 +165,7 @@ def test_equivariance_high_lmax(cuda_device):
     P_rot, Q_rot = basis(directions_rotated)
     output2 = layer(P_rot, Q_rot, node_features_rotated, distances, src_indices)
 
-    rel_diff = (output1_rotated - output2).abs().max().item() / (output1_rotated.abs().max().item() + 1e-8)
-    assert rel_diff < 1e-4, f"Equivariance failed: rel_diff={rel_diff:.2e}"
+    check_equivariance(output1_rotated, output2, rtol=1e-4, msg="High lmax equivariance")
 
 
 @pytest.mark.parametrize("lvals", [
@@ -267,6 +241,4 @@ def test_gradient_equivariance(cuda_device, lvals):
         f"Losses should be equal for invariant loss: {loss1.item():.6f} vs {loss2.item():.6f}"
 
     # Compare: D @ grad1 should equal grad2
-    rel_diff = (grad1_rotated - grad2).abs().max().item() / (grad1_rotated.abs().max().item() + 1e-8)
-
-    assert rel_diff < 1e-4, f"Gradient equivariance failed: rel_diff={rel_diff:.2e}"
+    check_equivariance(grad1_rotated, grad2, rtol=1e-4, msg="Gradient equivariance")

@@ -13,15 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..utils import get_epsilon
-
-
-def _init_weights(module: nn.Module) -> None:
-    """Initialize weights using Xavier uniform for linear layers."""
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+from ..utils import get_epsilon, init_linear_weights
 
 
 class RadialBasisFunctions(nn.Module):
@@ -121,7 +113,7 @@ class RadialMLP(nn.Module):
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.mlp = nn.Sequential(*layers)
 
-        self.apply(_init_weights)
+        self.apply(init_linear_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute weights from distances.

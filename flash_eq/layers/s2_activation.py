@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from ..representations import Repr
 from ..spherical import S2Grid
+from ..utils import init_linear_weights
 
 
 class S2Activation(nn.Module):
@@ -89,26 +90,17 @@ class S2Activation(nn.Module):
         self.register_buffer('Y_T', Y_subset.T.float().contiguous())        # (dim, n_points)
         self.register_buffer('Y_inv_T', Y_inv_subset.T.float().contiguous())  # (n_points, dim)
 
-        # Channel-wise MLP using Conv1d (avoids transpose operations)
-        # Conv1d with kernel_size=1 mixes channels at each grid point
+        # Channel-wise MLP using Linear (better fusion under torch.compile)
         hidden_dim = self.mult * hidden_mult
         act_fn = activation if activation is not None else nn.SiLU()
 
         self.mlp = nn.Sequential(
-            nn.Conv1d(self.mult, hidden_dim, 1),
+            nn.Linear(self.mult, hidden_dim),
             act_fn,
-            nn.Conv1d(hidden_dim, self.mult, 1),
+            nn.Linear(hidden_dim, self.mult),
         )
 
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize MLP weights."""
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Conv1d):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        self.apply(init_linear_weights)
 
     def forward(self, f: torch.Tensor) -> torch.Tensor:
         """Apply S² activation.
@@ -122,12 +114,9 @@ class S2Activation(nn.Module):
         # To grid: (..., mult, n_points)
         f_grid = f @ self.Y_T
 
-        # Apply Conv1d MLP across channels at each grid point
-        # Conv1d expects (batch, channels, length) = (batch, mult, n_points)
-        batch_shape = f_grid.shape[:-2]
-        f_grid = f_grid.view(-1, self.mult, self.n_points)
-        f_grid = self.mlp(f_grid)
-        f_grid = f_grid.view(*batch_shape, self.mult, self.n_points)
+        # Apply MLP across channels at each grid point
+        # Linear operates on last dim, so transpose: (..., mult, n_points) -> (..., n_points, mult)
+        f_grid = self.mlp(f_grid.transpose(-1, -2)).transpose(-1, -2)
 
         # Back to SH: (..., mult, dim)
         return f_grid @ self.Y_inv_T

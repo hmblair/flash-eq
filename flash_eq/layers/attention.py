@@ -228,7 +228,7 @@ class EquivariantAttention(nn.Module):
         >>>
         >>> repr = Repr(lvals=[0, 1, 2], mult=32)
         >>> layer = EquivariantAttention(repr, repr, num_heads=4).cuda()
-        >>> basis = WignerDBasis(repr, repr).cuda()
+        >>> basis = WignerDBasis([repr, repr]).cuda()
         >>>
         >>> # Graph data
         >>> P, Q = basis(directions)

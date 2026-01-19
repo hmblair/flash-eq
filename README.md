@@ -22,7 +22,7 @@ out_repr = Repr(lvals=[0, 1, 2], mult=32)
 
 # Create layer and basis
 layer = EquivariantEdgewiseLinear(in_repr, out_repr).cuda()
-basis = WignerDBasis(in_repr, out_repr).cuda()
+basis = WignerDBasis([in_repr, out_repr]).cuda()
 
 # Input data
 num_nodes, num_edges = 1000, 5000
@@ -33,7 +33,7 @@ directions = directions / directions.norm(dim=-1, keepdim=True)
 distances = torch.rand(num_edges, device='cuda') * 10.0
 
 # Compute basis matrices (once per forward pass, shared across layers)
-P, Q = basis(directions)
+P, Q = basis(directions)  # One matrix per repr in the input list
 
 # Apply layer
 output = layer(P, Q, node_features, distances, src_indices)
@@ -59,17 +59,27 @@ repr.mult     # 32
 
 ### WignerDBasis
 
-Computes the Wigner-D basis matrices P and Q from edge directions.
+Computes Wigner-D basis matrices from edge directions. Takes a list of representations
+and returns one matrix per representation, deduplicating by `lvals` for efficiency.
 
 ```python
 from flash_eq import WignerDBasis
 
-basis = WignerDBasis(in_repr, out_repr).cuda()
+# For a simple case with matching in/out representations:
+basis = WignerDBasis([in_repr, out_repr]).cuda()
+P, Q = basis(directions)  # One matrix per repr
 
-# directions: (num_edges, 3) unit vectors
-P, Q = basis(directions)
-# P: (num_edges, dim_in, dim_in)
-# Q: (num_edges, dim_out, dim_out)
+# For a transformer with different layer configurations:
+repr_in = Repr(lvals=[0, 1], mult=32)
+repr_hidden = Repr(lvals=[0, 1, 2, 3, 4], mult=64)
+repr_out = Repr(lvals=[0], mult=1)
+
+basis = WignerDBasis([repr_in, repr_hidden, repr_out]).cuda()
+M_in, M_hidden, M_out = basis(directions)
+
+# Layer 1 (in -> hidden): P=M_in, Q=M_hidden
+# Hidden layers (hidden -> hidden): P=M_hidden, Q=M_hidden
+# Final layer (hidden -> out): P=M_hidden, Q=M_out
 ```
 
 The basis matrices are computed once and shared across all layers in a network.

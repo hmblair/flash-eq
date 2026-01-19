@@ -22,7 +22,7 @@ def profile_kernels(lmax, num_nodes, num_edges, cin, cout, num_bins=100, dtype=t
         max_dist=10.0,
     ).to(device).to(dtype)
 
-    basis = WignerDBasis(in_repr, out_repr).to(device)
+    basis = WignerDBasis([in_repr, out_repr]).to(device)
 
     node_features = torch.randn(num_nodes, cin, dim, device=device, dtype=dtype)
     src_indices = torch.randint(0, num_nodes, (num_edges,), device=device, dtype=torch.int64)

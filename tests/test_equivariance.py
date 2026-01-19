@@ -53,7 +53,7 @@ def test_equivariance(cuda_device, lvals_in, lvals_out):
     out_repr = Repr(lvals=lvals_out, mult=mult)
 
     layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(cuda_device)
-    basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
     wigner_in = WignerD(in_repr).to(cuda_device)
     wigner_out = WignerD(out_repr).to(cuda_device)
 
@@ -103,7 +103,7 @@ def test_equivariance_multiple_rotations(cuda_device, lvals_in, lvals_out):
     out_repr = Repr(lvals=lvals_out, mult=mult)
 
     layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(cuda_device)
-    basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
     wigner_in = WignerD(in_repr).to(cuda_device)
     wigner_out = WignerD(out_repr).to(cuda_device)
 
@@ -144,7 +144,7 @@ def test_equivariance_high_lmax(cuda_device):
     out_repr = Repr(lvals=lvals, mult=mult)
 
     layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(cuda_device)
-    basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
     wigner = WignerD(in_repr).to(cuda_device)
 
     node_features = torch.randn(num_nodes, mult, dim, device=cuda_device)
@@ -195,7 +195,7 @@ def test_gradient_equivariance(cuda_device, lvals):
     out_repr = Repr(lvals=lvals, mult=mult)
 
     layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bins=50).to(cuda_device)
-    basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
     wigner = WignerD(in_repr).to(cuda_device)
 
     axis, angle, R = random_rotation(cuda_device)

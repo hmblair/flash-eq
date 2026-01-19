@@ -216,7 +216,7 @@ class TestFullPipeline:
         num_nodes, num_edges = 20, 100
 
         # Create layers
-        basis = WignerDBasis(repr, repr).to(device)
+        basis = WignerDBasis([repr, repr]).to(device)
         linear = EquivariantEdgewiseLinear(repr, repr).to(device)
         attn = EquivariantEdgeAttention(repr, num_heads=2, dropout=0.0).to(device)
         pool = GraphPooling(reduce='sum')

@@ -11,6 +11,8 @@ we avoid redundant computation in multi-layer networks.
 Reference: docs/theory.tex, Section 2
 """
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 
@@ -52,57 +54,70 @@ def _build_m_order_permutation(lvals: torch.Tensor) -> torch.Tensor:
 class WignerDBasis(nn.Module):
     """Compute Wigner-D basis matrices from direction vectors.
 
-    This class computes the P and Q matrices that transform between the
-    standard spherical harmonic basis and the m-diagonalized basis:
+    This class computes Wigner-D matrices that transform between the standard
+    spherical harmonic basis and the m-diagonalized basis used by equivariant
+    layers.
 
-        f_diag = P^T @ f_standard
-        f_standard = Q @ f_diag
-
-    The matrices P and Q are Wigner-D matrices with columns permuted to
-    m-first ordering. They depend only on the direction vectors, not on
-    any learnable parameters.
+    Takes a sequence of Repr objects and returns one matrix per repr. Internally
+    deduplicates by lvals (since multiplicity doesn't affect the matrix) for
+    computational efficiency.
 
     For efficiency, compute the basis once and pass to multiple layers:
 
-        basis = WignerDBasis(in_repr, out_repr)
-        P, Q = basis(directions)
+        basis = WignerDBasis([repr_in, repr_hidden, repr_out])
+        M_in, M_hidden, M_out = basis(directions)
 
-        out1 = layer1(features, distances, P=P, Q=Q)
-        out2 = layer2(out1, distances, P=P, Q=Q)
+        # Layer 1: in -> hidden
+        out1 = layer1(features, distances, P=M_in, Q=M_hidden)
+        # Layer 2: hidden -> hidden
+        out2 = layer2(out1, distances, P=M_hidden, Q=M_hidden)
+        # Layer 3: hidden -> out
+        out3 = layer3(out2, distances, P=M_hidden, Q=M_out)
 
     Args:
-        repr_in: Input representation (determines P matrix structure)
-        repr_out: Output representation (determines Q matrix structure)
+        reprs: Sequence of representations to compute matrices for.
 
     Example:
-        >>> repr_in = Repr(lvals=[0, 1, 2], mult=32)
-        >>> repr_out = Repr(lvals=[0, 1, 2], mult=32)
-        >>> basis = WignerDBasis(repr_in, repr_out)
+        >>> repr_in = Repr(lvals=[0, 1], mult=32)
+        >>> repr_hidden = Repr(lvals=[0, 1, 2], mult=64)
+        >>> repr_out = Repr(lvals=[0], mult=1)
+        >>> basis = WignerDBasis([repr_in, repr_hidden, repr_out])
         >>>
         >>> directions = torch.randn(1000, 3)
-        >>> P, Q = basis(directions)
-        >>> P.shape, Q.shape
-        (torch.Size([1000, 9, 9]), torch.Size([1000, 9, 9]))
+        >>> M_in, M_hidden, M_out = basis(directions)
+        >>> M_in.shape, M_hidden.shape, M_out.shape
+        (torch.Size([1000, 4, 4]), torch.Size([1000, 9, 9]), torch.Size([1000, 1, 1]))
     """
 
-    def __init__(self, repr_in: Repr, repr_out: Repr) -> None:
+    def __init__(self, reprs: Sequence[Repr]) -> None:
         super().__init__()
 
-        self.repr_in = repr_in
-        self.repr_out = repr_out
+        if len(reprs) == 0:
+            raise ValueError("reprs must contain at least one Repr")
 
-        # WignerD modules for computing rotations
-        self._wigner_in = WignerD(repr_in)
-        self._wigner_out = WignerD(repr_out)
+        self.reprs = list(reprs)
 
-        # Build m-order permutations
-        self.register_buffer('_perm_in', _build_m_order_permutation(repr_in.lvals))
-        self.register_buffer('_perm_out', _build_m_order_permutation(repr_out.lvals))
+        # Deduplicate by lvals (multiplicity doesn't affect the matrix)
+        # Map each input index to its unique lvals index
+        lvals_to_idx: dict[tuple[int, ...], int] = {}
+        self._input_to_unique: list[int] = []
+        unique_reprs: list[Repr] = []
 
-    def forward(
-        self,
-        directions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for repr in reprs:
+            lvals_key = tuple(repr.lvals.tolist())
+            if lvals_key not in lvals_to_idx:
+                lvals_to_idx[lvals_key] = len(unique_reprs)
+                unique_reprs.append(repr)
+            self._input_to_unique.append(lvals_to_idx[lvals_key])
+
+        self._num_unique = len(unique_reprs)
+
+        # Create WignerD modules and permutation buffers for unique reprs only
+        self._wigner_modules = nn.ModuleList([WignerD(r) for r in unique_reprs])
+        for i, repr in enumerate(unique_reprs):
+            self.register_buffer(f'_perm_{i}', _build_m_order_permutation(repr.lvals))
+
+    def forward(self, directions: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Compute Wigner-D basis matrices for given directions.
 
         Args:
@@ -110,8 +125,8 @@ class WignerDBasis(nn.Module):
                         (need not be normalized)
 
         Returns:
-            P: (batch, dim_in, dim_in) input basis matrix D(g_x)
-            Q: (batch, dim_out, dim_out) output basis matrix D(g_x)
+            Tuple of matrices, one per input Repr. Each matrix has shape
+            (batch, dim, dim) where dim is the representation dimension.
 
         Note:
             These are the Wigner-D matrices for the rotation g_x that takes
@@ -119,17 +134,19 @@ class WignerDBasis(nn.Module):
                 out = Q @ W @ P^T @ f
             where W is block-diagonal in the m-basis.
         """
-        # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
-        # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
-        # cartesian=True because directions are in Cartesian (x,y,z) coordinates
-        P_std = self._wigner_in.rot_to_ez(directions).mT
-        Q_std = self._wigner_out.rot_to_ez(directions).mT
+        # Compute matrices for unique lvals only
+        unique_matrices: list[torch.Tensor] = []
+        for i in range(self._num_unique):
+            # rot_to_ez returns D(g_x^{-1}) where g_x takes e_z to x
+            # We need D(g_x), so we transpose: D(g_x) = D(g_x^{-1})^T
+            M_std = self._wigner_modules[i].rot_to_ez(directions).mT
+            perm = getattr(self, f'_perm_{i}')
+            M = M_std[..., perm]
+            unique_matrices.append(M)
 
-        # Permute to m-first order for block-diagonal structure
-        P = P_std[..., self._perm_in]  # type: ignore[index]
-        Q = Q_std[..., self._perm_out]  # type: ignore[index]
-
-        return P, Q
+        # Map back to input order
+        return tuple(unique_matrices[idx] for idx in self._input_to_unique)
 
     def extra_repr(self) -> str:
-        return f"repr_in={self.repr_in}, repr_out={self.repr_out}"
+        repr_strs = [str(r) for r in self.reprs]
+        return f"reprs=[{', '.join(repr_strs)}], num_unique={self._num_unique}"

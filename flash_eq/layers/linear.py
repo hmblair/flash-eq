@@ -47,7 +47,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         >>> out_repr = Repr(lvals=[0, 1, 2], mult=32)
         >>>
         >>> layer = EquivariantEdgewiseLinear(in_repr, out_repr).cuda()
-        >>> basis = WignerDBasis(in_repr, out_repr).cuda()
+        >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>>
         >>> # Compute basis matrices from edge directions
         >>> P, Q = basis(directions)  # directions: (num_edges, 3)

@@ -208,7 +208,7 @@ def benchmark_flash_eq(
     layer = EquivariantEdgewiseLinear(
         in_repr, out_repr, num_bins=num_bins, min_dist=0.0, max_dist=10.0
     ).to(device).to(dtype)
-    basis = WignerDBasis(in_repr, out_repr).to(device)
+    basis = WignerDBasis([in_repr, out_repr]).to(device)
     optimizer = torch.optim.Adam(layer.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -251,7 +251,7 @@ def benchmark_basis_computation(
     dim = sum(2 * l + 1 for l in lvals)
     repr_in = Repr(lvals=lvals, mult=1)
     repr_out = Repr(lvals=lvals, mult=1)
-    basis = WignerDBasis(repr_in, repr_out).to(device)
+    basis = WignerDBasis([repr_in, repr_out]).to(device)
 
     directions = torch.randn(num_edges, 3, device=device, dtype=dtype)
     directions = directions / directions.norm(dim=-1, keepdim=True)

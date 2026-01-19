@@ -23,7 +23,7 @@ class TestEmptyInputs:
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_nodes = 10
         num_edges = 0
@@ -44,7 +44,7 @@ class TestEmptyInputs:
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_nodes = 10
         num_edges = 1
@@ -66,7 +66,7 @@ class TestEmptyInputs:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_nodes = 1
         num_edges = 5
@@ -91,7 +91,7 @@ class TestNumericalEdgeCases:
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        basis = WignerDBasis([in_repr, out_repr]).to(device)
 
         # Include zero direction
         directions = torch.tensor([
@@ -108,7 +108,7 @@ class TestNumericalEdgeCases:
     def test_near_zero_directions(self, device):
         """Very small directions should not cause NaN."""
         in_repr = Repr(lvals=[0, 1], mult=2)
-        basis = WignerDBasis(in_repr, in_repr).to(device)
+        basis = WignerDBasis([in_repr, in_repr]).to(device)
 
         directions = torch.tensor([
             [1e-10, 1e-10, 1e-10],
@@ -123,7 +123,7 @@ class TestNumericalEdgeCases:
     def test_axis_aligned_directions(self, device):
         """Axis-aligned directions (edge case for cross product)."""
         in_repr = Repr(lvals=[0, 1, 2], mult=2)
-        basis = WignerDBasis(in_repr, in_repr).to(device)
+        basis = WignerDBasis([in_repr, in_repr]).to(device)
 
         # +z and -z are edge cases (cross product with e_z is zero)
         directions = torch.tensor([
@@ -144,7 +144,7 @@ class TestNumericalEdgeCases:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 5
         node_features = torch.randn(10, 2, 4, device=cuda_device)
@@ -166,7 +166,7 @@ class TestNumericalEdgeCases:
         layer = EquivariantEdgewiseLinear(
             in_repr, out_repr, min_dist=0.0, max_dist=10.0
         ).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 4
         node_features = torch.randn(10, 2, 4, device=cuda_device)
@@ -221,7 +221,7 @@ class TestDtypes:
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device).half()
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 50
         node_features = torch.randn(20, 4, 9, device=cuda_device, dtype=torch.float16)
@@ -260,7 +260,7 @@ class TestDtypes:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device).double()
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device).double()
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device).double()
 
         num_edges = 20
         node_features = torch.randn(10, 2, 4, device=cuda_device, dtype=torch.float64)
@@ -368,7 +368,7 @@ class TestDegenerateGraphs:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_nodes = 5
         num_edges = 10
@@ -390,7 +390,7 @@ class TestDegenerateGraphs:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_nodes = 10
         num_edges = 50
@@ -411,7 +411,7 @@ class TestDegenerateGraphs:
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 20
         node_features = torch.randn(10, 4, 9, device=cuda_device)
@@ -431,7 +431,7 @@ class TestDegenerateGraphs:
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
-        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
 
         num_edges = 20
         node_features = torch.randn(10, 2, 4, device=cuda_device)

@@ -78,3 +78,37 @@ This suggests Flash-EQ's block-diagonal structure cannot represent the same func
 4. **Different basis for Flash-EQ** - Modify Flash-EQ to use CG-basis instead of Wigner-D. Would lose the block-diagonal structure but enable direct weight loading.
 
 5. **Sparse conversion matrix** - Investigate whether a sparse/structured transformation exists between the two weight spaces that we missed.
+
+## Training Validation
+
+### Denoising Training Script
+
+Create a minimal training script to verify the model can learn, using ciffy for data loading.
+
+**Task:** Coordinate denoising
+- Add Gaussian noise to atom coordinates
+- Predict displacement vectors to recover original positions
+- Loss: MSE between predicted and true displacements
+
+**Data pipeline (using ciffy):**
+1. Load CIF structures via `ciffy.load(path, backend="torch")`
+2. Build k-NN graph with `build_knn_graph(coords, k=16)`
+3. Extract edges: `src`, `dst`, `directions`, `distances`
+4. Compute spherical harmonic features from directions via `WignerDBasis`
+
+**Model:**
+- Input: noisy coordinates → spherical tensor features (l=0,1,2)
+- Layers: 2-4 `EquivariantEdgewiseLinear` blocks
+- Output: displacement vectors (l=1 only, equivariant)
+
+**Training loop:**
+1. Sample batch of structures
+2. Add noise: `noisy_coords = coords + noise * randn`
+3. Forward pass → predicted displacements
+4. Loss: `MSE(pred_displacement, -noise)`
+5. Verify loss decreases over epochs
+
+**Success criteria:**
+- Overfit single structure (loss → 0)
+- Generalize across multiple structures (loss decreases)
+- Equivariance preserved (rotate input → output rotates accordingly)

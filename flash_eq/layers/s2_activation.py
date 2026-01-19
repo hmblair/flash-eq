@@ -79,10 +79,11 @@ class S2Activation(nn.Module):
         weights = grid.weights
 
         # Recompute inverse transform for the subset
+        # Use lstsq to handle duplicate l values (which create linearly dependent columns)
         W = torch.diag(weights)
         YtW = Y_subset.T @ W
         YtWY = YtW @ Y_subset
-        Y_inv_subset = torch.linalg.solve(YtWY, YtW)  # (dim, n_points)
+        Y_inv_subset = torch.linalg.lstsq(YtWY, YtW).solution  # (dim, n_points)
 
         # Store transposed matrices to avoid transpose in forward pass
         self.register_buffer('Y_T', Y_subset.T.float().contiguous())        # (dim, n_points)

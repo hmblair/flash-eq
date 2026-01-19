@@ -26,6 +26,11 @@ LVALS_CONFIGS = [
     [1, 2],
     [0, 2],  # non-contiguous
     [0, 1, 2, 3],
+    # Duplicate l values
+    [0, 0],
+    [1, 1],
+    [0, 1, 1],
+    [1, 2, 2],
 ]
 
 MULT_CONFIGS = [1, 4, 16]

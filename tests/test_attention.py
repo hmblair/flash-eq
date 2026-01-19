@@ -30,6 +30,9 @@ REPR_CONFIGS = [
     ([0, 1], 4),
     ([0, 1, 2], 8),
     ([0, 1, 2], 16),
+    # Duplicate l values
+    ([0, 0, 1], 4),
+    ([0, 1, 1, 2], 8),
 ]
 
 NUM_HEADS_CONFIGS = [1, 2, 4]

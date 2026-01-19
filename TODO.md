@@ -30,6 +30,20 @@ cuBLAS GEMMs with AMP use Tensor Cores efficiently, giving SE3-Transformer a sig
 
 **Note:** Flash-eq still provides 5-40x memory savings across all configurations, enabling larger batch sizes and models that would otherwise OOM.
 
+## FP16 Numerical Stability in Wigner-D Computation
+
+The `WignerD.rot()` method uses `torch.linalg.matrix_exp` which may be numerically unstable in FP16. Currently no dtype enforcement is applied, so FP16 inputs will compute in FP16.
+
+**Investigation needed:**
+1. Quantify error in Wigner-D matrices at FP16 vs FP32 for various L values
+2. Determine if errors are acceptable for typical use cases (training with AMP)
+3. If not acceptable, explore efficient solutions:
+   - Store generators in both FP32 and FP16, select based on input dtype
+   - Use a more stable algorithm for computing rotation matrices
+   - Only promote to FP32 for high-L where errors compound
+
+**Note:** The previous `@torch.amp.custom_fwd(cast_inputs=torch.float32)` decorator was removed because it broke FP64 support. Any solution should preserve FP64 compatibility.
+
 ## NVIDIA SE3-Transformer Weight Transfer
 
 ### Goal

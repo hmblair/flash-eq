@@ -300,6 +300,120 @@ class EquivariantLayerNorm(nn.Module):
         return f * norms_r[..., self.ix]
 
 
+class _ChannelLayerNorm(nn.Module):
+    """LayerNorm for scalar components, normalizing over channel dimension.
+
+    Standard LayerNorm normalizes over the last dim. This variant normalizes
+    over dim=-2 (channel/multiplicity), suitable for scalar irrep components.
+    """
+
+    def __init__(self, mult: int, nscalar: int, epsilon: float | None = None) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(mult, nscalar))
+        self.bias = nn.Parameter(torch.zeros(mult, nscalar))
+        self._epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        epsilon = self._epsilon if self._epsilon is not None else get_epsilon(x.dtype)
+        mu = x.mean(dim=-2, keepdim=True)
+        sigma = x.std(dim=-2, keepdim=True, unbiased=False)
+        return (x - mu) / (sigma + epsilon) * self.weight + self.bias
+
+
+class _EquivariantRMSNorm(nn.Module):
+    """RMS normalization for higher-degree components with per-channel scale.
+
+    Computes a single RMS value across all channels and spatial dimensions,
+    then applies per-channel learnable scaling. This preserves relative
+    magnitudes between different L>0 degrees.
+    """
+
+    def __init__(self, mult: int, epsilon: float | None = None) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(mult))
+        self._epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        epsilon = self._epsilon if self._epsilon is not None else get_epsilon(x.dtype)
+        rms = torch.sqrt((x ** 2).mean(dim=(-2, -1), keepdim=True) + epsilon)
+        return x * (self.weight[..., None] / rms)
+
+
+class SeparableEquivariantLayerNorm(nn.Module):
+    """Separable equivariant layer normalization (EquiformerV2).
+
+    Unlike standard EquivariantLayerNorm which normalizes each degree
+    independently, this version:
+    - For L=0 (scalars): applies standard LayerNorm with mean/std and
+      learnable scale (γ) and bias (β)
+    - For L>0 (higher degrees): normalizes by a shared RMS computed across
+      all higher degrees, preserving relative magnitudes between degrees
+
+    This design preserves the relative importance of different degrees,
+    which improves force predictions where angular information matters.
+
+    Reference: EquiformerV2 (Liao et al., ICLR 2024), Section 3.4
+
+    Args:
+        repr: The representation of input tensors.
+        epsilon: Small constant for numerical stability.
+
+    Example:
+        >>> repr = Repr(lvals=[0, 1, 2], mult=8)
+        >>> ln = SeparableEquivariantLayerNorm(repr)
+        >>> x = torch.randn(32, 8, 9)
+        >>> y = ln(x)
+    """
+
+    def __init__(
+        self,
+        repr: Repr,
+        epsilon: float | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.repr = repr
+
+        # Find scalar and higher-degree components
+        nscalar, scalar_locs = repr.find_scalar()
+        self.scalar_locs = scalar_locs
+        self.nscalar = nscalar
+
+        higher_mask = torch.ones(repr.dim(), dtype=torch.bool)
+        higher_mask[scalar_locs] = False
+        self.register_buffer('higher_mask', higher_mask)
+        self.nhigher = repr.nreps() - nscalar
+
+        # Create normalization modules
+        if nscalar > 0:
+            self.scalar_norm = _ChannelLayerNorm(repr.mult, nscalar, epsilon)
+
+        if self.nhigher > 0:
+            self.higher_norm = _EquivariantRMSNorm(repr.mult, epsilon)
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        """Apply separable equivariant layer normalization.
+
+        Args:
+            f: Spherical tensor of shape (..., mult, dim).
+
+        Returns:
+            Normalized tensor of shape (..., mult, dim).
+        """
+        out = f.clone()
+
+        if self.nscalar > 0:
+            out[..., self.scalar_locs] = self.scalar_norm(f[..., self.scalar_locs])
+
+        if self.nhigher > 0:
+            out[..., self.higher_mask] = self.higher_norm(f[..., self.higher_mask])
+
+        return out
+
+    def extra_repr(self) -> str:
+        return f"nscalar={self.nscalar}, nhigher={self.nhigher}"
+
+
 def _expand_indices(dst_indices: torch.Tensor, channels: int, dim: int) -> torch.Tensor:
     """Expand (num_edges,) indices to (num_edges, channels, dim) for scatter."""
     return dst_indices.view(-1, 1, 1).expand(-1, channels, dim)

@@ -331,7 +331,6 @@ class WignerD(nn.Module):
 
         self.register_buffer('generators', gens.view(3, -1))
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def rot(
         self,
         axis: torch.Tensor,
@@ -339,9 +338,6 @@ class WignerD(nn.Module):
         cartesian: bool = False,
     ) -> torch.Tensor:
         """Compute the Wigner D-matrix for a rotation.
-
-        This method is forced to run in FP32 even under AMP, because the
-        matrix exponential is numerically unstable in FP16.
 
         Args:
             axis: Rotation axis of shape (..., 3).

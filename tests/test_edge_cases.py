@@ -14,50 +14,45 @@ from flash_eq import (
 )
 
 
-@pytest.fixture
-def device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 class TestEmptyInputs:
-    """Tests for empty tensor inputs."""
+    """Tests for empty tensor inputs (CUDA-only due to EquivariantEdgewiseLinear)."""
 
-    def test_zero_edges(self, device):
+    def test_zero_edges(self, cuda_device):
         """Layer should handle zero edges gracefully."""
         in_repr = Repr(lvals=[0, 1, 2], mult=4)
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_nodes = 10
         num_edges = 0
 
-        node_features = torch.randn(num_nodes, 4, 9, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.randn(num_edges, device=device)
-        src_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+        node_features = torch.randn(num_nodes, 4, 9, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.randn(num_edges, device=cuda_device)
+        src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
 
         assert output.shape == (0, 4, 9)
 
-    def test_single_edge(self, device):
+    def test_single_edge(self, cuda_device):
         """Layer should handle single edge."""
         in_repr = Repr(lvals=[0, 1, 2], mult=4)
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_nodes = 10
         num_edges = 1
 
-        node_features = torch.randn(num_nodes, 4, 9, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.rand(num_edges, device=device) * 5.0
-        src_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+        node_features = torch.randn(num_nodes, 4, 9, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.rand(num_edges, device=cuda_device) * 5.0
+        src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
@@ -65,21 +60,21 @@ class TestEmptyInputs:
         assert output.shape == (1, 4, 9)
         assert torch.isfinite(output).all()
 
-    def test_single_node(self, device):
+    def test_single_node(self, cuda_device):
         """Layer should handle single node with self-loop."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_nodes = 1
         num_edges = 5
 
-        node_features = torch.randn(num_nodes, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.rand(num_edges, device=device) * 5.0
-        src_indices = torch.zeros(num_edges, device=device, dtype=torch.long)
+        node_features = torch.randn(num_nodes, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.rand(num_edges, device=cuda_device) * 5.0
+        src_indices = torch.zeros(num_edges, device=cuda_device, dtype=torch.long)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
@@ -143,42 +138,42 @@ class TestNumericalEdgeCases:
         assert torch.isfinite(P).all(), "P contains NaN/Inf for axis-aligned direction"
         assert torch.isfinite(Q).all(), "Q contains NaN/Inf for axis-aligned direction"
 
-    def test_zero_distance(self, device):
-        """Distance of exactly zero."""
+    def test_zero_distance(self, cuda_device):
+        """Distance of exactly zero (CUDA-only)."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_edges = 5
-        node_features = torch.randn(10, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.zeros(num_edges, device=device)  # All zero
-        src_indices = torch.randint(0, 10, (num_edges,), device=device)
+        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.zeros(num_edges, device=cuda_device)  # All zero
+        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
 
         assert torch.isfinite(output).all(), "Output contains NaN/Inf for zero distance"
 
-    def test_distance_outside_range(self, device):
-        """Distances outside the binned range."""
+    def test_distance_outside_range(self, cuda_device):
+        """Distances outside the binned range (CUDA-only)."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
         # Layer with range [0, 10]
         layer = EquivariantEdgewiseLinear(
             in_repr, out_repr, min_dist=0.0, max_dist=10.0
-        ).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        ).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_edges = 4
-        node_features = torch.randn(10, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
+        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
         # Distances: negative, zero, in range, above range
-        distances = torch.tensor([-5.0, 0.0, 5.0, 100.0], device=device)
-        src_indices = torch.randint(0, 10, (num_edges,), device=device)
+        distances = torch.tensor([-5.0, 0.0, 5.0, 100.0], device=cuda_device)
+        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
@@ -220,22 +215,19 @@ class TestNumericalEdgeCases:
 class TestDtypes:
     """Tests for different data types."""
 
-    def test_fp16_layer(self, device):
-        """Test layer with FP16 inputs."""
-        if not torch.cuda.is_available():
-            pytest.skip("FP16 test requires CUDA")
-
+    def test_fp16_layer(self, cuda_device):
+        """Test layer with FP16 inputs (CUDA-only)."""
         in_repr = Repr(lvals=[0, 1, 2], mult=4)
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device).half()
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device).half()
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_edges = 50
-        node_features = torch.randn(20, 4, 9, device=device, dtype=torch.float16)
-        directions = torch.randn(num_edges, 3, device=device, dtype=torch.float16)
-        distances = torch.rand(num_edges, device=device, dtype=torch.float16) * 5.0
-        src_indices = torch.randint(0, 20, (num_edges,), device=device)
+        node_features = torch.randn(20, 4, 9, device=cuda_device, dtype=torch.float16)
+        directions = torch.randn(num_edges, 3, device=cuda_device, dtype=torch.float16)
+        distances = torch.rand(num_edges, device=cuda_device, dtype=torch.float16) * 5.0
+        src_indices = torch.randint(0, 20, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions.float())  # Basis computed in FP32
         P, Q = P.half(), Q.half()
@@ -244,11 +236,8 @@ class TestDtypes:
         assert output.dtype == torch.float16
         assert torch.isfinite(output).all(), "FP16 output contains NaN/Inf"
 
-    def test_fp16_building_blocks(self, device):
-        """Test building block layers with FP16."""
-        if not torch.cuda.is_available():
-            pytest.skip("FP16 test requires CUDA")
-
+    def test_fp16_building_blocks(self, cuda_device):
+        """Test building block layers with FP16 (CUDA-only)."""
         repr = Repr(lvals=[0, 1, 2], mult=4)
 
         layers = [
@@ -258,26 +247,26 @@ class TestDtypes:
             EquivariantLayerNorm(repr),
         ]
 
-        x = torch.randn(16, 4, 9, device=device, dtype=torch.float16)
+        x = torch.randn(16, 4, 9, device=cuda_device, dtype=torch.float16)
 
         for layer in layers:
-            layer = layer.to(device).half()
+            layer = layer.to(cuda_device).half()
             out = layer(x)
             assert torch.isfinite(out).all(), f"{layer.__class__.__name__} FP16 output contains NaN/Inf"
 
-    def test_fp64_layer(self, device):
-        """Test layer with FP64 inputs."""
+    def test_fp64_layer(self, cuda_device):
+        """Test layer with FP64 inputs (CUDA-only)."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device).double()
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device).double()
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device).double()
 
         num_edges = 20
-        node_features = torch.randn(10, 2, 4, device=device, dtype=torch.float64)
-        directions = torch.randn(num_edges, 3, device=device, dtype=torch.float64)
-        distances = torch.rand(num_edges, device=device, dtype=torch.float64) * 5.0
-        src_indices = torch.randint(0, 10, (num_edges,), device=device)
+        node_features = torch.randn(10, 2, 4, device=cuda_device, dtype=torch.float64)
+        directions = torch.randn(num_edges, 3, device=cuda_device, dtype=torch.float64)
+        distances = torch.rand(num_edges, device=cuda_device, dtype=torch.float64) * 5.0
+        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
@@ -321,84 +310,84 @@ class TestRadialBasis:
 
 
 class TestDegenerateGraphs:
-    """Tests for degenerate graph structures."""
+    """Tests for degenerate graph structures (CUDA-only)."""
 
-    def test_all_self_loops(self, device):
+    def test_all_self_loops(self, cuda_device):
         """All edges are self-loops."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_nodes = 5
         num_edges = 10
 
-        node_features = torch.randn(num_nodes, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.rand(num_edges, device=device) * 5.0
+        node_features = torch.randn(num_nodes, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.rand(num_edges, device=cuda_device) * 5.0
         # All edges from node i to node i
-        src_indices = torch.arange(num_edges, device=device) % num_nodes
+        src_indices = torch.arange(num_edges, device=cuda_device) % num_nodes
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
 
         assert torch.isfinite(output).all()
 
-    def test_all_edges_same_source(self, device):
+    def test_all_edges_same_source(self, cuda_device):
         """All edges originate from the same node."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_nodes = 10
         num_edges = 50
 
-        node_features = torch.randn(num_nodes, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.rand(num_edges, device=device) * 5.0
-        src_indices = torch.zeros(num_edges, device=device, dtype=torch.long)  # All from node 0
+        node_features = torch.randn(num_nodes, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.rand(num_edges, device=cuda_device) * 5.0
+        src_indices = torch.zeros(num_edges, device=cuda_device, dtype=torch.long)  # All from node 0
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
 
         assert torch.isfinite(output).all()
 
-    def test_identical_directions(self, device):
+    def test_identical_directions(self, cuda_device):
         """All edges have the same direction."""
         in_repr = Repr(lvals=[0, 1, 2], mult=4)
         out_repr = Repr(lvals=[0, 1, 2], mult=4)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_edges = 20
-        node_features = torch.randn(10, 4, 9, device=device)
+        node_features = torch.randn(10, 4, 9, device=cuda_device)
         # All same direction
-        directions = torch.tensor([[1.0, 0.0, 0.0]], device=device).expand(num_edges, 3)
-        distances = torch.rand(num_edges, device=device) * 5.0
-        src_indices = torch.randint(0, 10, (num_edges,), device=device)
+        directions = torch.tensor([[1.0, 0.0, 0.0]], device=cuda_device).expand(num_edges, 3)
+        distances = torch.rand(num_edges, device=cuda_device) * 5.0
+        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)
 
         assert torch.isfinite(output).all()
 
-    def test_identical_distances(self, device):
+    def test_identical_distances(self, cuda_device):
         """All edges have the same distance."""
         in_repr = Repr(lvals=[0, 1], mult=2)
         out_repr = Repr(lvals=[0, 1], mult=2)
 
-        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(device)
-        basis = WignerDBasis(in_repr, out_repr).to(device)
+        layer = EquivariantEdgewiseLinear(in_repr, out_repr).to(cuda_device)
+        basis = WignerDBasis(in_repr, out_repr).to(cuda_device)
 
         num_edges = 20
-        node_features = torch.randn(10, 2, 4, device=device)
-        directions = torch.randn(num_edges, 3, device=device)
-        distances = torch.full((num_edges,), 5.0, device=device)  # All same distance
-        src_indices = torch.randint(0, 10, (num_edges,), device=device)
+        node_features = torch.randn(10, 2, 4, device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        distances = torch.full((num_edges,), 5.0, device=cuda_device)  # All same distance
+        src_indices = torch.randint(0, 10, (num_edges,), device=cuda_device)
 
         P, Q = basis(directions)
         output = layer(P, Q, node_features, distances, src_indices)

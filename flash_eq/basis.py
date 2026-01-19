@@ -99,16 +99,11 @@ class WignerDBasis(nn.Module):
         self.register_buffer('_perm_in', _build_m_order_permutation(repr_in.lvals))
         self.register_buffer('_perm_out', _build_m_order_permutation(repr_out.lvals))
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(
         self,
         directions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute Wigner-D basis matrices for given directions.
-
-        This method is forced to run in FP32 even under AMP, because the
-        matrix exponential in Wigner-D computation is numerically unstable
-        in FP16.
 
         Args:
             directions: (batch, 3) direction vectors in Cartesian coordinates

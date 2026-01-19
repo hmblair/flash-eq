@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation
 from flash_eq import (
     Repr, WignerD,
     RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm,
-    GraphPooling,
+    SeparableEquivariantLayerNorm, GraphPooling,
 )
 
 
@@ -36,11 +36,6 @@ def random_rotation(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, t
     R = torch.tensor(R_np, device=device, dtype=torch.float32)
 
     return axis, angle, R
-
-
-@pytest.fixture
-def device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 LVALS_CONFIGS = [
@@ -290,6 +285,137 @@ class TestEquivariantLayerNorm:
         out = layer(x)
 
         assert out.shape == x.shape
+
+
+class TestSeparableEquivariantLayerNorm:
+    """Tests for SeparableEquivariantLayerNorm layer."""
+
+    @pytest.mark.parametrize("lvals", LVALS_CONFIGS)
+    @pytest.mark.parametrize("mult", MULT_CONFIGS)
+    def test_equivariance(self, device, lvals, mult):
+        """D @ layer(x) should equal layer(D @ x)."""
+        torch.manual_seed(42)
+
+        repr = Repr(lvals=lvals, mult=mult)
+        dim = repr.dim()
+
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+        wigner = WignerD(repr).to(device)
+
+        # Input tensor
+        x = torch.randn(16, mult, dim, device=device)
+
+        # Random rotation
+        axis, angle, _ = random_rotation(device)
+        D = wigner.rot(axis, angle).squeeze(0)
+
+        # Method 1: Apply layer, then rotate
+        out1 = layer(x)
+        out1_rot = torch.einsum('ij,bmj->bmi', D, out1)
+
+        # Method 2: Rotate input, then apply layer
+        x_rot = torch.einsum('ij,bmj->bmi', D, x)
+        out2 = layer(x_rot)
+
+        # Check equivariance
+        rel_diff = (out1_rot - out2).abs().max().item() / (out1_rot.abs().max().item() + 1e-8)
+        assert rel_diff < 1e-4, f"SeparableEquivariantLayerNorm equivariance failed: rel_diff={rel_diff:.2e}"
+
+    def test_output_shape(self, device):
+        """Test that output shape is correct."""
+        repr = Repr(lvals=[0, 1, 2], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        x = torch.randn(16, 4, 9, device=device)
+        out = layer(x)
+
+        assert out.shape == x.shape
+
+    def test_no_scalars(self, device):
+        """Test with representation containing no scalars."""
+        repr = Repr(lvals=[1, 2], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        assert layer.nscalar == 0
+        assert layer.nhigher == 2
+        assert not hasattr(layer, 'scalar_norm')
+        assert hasattr(layer, 'higher_norm')
+
+        x = torch.randn(16, 4, 8, device=device)  # dim = 3 + 5 = 8
+        out = layer(x)
+
+        assert out.shape == x.shape
+
+    def test_only_scalars(self, device):
+        """Test with representation containing only scalars."""
+        repr = Repr(lvals=[0], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        assert layer.nscalar == 1
+        assert layer.nhigher == 0
+        assert hasattr(layer, 'scalar_norm')
+        assert not hasattr(layer, 'higher_norm')
+
+        x = torch.randn(16, 4, 1, device=device)
+        out = layer(x)
+
+        assert out.shape == x.shape
+
+    def test_preserves_higher_degree_ratios(self, device):
+        """Test that L>0 components maintain relative magnitudes."""
+        repr = Repr(lvals=[0, 1, 2], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        # Create input where l=1 has 2x the magnitude of l=2
+        x = torch.zeros(16, 4, 9, device=device)
+        x[..., 1:4] = 2.0  # l=1 components
+        x[..., 4:9] = 1.0  # l=2 components
+
+        out = layer(x)
+
+        # The ratio of l=1 to l=2 norms should be preserved
+        l1_norm = out[..., 1:4].norm(dim=-1).mean()
+        l2_norm = out[..., 4:9].norm(dim=-1).mean()
+        ratio = l1_norm / l2_norm
+
+        # Original ratio was sqrt(3*4) / sqrt(5*1) = sqrt(12/5) ≈ 1.55
+        expected_ratio = math.sqrt(3 * 4.0 / (5 * 1.0))
+        assert abs(ratio - expected_ratio) < 0.1, f"Ratio {ratio:.2f} != expected {expected_ratio:.2f}"
+
+    def test_multiple_batch_dims(self, device):
+        """Test with multiple batch dimensions."""
+        repr = Repr(lvals=[0, 1], mult=2)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        x = torch.randn(2, 3, 2, 4, device=device)
+        out = layer(x)
+
+        assert out.shape == x.shape
+
+    def test_gradient_flow(self, device):
+        """Test that gradients flow through the layer."""
+        repr = Repr(lvals=[0, 1, 2], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        x = torch.randn(16, 4, 9, device=device, requires_grad=True)
+        out = layer(x)
+        loss = out.sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+
+    def test_learnable_parameters(self, device):
+        """Test that learnable parameters are created correctly."""
+        repr = Repr(lvals=[0, 1, 2], mult=4)
+        layer = SeparableEquivariantLayerNorm(repr).to(device)
+
+        # Check scalar norm params
+        assert layer.scalar_norm.weight.shape == (4, 1)  # (mult, nscalar)
+        assert layer.scalar_norm.bias.shape == (4, 1)
+
+        # Check higher norm params
+        assert layer.higher_norm.weight.shape == (4,)  # (mult,)
 
 
 class TestReprMethods:

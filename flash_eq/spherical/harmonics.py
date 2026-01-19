@@ -12,7 +12,7 @@ import math
 import torch
 import sphericart.torch as sph
 
-from .lebedev_tables import LEBEDEV_RULES, get_available_precisions
+from .lebedev import LEBEDEV_RULES, get_available_precisions
 
 
 # =============================================================================

@@ -38,7 +38,7 @@ def test_equivariance(l_max: int, precision: int = 47, n_samples: int = 50, mult
 
 
 if __name__ == "__main__":
-    from flash_eq.lebedev_tables import LEBEDEV_RULES
+    from flash_eq.spherical import LEBEDEV_RULES
 
     print("Available precisions:", sorted(LEBEDEV_RULES.keys()))
     print()

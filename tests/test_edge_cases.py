@@ -297,8 +297,7 @@ class TestRadialBasis:
 
     def test_binned_module_edge_values(self, device):
         """Test binned module at exact bin edges."""
-        mlp = RadialMLP(hidden_dim=32, num_basis=10, in_mult=2, out_mult=2).to(device)
-        binned = BinnedModule(mlp, num_bins=10, min_val=0.0, max_val=10.0).to(device)
+        binned = BinnedModule(num_bins=10, shape=(2, 2, 10), min_val=0.0, max_val=10.0).to(device)
 
         # Exact bin edge values
         values = torch.tensor([0.0, 1.0, 5.0, 9.0, 10.0], device=device)
@@ -307,6 +306,57 @@ class TestRadialBasis:
         assert torch.isfinite(bin_lo.float()).all()
         assert torch.isfinite(interp).all()
         assert (interp >= 0).all() and (interp <= 1).all()
+
+        # Check table output shape
+        table = binned()
+        assert table.shape == (11, 2, 2, 10)
+        assert torch.isfinite(table).all()
+
+    def test_binned_module_log_spacing(self, device):
+        """Test binned module with logarithmic spacing."""
+        binned = BinnedModule(num_bins=10, shape=(2, 2, 10), min_val=0.5, max_val=10.0, log=True).to(device)
+
+        # Log spacing should have more bins at short distances
+        edges = binned.bin_edges
+        first_bin_width = edges[1] - edges[0]
+        last_bin_width = edges[-1] - edges[-2]
+        assert first_bin_width < last_bin_width, "Log spacing should have smaller bins at short range"
+
+        # Test bin_indices
+        values = torch.tensor([0.5, 1.0, 2.0, 5.0, 10.0], device=device)
+        bin_lo, interp = binned.bin_indices(values)
+
+        assert torch.isfinite(bin_lo.float()).all()
+        assert torch.isfinite(interp).all()
+        assert (interp >= 0).all() and (interp <= 1).all()
+
+        # Values below min_val should clamp to first bin
+        values_below = torch.tensor([0.1, 0.3], device=device)
+        bin_lo_below, interp_below = binned.bin_indices(values_below)
+        assert (bin_lo_below == 0).all()
+        assert (interp_below == 0).all()
+
+    def test_binned_module_smoothing(self, device):
+        """Test that Gaussian smoothing works and gradients flow."""
+        binned = BinnedModule(num_bins=10, shape=(4,), sigma=2.0).to(device)
+
+        # Set one bin to 1, others to 0
+        with torch.no_grad():
+            binned.raw_table.zero_()
+            binned.raw_table[5, :] = 1.0
+
+        # Smoothed output should spread the value to neighbors
+        table = binned()
+        assert table[5, 0] < 1.0, "Smoothing should reduce peak"
+        assert table[4, 0] > 0.0, "Smoothing should spread to neighbors"
+        assert table[6, 0] > 0.0, "Smoothing should spread to neighbors"
+
+        # Gradients should flow through smoothing
+        table = binned()
+        loss = table.sum()
+        loss.backward()
+        assert binned.raw_table.grad is not None
+        assert torch.isfinite(binned.raw_table.grad).all()
 
 
 class TestDegenerateGraphs:

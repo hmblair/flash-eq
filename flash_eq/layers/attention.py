@@ -217,8 +217,8 @@ class EquivariantAttention(nn.Module):
         num_bins: Number of distance bins for radial weight interpolation.
         min_dist: Minimum distance in Angstroms.
         max_dist: Maximum distance in Angstroms.
-        radial_hidden: Hidden dimension for radial MLP.
-        radial_layers: Number of hidden layers in radial MLP.
+        log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
+        sigma: Gaussian smoothing kernel width for radial weights.
         use_layer_norm: Apply LayerNorm to scalars before attention.
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
@@ -243,8 +243,8 @@ class EquivariantAttention(nn.Module):
         num_bins: int = 100,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
-        radial_hidden: int = 64,
-        radial_layers: int = 2,
+        log_bins: bool = False,
+        sigma: float = 1.0,
         use_layer_norm: bool = True,
         dropout: float = 0.0,
         reduce: str = 'sum',
@@ -261,8 +261,8 @@ class EquivariantAttention(nn.Module):
             num_bins=num_bins,
             min_dist=min_dist,
             max_dist=max_dist,
-            radial_hidden=radial_hidden,
-            radial_layers=radial_layers,
+            log_bins=log_bins,
+            sigma=sigma,
         )
 
         # Edge attention

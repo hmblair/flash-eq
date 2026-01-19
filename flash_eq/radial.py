@@ -139,65 +139,125 @@ class RadialMLP(nn.Module):
 
 
 class BinnedModule(nn.Module):
-    """Wraps a module to precompute outputs at bin edges for memory efficiency.
+    """Learnable lookup table with Gaussian smoothing for radial weights.
 
-    Instead of computing outputs per-edge, this module evaluates the wrapped
-    module at bin edges during forward(). The CUDA kernel handles interpolation
-    at runtime. This reduces memory from O(edges) to O(bins).
+    Stores a learnable table of values at bin edges. During forward(), applies
+    Gaussian smoothing along the bin dimension, which:
+    1. Provides implicit regularization (smooth radial functions)
+    2. Spreads gradients to neighboring bins during backprop
 
-    The wrapped module should take input of shape (N, 1) and return (N, ...).
+    The CUDA kernel handles interpolation between bins at runtime.
 
     Args:
-        module: Module to wrap. Takes (N, 1) input, returns (N, ...).
         num_bins: Number of bins (default: 100).
-        min_val: Minimum value for binning (default: 0.0).
-        max_val: Maximum value for binning (default: 10.0).
+        shape: Shape of output per bin, e.g., (out_mult, in_mult, weight_dim).
+        min_val: Minimum distance value (default: 0.0).
+        max_val: Maximum distance value (default: 10.0).
+        log: If True, use logarithmic bin spacing (density ~ 1/r).
+            Requires min_val > 0. Smoothing is uniform in log-space.
+        sigma: Gaussian kernel width in bin units (default: 1.0).
+            Larger values = more smoothing. The kernel covers ~3*sigma bins.
 
     Example:
-        >>> mlp = RadialMLP(hidden_dim=64, num_basis=44, in_mult=8, out_mult=8)
-        >>> binned = BinnedModule(mlp, num_bins=100, min_val=0.0, max_val=10.0)
+        >>> binned = BinnedModule(num_bins=100, shape=(8, 8, 44))
         >>> table = binned()  # (101, 8, 8, 44) - pass to CUDA kernel
+        >>> # Log spacing for molecular data
+        >>> binned_log = BinnedModule(
+        ...     num_bins=100, shape=(8, 8, 44),
+        ...     min_val=0.5, max_val=10.0, log=True
+        ... )
     """
 
     def __init__(
         self,
-        module: nn.Module,
         num_bins: int = 100,
+        shape: tuple[int, ...] = (),
         min_val: float = 0.0,
         max_val: float = 10.0,
+        log: bool = False,
+        sigma: float = 1.0,
     ) -> None:
         super().__init__()
 
-        self.module = module
+        if log and min_val <= 0:
+            raise ValueError("min_val must be > 0 for log spacing")
+
         self.num_bins = num_bins
+        self.shape = shape
         self.min_val = min_val
         self.max_val = max_val
+        self.log = log
+        self.sigma = sigma
 
-        self.register_buffer(
-            'bin_edges',
-            torch.linspace(min_val, max_val, num_bins + 1)
-        )
+        # Learnable table: (num_bins+1, *shape)
+        # Xavier init treating shape[0] as fan_out, rest as fan_in
+        self.raw_table = nn.Parameter(torch.empty(num_bins + 1, *shape))
+        if shape:
+            nn.init.xavier_uniform_(self.raw_table.view(num_bins + 1, shape[0], -1))
+        else:
+            nn.init.zeros_(self.raw_table)
+
+        # Fixed Gaussian smoothing kernel
+        radius = max(1, int(3 * sigma))
+        x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        kernel = torch.exp(-x**2 / (2 * sigma**2))
+        self._kernel: torch.Tensor
+        self.register_buffer('_kernel', kernel / kernel.sum())
+
+        # Bin edges for distance-to-index mapping
+        if log:
+            self.register_buffer(
+                'bin_edges',
+                torch.logspace(
+                    torch.tensor(min_val).log10().item(),
+                    torch.tensor(max_val).log10().item(),
+                    num_bins + 1,
+                )
+            )
+            self._log_min = torch.tensor(min_val).log().item()
+            self._inv_log_range = 1.0 / (torch.tensor(max_val / min_val).log().item())
+        else:
+            self.register_buffer(
+                'bin_edges',
+                torch.linspace(min_val, max_val, num_bins + 1)
+            )
 
     def forward(self) -> torch.Tensor:
-        """Compute output table at bin edges.
+        """Return smoothed lookup table.
 
         Returns:
-            Table of shape (num_bins+1, ...) where ... is the module output shape.
+            Table of shape (num_bins+1, *shape).
         """
-        return self.module(self.bin_edges.unsqueeze(-1))  # type: ignore[operator]
+        # Reshape for conv1d: (num_bins+1, *shape) -> (prod(shape), 1, num_bins+1)
+        n_bins = self.num_bins + 1
+        flat = self.raw_table.permute(*range(1, len(self.shape) + 1), 0)
+        flat = flat.reshape(-1, 1, n_bins)
+
+        # Apply Gaussian smoothing with replicate padding
+        pad = self._kernel.shape[0] // 2
+        padded = torch.nn.functional.pad(flat, (pad, pad), mode='replicate')
+        smoothed = torch.nn.functional.conv1d(padded, self._kernel.view(1, 1, -1))
+
+        # Reshape back: (prod(shape), 1, num_bins+1) -> (num_bins+1, *shape)
+        smoothed = smoothed.reshape(*self.shape, n_bins)
+        return smoothed.permute(len(self.shape), *range(len(self.shape)))
 
     def bin_indices(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute bin indices and interpolation weights for given values.
 
         Args:
-            values: (N,) values to bin.
+            values: (N,) distance values to bin.
 
         Returns:
             bin_lo: (N,) lower bin indices as int32.
             interp_weight: (N,) interpolation weights in [0, 1].
         """
-        inv_bin_width = self.num_bins / (self.max_val - self.min_val)
-        normalized = (values.float() - self.min_val) * inv_bin_width
+        if self.log:
+            normalized = (values.float().clamp(min=self.min_val).log() - self._log_min) * self._inv_log_range * self.num_bins
+        else:
+            inv_bin_width = self.num_bins / (self.max_val - self.min_val)
+            normalized = (values.float() - self.min_val) * inv_bin_width
+
         normalized = normalized.clamp(0.0, self.num_bins)
         bin_lo = normalized.floor().int().clamp(max=self.num_bins - 1)
         interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)

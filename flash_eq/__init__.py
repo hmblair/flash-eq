@@ -30,7 +30,10 @@ from .layers import (
     EquivariantLayerNorm,
     SeparableEquivariantLayerNorm,
     GraphPooling,
+    S2Activation,
+    SeparableS2Activation,
 )
+from .spherical import S2Grid, real_spherical_harmonics, lebedev_grid
 from .cuda import CUDANotAvailableError
 
 __all__ = [
@@ -50,12 +53,18 @@ __all__ = [
     "SeparableEquivariantLayerNorm",
     "GraphPooling",
     "EquivariantEdgeAttention",
+    "S2Activation",
+    "SeparableS2Activation",
     # Basis
     "WignerDBasis",
     # Radial weights
     "RadialBasisFunctions",
     "RadialMLP",
     "BinnedModule",
+    # Spherical utilities
+    "S2Grid",
+    "real_spherical_harmonics",
+    "lebedev_grid",
     # Exceptions
     "CUDANotAvailableError",
 ]

@@ -28,6 +28,7 @@ from .attention import EquivariantEdgeAttention, EquivariantAttention
 from .norm import RepNorm, EquivariantLayerNorm, SeparableEquivariantLayerNorm
 from .pooling import GraphPooling
 from .gating import EquivariantGating
+from .s2_activation import S2Activation, SeparableS2Activation
 
 __all__ = [
     # Linear
@@ -44,4 +45,7 @@ __all__ = [
     "GraphPooling",
     # Gating
     "EquivariantGating",
+    # S² Activation
+    "S2Activation",
+    "SeparableS2Activation",
 ]

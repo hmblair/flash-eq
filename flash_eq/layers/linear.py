@@ -1,34 +1,19 @@
-"""
-SO(3)-equivariant edgewise linear layers.
+"""SO(3)-equivariant linear layers.
 
-This module implements the core equivariant layer:
+This module implements equivariant linear transformations:
+- EquivariantEdgewiseLinear: Edgewise linear with distance-dependent weights
+- EquivariantLinear: Linear layer preserving spherical tensor structure
 
-    out = Q @ Λ(r) @ P^T @ f
-
-where:
-    f: input node features in standard SH basis
-    P: Wigner-D matrix transforming to m-first diagonal basis
-    Λ(r): block-diagonal radial weights
-    Q: Wigner-D matrix transforming back to standard SH basis
-    out: output edge features in standard SH basis
-
-The computation is split across modules:
-    - Gather (PyTorch): edge_f = node_f[src_indices]
-    - P^T transform (PyTorch): f_diag = P^T @ edge_f
-    - Block multiply (CUDA kernel): out_diag = Λ(r) @ f_diag
-    - Q transform (PyTorch): out = Q @ out_diag
-
-Classes:
-    EquivariantEdgewiseLinear: Full layer with learned radial MLP.
+Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .representations import Repr, ProductRepr
-from .block_diagonal_cuda import block_diagonal_cuda
-from .radial import RadialMLP, BinnedModule
+from ..representations import Repr, ProductRepr
+from ..cuda.block_diagonal import block_diagonal_cuda
+from ..radial import RadialMLP, BinnedModule
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -172,121 +157,100 @@ class EquivariantEdgewiseLinear(nn.Module):
         )
 
 
-class EquivariantAttention(nn.Module):
-    """SO(3)-equivariant graph attention layer.
+class EquivariantLinear(nn.Module):
+    """Linear layer that preserves spherical tensor structure.
 
-    Combines the full message-passing pipeline:
-        1. EquivariantEdgewiseLinear: Transform node features to edge features
-        2. EquivariantEdgeAttention: Apply attention weighting on edges
-        3. GraphPooling: Aggregate edge features back to nodes
-
-    This is the primary building block for equivariant graph neural networks,
-    implementing the attention mechanism from EquiformerV2 (Liao et al., 2024).
+    Applies separate linear transformations to each irrep degree,
+    preserving SO(3) equivariance. Only degree-0 (scalar) components
+    can have bias terms.
 
     Args:
-        in_repr: Input representation (Repr with lvals and mult).
-        out_repr: Output representation.
-        num_heads: Number of attention heads. Must divide out_repr.mult.
-        num_bins: Number of distance bins for radial weight interpolation.
-        min_dist: Minimum distance in Angstroms.
-        max_dist: Maximum distance in Angstroms.
-        radial_hidden: Hidden dimension for radial MLP.
-        radial_layers: Number of hidden layers in radial MLP.
-        use_layer_norm: Apply LayerNorm to scalars before attention.
-        dropout: Dropout rate for attention weights.
-        reduce: Pooling reduction method ('sum', 'mean', or 'max').
+        in_repr: Input representation.
+        out_repr: Output representation (must have same lvals as in_repr).
+        bias: Whether to include bias for scalar components.
+        activation: Activation function (applied only to scalars).
+
+    Raises:
+        ValueError: If in_repr and out_repr have different lvals.
 
     Example:
-        >>> from flash_eq import Repr, WignerDBasis, EquivariantAttention
-        >>>
-        >>> repr = Repr(lvals=[0, 1, 2], mult=32)
-        >>> layer = EquivariantAttention(repr, repr, num_heads=4).cuda()
-        >>> basis = WignerDBasis(repr, repr).cuda()
-        >>>
-        >>> # Graph data
-        >>> P, Q = basis(directions)
-        >>> output = layer(P, Q, node_features, distances, src, dst, num_nodes)
+        >>> repr_in = Repr(lvals=[0, 1, 2], mult=8)
+        >>> repr_out = Repr(lvals=[0, 1, 2], mult=16)
+        >>> layer = EquivariantLinear(repr_in, repr_out)
+        >>> x = torch.randn(32, 8, 9)
+        >>> y = layer(x)  # shape: (32, 16, 9)
     """
 
     def __init__(
         self,
         in_repr: Repr,
         out_repr: Repr,
-        num_heads: int = 1,
-        num_bins: int = 100,
-        min_dist: float = 0.0,
-        max_dist: float = 10.0,
-        radial_hidden: int = 64,
-        radial_layers: int = 2,
-        use_layer_norm: bool = True,
-        dropout: float = 0.0,
-        reduce: str = 'sum',
-    ):
+        bias: bool = True,
+        activation: nn.Module | None = None,
+    ) -> None:
         super().__init__()
 
-        from .attention import EquivariantEdgeAttention
-        from .layers import GraphPooling
+        if not torch.equal(in_repr.lvals, out_repr.lvals):
+            raise ValueError(
+                "EquivariantLinear cannot modify the degrees of a representation. "
+                f"Got input lvals={in_repr.lvals.tolist()}, output lvals={out_repr.lvals.tolist()}"
+            )
 
         self.in_repr = in_repr
         self.out_repr = out_repr
 
-        # Edgewise linear transformation
-        self.linear = EquivariantEdgewiseLinear(
-            in_repr=in_repr,
-            out_repr=out_repr,
-            num_bins=num_bins,
-            min_dist=min_dist,
-            max_dist=max_dist,
-            radial_hidden=radial_hidden,
-            radial_layers=radial_layers,
+        # Weight matrix for linear transformation
+        self.weight = nn.Parameter(
+            torch.empty(in_repr.nreps() * out_repr.mult, in_repr.mult)
         )
+        nn.init.xavier_uniform_(self.weight)
 
-        # Edge attention
-        self.attention = EquivariantEdgeAttention(
-            repr=out_repr,
-            num_heads=num_heads,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
-        )
+        # Indices for gathering correct degrees
+        indices = torch.tensor(in_repr.indices(), dtype=torch.long)
+        self.register_buffer('indices', indices)
 
-        # Aggregation
-        self.pool = GraphPooling(reduce=reduce)
+        self.expanddims = (1, out_repr.mult, in_repr.dim())
+        self.outdims = (in_repr.nreps(), out_repr.mult, in_repr.dim())
 
-    def forward(
-        self,
-        P: torch.Tensor,
-        Q: torch.Tensor,
-        node_features: torch.Tensor,
-        distances: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
-        num_nodes: int,
-    ) -> torch.Tensor:
-        """Apply equivariant attention layer.
+        # Bias only for scalar (degree-0) components
+        nscalar, scalar_locs = in_repr.find_scalar()
+        self.scalar_locs = scalar_locs
+        self.bias: nn.Parameter | None
+
+        if nscalar > 0 and bias:
+            self.bias = nn.Parameter(
+                torch.zeros(out_repr.mult, nscalar),
+                requires_grad=True,
+            )
+        else:
+            self.bias = None
+
+        self.activation = activation if activation is not None else nn.Identity()
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        """Apply equivariant linear transformation.
 
         Args:
-            P: (num_edges, dim_in, dim_in) input basis from WignerDBasis.
-            Q: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
-            node_features: (num_nodes, channels_in, dim_in) node features.
-            distances: (num_edges,) edge distances.
-            src_indices: (num_edges,) source node for each edge.
-            dst_indices: (num_edges,) destination node for each edge.
-            num_nodes: Total number of nodes.
+            f: Spherical tensor of shape (..., mult, dim).
 
         Returns:
-            output: (num_nodes, channels_out, dim_out) updated node features.
+            Transformed tensor of shape (..., out_mult, dim).
         """
-        # Transform to edge features
-        edge_features = self.linear(P, Q, node_features, distances, src_indices)
+        GATHER_DIM = -3
 
-        # Apply attention weighting
-        edge_features = self.attention(edge_features, dst_indices, num_nodes)
+        *b, _, _ = f.shape
 
-        # Aggregate to nodes
-        return self.pool(edge_features, dst_indices, num_nodes)
+        # Apply linear transformation
+        out = (self.weight @ f).view(*b, *self.outdims)
 
-    def extra_repr(self) -> str:
-        return (
-            f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
-            f"num_heads={self.attention.num_heads}, reduce='{self.pool.reduce}'"
-        )
+        # Gather components for each degree
+        ix = self.indices.expand(*b, *self.expanddims)  # type: ignore[operator]
+        out = out.gather(dim=GATHER_DIM, index=ix).squeeze(GATHER_DIM)
+
+        # Add bias and activation to scalar components
+        if self.bias is not None:
+            out = out.clone()
+            scalar_out = self.activation(out[..., self.scalar_locs] + self.bias)
+            out[..., self.scalar_locs] = scalar_out.to(out.dtype)
+
+        return out

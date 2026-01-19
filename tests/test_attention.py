@@ -20,7 +20,7 @@ from flash_eq import (
     EquivariantEdgewiseLinear,
     GraphPooling,
 )
-from flash_eq.attention import EquivariantEdgeAttention
+from flash_eq.layers.attention import EquivariantEdgeAttention
 
 from .helpers import random_rotation, make_graph, check_equivariance
 

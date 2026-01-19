@@ -19,39 +19,24 @@ from .lebedev_tables import LEBEDEV_RULES, get_available_precisions
 # Lebedev Quadrature Grid
 # =============================================================================
 
-def lebedev_grid(precision: int | None = None, l_max: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def lebedev_grid(precision: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Get Lebedev quadrature points and weights.
 
     Lebedev grids are optimal for spherical integration, using ~2/3 the points
     of tensor-product grids for equivalent accuracy.
 
-    Specify either precision or l_max (not both).
-
     Args:
-        precision: Lebedev precision (17, 23, 29, 35, 41, 47).
+        precision: Lebedev precision (17, 23, 29, 35, 41, 47, ...).
                   Higher = more points, higher accuracy.
-        l_max: Maximum spherical harmonic degree. Auto-selects smallest
-              precision that exactly integrates products up to 2*l_max.
 
     Returns:
         points: (n_points, 3) tensor of unit vectors
         weights: (n_points,) tensor of quadrature weights (sum to 4π)
 
     Example:
-        >>> points, weights = lebedev_grid(l_max=6)  # 194 points
         >>> points, weights = lebedev_grid(precision=29)  # 302 points
     """
-    if precision is None and l_max is None:
-        raise ValueError("Must specify either precision or l_max")
-    if precision is not None and l_max is not None:
-        raise ValueError("Specify only one of precision or l_max")
-
     available = get_available_precisions()
-
-    if l_max is not None:
-        # Always use highest available precision (770 points) for best accuracy.
-        # Performance impact is minimal on modern GPUs.
-        precision = available[-1]  # 47
 
     if precision not in LEBEDEV_RULES:
         raise ValueError(
@@ -207,11 +192,10 @@ class S2Grid:
 
     Args:
         l_max: Maximum spherical harmonic degree
-        precision: Lebedev precision (17, 23, ..., 131). If None, auto-selects
-            based on l_max.
+        precision: Lebedev precision (17, 23, ..., 131).
 
     Example:
-        >>> grid = S2Grid(l_max=6)
+        >>> grid = S2Grid(l_max=6, precision=47)
         >>> # Forward: coefficients to grid values
         >>> f_grid = f_coeffs @ grid.Y.T
         >>> # Inverse: grid values to coefficients
@@ -221,17 +205,14 @@ class S2Grid:
     def __init__(
         self,
         l_max: int,
-        precision: int | None = None,
+        precision: int,
     ) -> None:
         self.l_max = l_max
         self.n_sh = (l_max + 1) ** 2
+        self.precision = precision
 
         # Get Lebedev quadrature points and weights
-        if precision is not None:
-            points, weights = lebedev_grid(precision=precision)
-        else:
-            points, weights = lebedev_grid(l_max=l_max)
-        self.precision = precision
+        points, weights = lebedev_grid(precision)
 
         self.n_points = points.shape[0]
 
@@ -253,16 +234,3 @@ class S2Grid:
 
     def __repr__(self) -> str:
         return f"S2Grid(l_max={self.l_max}, n_points={self.n_points}, precision={self.precision})"
-
-
-# =============================================================================
-# Legacy API compatibility
-# =============================================================================
-
-def get_lebedev_rule(degree: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Get quadrature points and weights for a given degree.
-
-    Deprecated: Use lebedev_grid(l_max=...) instead.
-    """
-    l_max = (degree + 1) // 2
-    return lebedev_grid(l_max=l_max)

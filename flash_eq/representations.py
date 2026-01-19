@@ -315,7 +315,7 @@ class WignerD(nn.Module):
         super().__init__()
         self.repr = repr
 
-        # Build generators eagerly
+        # Build generators eagerly (always FP32 - see _apply)
         NUM_GENS = 3
         dim = repr.dim()
         gens = torch.zeros(NUM_GENS, dim, dim)
@@ -330,6 +330,18 @@ class WignerD(nn.Module):
             cumdim += irrep.dim()
 
         self.register_buffer('generators', gens.view(3, -1))
+
+    def _apply(self, fn):
+        """Override to keep generators in FP32 when FP16 would be used.
+
+        torch.linalg.matrix_exp is numerically unstable in FP16, so we promote
+        FP16 generators back to FP32. FP64 is left alone for full precision.
+        """
+        super()._apply(fn)
+        # Only promote to FP32 if generators became FP16 (matrix_exp is broken in FP16)
+        if self.generators.dtype == torch.float16:
+            self.generators = self.generators.float()
+        return self
 
     def rot(
         self,
@@ -359,10 +371,23 @@ class WignerD(nn.Module):
 
         dim = self.repr.dim()
         *b, _ = axis.size()
-        gens = (axis @ self.generators).view(*b, dim, dim)  # type: ignore[operator]
+        input_dtype = axis.dtype
 
-        rot = torch.linalg.matrix_exp(angle[..., None, None] * gens)
+        # FP16 matrix_exp is numerically unstable (produces NaN/Inf).
+        # Compute in FP32, then cast back. Generators are always stored as FP32.
+        if input_dtype == torch.float16:
+            axis = axis.float()
+            angle = angle.float()
+
+        gens = (axis @ self.generators).view(*b, dim, dim)
+        K = angle[..., None, None] * gens
+
+        rot = torch.linalg.matrix_exp(K)
         rot = torch.nan_to_num(rot, 0.0)
+
+        # Cast back to input dtype
+        if input_dtype == torch.float16:
+            rot = rot.half()
 
         # Restore identity for degree-0 (scalar) irreps
         cdims = self.repr.cumdims()
@@ -372,7 +397,11 @@ class WignerD(nn.Module):
 
         return rot
 
-    def rot_to_ez(self, directions: torch.Tensor, cartesian: bool = False) -> torch.Tensor:
+    def rot_to_ez(
+        self,
+        directions: torch.Tensor,
+        cartesian: bool = False,
+    ) -> torch.Tensor:
         """Compute Wigner D-matrix for rotation taking e_z to direction.
 
         This computes the rotation matrix D such that applying D to features

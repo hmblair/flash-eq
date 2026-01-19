@@ -170,3 +170,123 @@ class EquivariantEdgewiseLinear(nn.Module):
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
             f"num_bins={rw.num_bins}, dist=[{rw.min_val}, {rw.max_val}]"
         )
+
+
+class EquivariantAttention(nn.Module):
+    """SO(3)-equivariant graph attention layer.
+
+    Combines the full message-passing pipeline:
+        1. EquivariantEdgewiseLinear: Transform node features to edge features
+        2. EquivariantEdgeAttention: Apply attention weighting on edges
+        3. GraphPooling: Aggregate edge features back to nodes
+
+    This is the primary building block for equivariant graph neural networks,
+    implementing the attention mechanism from EquiformerV2 (Liao et al., 2024).
+
+    Args:
+        in_repr: Input representation (Repr with lvals and mult).
+        out_repr: Output representation.
+        num_heads: Number of attention heads. Must divide out_repr.mult.
+        num_bins: Number of distance bins for radial weight interpolation.
+        min_dist: Minimum distance in Angstroms.
+        max_dist: Maximum distance in Angstroms.
+        radial_hidden: Hidden dimension for radial MLP.
+        radial_layers: Number of hidden layers in radial MLP.
+        use_layer_norm: Apply LayerNorm to scalars before attention.
+        dropout: Dropout rate for attention weights.
+        reduce: Pooling reduction method ('sum', 'mean', or 'max').
+
+    Example:
+        >>> from flash_eq import Repr, WignerDBasis, EquivariantAttention
+        >>>
+        >>> repr = Repr(lvals=[0, 1, 2], mult=32)
+        >>> layer = EquivariantAttention(repr, repr, num_heads=4).cuda()
+        >>> basis = WignerDBasis(repr, repr).cuda()
+        >>>
+        >>> # Graph data
+        >>> P, Q = basis(directions)
+        >>> output = layer(P, Q, node_features, distances, src, dst, num_nodes)
+    """
+
+    def __init__(
+        self,
+        in_repr: Repr,
+        out_repr: Repr,
+        num_heads: int = 1,
+        num_bins: int = 100,
+        min_dist: float = 0.0,
+        max_dist: float = 10.0,
+        radial_hidden: int = 64,
+        radial_layers: int = 2,
+        use_layer_norm: bool = True,
+        dropout: float = 0.0,
+        reduce: str = 'sum',
+    ):
+        super().__init__()
+
+        from .attention import EquivariantEdgeAttention
+        from .layers import GraphPooling
+
+        self.in_repr = in_repr
+        self.out_repr = out_repr
+
+        # Edgewise linear transformation
+        self.linear = EquivariantEdgewiseLinear(
+            in_repr=in_repr,
+            out_repr=out_repr,
+            num_bins=num_bins,
+            min_dist=min_dist,
+            max_dist=max_dist,
+            radial_hidden=radial_hidden,
+            radial_layers=radial_layers,
+        )
+
+        # Edge attention
+        self.attention = EquivariantEdgeAttention(
+            repr=out_repr,
+            num_heads=num_heads,
+            use_layer_norm=use_layer_norm,
+            dropout=dropout,
+        )
+
+        # Aggregation
+        self.pool = GraphPooling(reduce=reduce)
+
+    def forward(
+        self,
+        P: torch.Tensor,
+        Q: torch.Tensor,
+        node_features: torch.Tensor,
+        distances: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """Apply equivariant attention layer.
+
+        Args:
+            P: (num_edges, dim_in, dim_in) input basis from WignerDBasis.
+            Q: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
+            node_features: (num_nodes, channels_in, dim_in) node features.
+            distances: (num_edges,) edge distances.
+            src_indices: (num_edges,) source node for each edge.
+            dst_indices: (num_edges,) destination node for each edge.
+            num_nodes: Total number of nodes.
+
+        Returns:
+            output: (num_nodes, channels_out, dim_out) updated node features.
+        """
+        # Transform to edge features
+        edge_features = self.linear(P, Q, node_features, distances, src_indices)
+
+        # Apply attention weighting
+        edge_features = self.attention(edge_features, dst_indices, num_nodes)
+
+        # Aggregate to nodes
+        return self.pool(edge_features, dst_indices, num_nodes)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
+            f"num_heads={self.attention.num_heads}, reduce='{self.pool.reduce}'"
+        )

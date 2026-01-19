@@ -15,7 +15,7 @@ Flash-eq approach:
 import torch
 import torch.nn as nn
 import gc
-from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr, GraphPooling
+from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr, GraphPooling, EquivariantEdgeAttention
 
 
 class RadialMLP(nn.Module):
@@ -516,6 +516,147 @@ def run_pooling_benchmark(dtype):
     return all_results
 
 
+def benchmark_edge_attention(num_nodes, num_edges, mult, lmax, num_heads, dtype, use_amp=False, n_warmup=3, n_iter=10):
+    """
+    Benchmark EquivariantEdgeAttention forward + backward pass.
+
+    Measures:
+    - Runtime for attention computation (forward + backward)
+    - Peak memory usage
+    """
+    clear_memory()
+    device = torch.device("cuda")
+
+    lvals = list(range(lmax + 1))
+    repr = Repr(lvals=lvals, mult=mult)
+    dim = repr.dim()
+
+    # Create attention module
+    attn = EquivariantEdgeAttention(repr, num_heads=num_heads, dropout=0.0).to(device).to(dtype)
+
+    optimizer = torch.optim.Adam(attn.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    # Edge features and destination indices
+    edge_features = torch.randn(num_edges, mult, dim, device=device, dtype=dtype, requires_grad=True)
+    dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+    target = torch.randn(num_edges, mult, dim, device=device, dtype=dtype)
+
+    def train_step():
+        optimizer.zero_grad()
+
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            output = attn(edge_features, dst_indices, num_nodes)
+            loss = ((output - target) ** 2).mean()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        return loss.item()
+
+    # Warmup
+    for _ in range(n_warmup):
+        train_step()
+    torch.cuda.synchronize()
+
+    # Benchmark
+    clear_memory()
+    torch.cuda.reset_peak_memory_stats()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(n_iter):
+        train_step()
+    end.record()
+    torch.cuda.synchronize()
+
+    return {
+        'time_ms': start.elapsed_time(end) / n_iter,
+        'peak_mem_mb': torch.cuda.max_memory_allocated() / 1024**2,
+    }
+
+
+def run_attention_benchmark(dtype, use_amp=False):
+    """Run benchmark suite for EquivariantEdgeAttention."""
+    precision_name = "float16 (AMP)" if use_amp else ("float16" if dtype == torch.float16 else "float32")
+
+    print(f"\n{'='*100}")
+    print(f"Benchmark: EquivariantEdgeAttention ({precision_name})")
+    print("=" * 100)
+
+    # Configs: (num_nodes, num_edges, mult, lmax, num_heads)
+    configs = [
+        # Varying edges
+        (1000, 5000, 32, 2, 4),
+        (1000, 10000, 32, 2, 4),
+        (1000, 50000, 32, 2, 4),
+        (1000, 100000, 32, 2, 4),
+        # Varying num_heads
+        (1000, 50000, 32, 2, 1),
+        (1000, 50000, 32, 2, 4),
+        (1000, 50000, 32, 2, 8),
+        (1000, 50000, 32, 2, 16),
+        # Varying mult
+        (1000, 50000, 16, 2, 4),
+        (1000, 50000, 32, 2, 4),
+        (1000, 50000, 64, 2, 8),
+        (1000, 50000, 128, 2, 8),
+        # Varying lmax
+        (1000, 50000, 32, 1, 4),
+        (1000, 50000, 32, 2, 4),
+        (1000, 50000, 32, 4, 4),
+        (1000, 50000, 32, 6, 4),
+        # Large scale
+        (5000, 200000, 32, 2, 4),
+        (5000, 200000, 64, 4, 8),
+        (10000, 500000, 32, 2, 4),
+    ]
+
+    print(f"\n{'Config':<50} {'Time (ms)':<15} {'Memory (MB)':<15}")
+    print("-" * 80)
+
+    all_results = []
+
+    for num_nodes, num_edges, mult, lmax, num_heads in configs:
+        config_str = f"N={num_nodes}, E={num_edges}, M={mult}, L={lmax}, H={num_heads}"
+
+        try:
+            r = benchmark_edge_attention(num_nodes, num_edges, mult, lmax, num_heads, dtype, use_amp)
+            time_str = f"{r['time_ms']:.2f}"
+            mem_str = f"{r['peak_mem_mb']:.0f}"
+            all_results.append((config_str, r))
+        except torch.cuda.OutOfMemoryError:
+            time_str = "OOM"
+            mem_str = "OOM"
+            all_results.append((config_str, None))
+        clear_memory()
+
+        print(f"{config_str:<50} {time_str:<15} {mem_str:<15}")
+
+    # Throughput analysis
+    print(f"\nThroughput Analysis:")
+    print(f"{'Config':<50} {'Edges/ms':<15} {'GB/s':<15}")
+    print("-" * 80)
+
+    for config_str, r in all_results:
+        if r:
+            parts = dict(p.split('=') for p in config_str.split(', '))
+            num_edges = int(parts['E'])
+            mult = int(parts['M'])
+            lmax = int(parts['L'])
+            dim = sum(2 * l + 1 for l in range(lmax + 1))
+
+            edges_per_ms = num_edges / r['time_ms']
+            bytes_per_edge = mult * dim * (4 if dtype == torch.float32 else 2)
+            gb_per_s = (num_edges * bytes_per_edge / 1e9) / (r['time_ms'] / 1000)
+
+            print(f"{config_str:<50} {edges_per_ms:<15.0f} {gb_per_s:<15.1f}")
+
+    return all_results
+
+
 def main():
     print("=" * 100)
     print("Benchmark: SE3-Transformer (dense matmuls) vs Flash-eq (public API)")
@@ -538,6 +679,12 @@ def main():
 
     # Run graph pooling benchmark
     pooling_results_fp32 = run_pooling_benchmark(torch.float32)
+
+    print("\n" + "=" * 100)
+
+    # Run attention benchmark
+    attention_results_fp32 = run_attention_benchmark(torch.float32)
+    attention_results_amp = run_attention_benchmark(torch.float32, use_amp=True)
 
     print("\n" + "=" * 100)
 

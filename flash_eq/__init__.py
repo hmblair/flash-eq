@@ -18,10 +18,11 @@ Radial weights:
 """
 
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
-from .layer import EquivariantEdgewiseLinear
+from .layer import EquivariantEdgewiseLinear, EquivariantAttention
 from .basis import WignerDBasis
 from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
 from .layers import RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm, SeparableEquivariantLayerNorm, GraphPooling
+from .attention import EquivariantEdgeAttention
 from .block_diagonal_cuda import CUDANotAvailableError
 
 __all__ = [
@@ -33,12 +34,14 @@ __all__ = [
     "WignerD",
     # Layers
     "EquivariantEdgewiseLinear",
+    "EquivariantAttention",
     "RepNorm",
     "EquivariantLinear",
     "EquivariantGating",
     "EquivariantLayerNorm",
     "SeparableEquivariantLayerNorm",
     "GraphPooling",
+    "EquivariantEdgeAttention",
     # Basis
     "WignerDBasis",
     # Radial weights

@@ -32,17 +32,21 @@ cuBLAS GEMMs with AMP use Tensor Cores efficiently, giving SE3-Transformer a sig
 
 ## FP16 Numerical Stability in Wigner-D Computation
 
-The `WignerD.rot()` method uses `torch.linalg.matrix_exp` which may be numerically unstable in FP16. Currently no dtype enforcement is applied, so FP16 inputs will compute in FP16.
+**RESOLVED:** FP16 inputs are now promoted to FP32 for `matrix_exp`, then cast back. The `_apply` override keeps generators in FP32 when `.half()` is called, while FP64 inputs use FP64 generators for full precision. See commit `2ce4693`.
 
-**Investigation needed:**
-1. Quantify error in Wigner-D matrices at FP16 vs FP32 for various L values
-2. Determine if errors are acceptable for typical use cases (training with AMP)
-3. If not acceptable, explore efficient solutions:
-   - Store generators in both FP32 and FP16, select based on input dtype
-   - Use a more stable algorithm for computing rotation matrices
-   - Only promote to FP32 for high-L where errors compound
+## Add S2Activation to EquivariantTransformerBlock
 
-**Note:** The previous `@torch.amp.custom_fwd(cast_inputs=torch.float32)` decorator was removed because it broke FP64 support. Any solution should preserve FP64 compatibility.
+The current `EquivariantTransformerBlock` uses `EquivariantGating` for nonlinearity, but `S2Activation` (spherical grid sampling + MLP) may provide better expressivity as used in EquiformerV2.
+
+**Options:**
+1. Replace `EquivariantGating` with `S2Activation` in the MLP
+2. Add `S2Activation` as an optional nonlinearity (configurable)
+3. Use both: gating for the attention path, S2Activation for the MLP
+
+**Considerations:**
+- S2Activation has higher memory cost due to grid expansion (770 points at precision=47)
+- Benchmark shows ~2-5ms per 1K-2K nodes, adding ~15-25% overhead to block time
+- May need gradient checkpointing for large graphs
 
 ## NVIDIA SE3-Transformer Weight Transfer
 

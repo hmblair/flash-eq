@@ -44,10 +44,13 @@ class EquivariantTransformerBlock(nn.Module):
         out_repr: Output representation.
         num_heads: Number of attention heads. Must divide out_repr.mult.
         num_bins: Number of distance bins for radial weights.
+        num_bases: Number of radial basis functions. If None, uses independent
+            weights per bin. If set (e.g., 16), uses radial basis functions
+            for parameter efficiency (recommended for high L).
         min_dist: Minimum distance for binning.
         max_dist: Maximum distance for binning.
         log_bins: Use logarithmic bin spacing.
-        sigma: Gaussian smoothing for radial weights.
+        sigma: Gaussian smoothing for radial weights (only used when num_bases=None).
         mlp_ratio: Hidden dimension multiplier for MLP (default 2).
         dropout: Dropout rate for attention weights.
         use_gating: Use EquivariantGating in MLP (default True).
@@ -59,7 +62,10 @@ class EquivariantTransformerBlock(nn.Module):
         >>> in_repr = Repr(lvals=[0, 1], mult=32)
         >>> out_repr = Repr(lvals=[0, 1, 2], mult=64)
         >>>
-        >>> block = EquivariantTransformerBlock(in_repr, out_repr, num_heads=8).cuda()
+        >>> # Parameter-efficient version with radial basis functions
+        >>> block = EquivariantTransformerBlock(
+        ...     in_repr, out_repr, num_heads=8, num_bases=16
+        ... ).cuda()
         >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>>
         >>> P, Q = basis(directions)
@@ -72,6 +78,7 @@ class EquivariantTransformerBlock(nn.Module):
         out_repr: Repr,
         num_heads: int = 1,
         num_bins: int = 100,
+        num_bases: int | None = None,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
@@ -100,6 +107,7 @@ class EquivariantTransformerBlock(nn.Module):
             out_repr=out_repr,
             num_heads=num_heads,
             num_bins=num_bins,
+            num_bases=num_bases,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
@@ -183,10 +191,13 @@ class EquivariantTransformer(nn.Module):
         num_layers: Number of transformer blocks.
         num_heads: Number of attention heads.
         num_bins: Number of distance bins for radial weights.
+        num_bases: Number of radial basis functions. If None, uses independent
+            weights per bin. If set (e.g., 16), uses radial basis functions
+            for parameter efficiency (recommended for high L).
         min_dist: Minimum distance for binning.
         max_dist: Maximum distance for binning.
         log_bins: Use logarithmic bin spacing.
-        sigma: Gaussian smoothing for radial weights.
+        sigma: Gaussian smoothing for radial weights (only used when num_bases=None).
         mlp_ratio: Hidden dimension multiplier for MLP.
         dropout: Dropout rate for attention.
 
@@ -198,9 +209,10 @@ class EquivariantTransformer(nn.Module):
         >>> hidden_repr = Repr(lvals=[0, 1, 2, 3, 4], mult=64)
         >>> out_repr = Repr(lvals=[0], mult=1)
         >>>
+        >>> # Parameter-efficient version with radial basis functions
         >>> model = EquivariantTransformer(
         ...     in_repr, hidden_repr, out_repr,
-        ...     num_layers=6, num_heads=8
+        ...     num_layers=6, num_heads=8, num_bases=16
         ... ).cuda()
         >>>
         >>> # Model provides method to get all needed reprs for basis computation
@@ -218,6 +230,7 @@ class EquivariantTransformer(nn.Module):
         num_layers: int = 6,
         num_heads: int = 1,
         num_bins: int = 100,
+        num_bases: int | None = None,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
@@ -259,6 +272,7 @@ class EquivariantTransformer(nn.Module):
                     out_repr=layer_out,
                     num_heads=num_heads,
                     num_bins=num_bins,
+                    num_bases=num_bases,
                     min_dist=min_dist,
                     max_dist=max_dist,
                     log_bins=log_bins,

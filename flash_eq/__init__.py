@@ -15,11 +15,12 @@ Representations:
 Radial weights:
     - RadialMLP: MLP mapping distance to weight tensor
     - BinnedModule: Wrapper for precomputing module outputs at bin edges
+    - BinnedRadialBasis: Parameter-efficient radial basis function weights
 """
 
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
 from .basis import WignerDBasis
-from .radial import RadialBasisFunctions, RadialMLP, BinnedModule
+from .radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 from .layers import (
     EquivariantEdgewiseLinear,
     EquivariantAttention,
@@ -64,6 +65,7 @@ __all__ = [
     "RadialBasisFunctions",
     "RadialMLP",
     "BinnedModule",
+    "BinnedRadialBasis",
     # Spherical utilities
     "S2Grid",
     "real_spherical_harmonics",

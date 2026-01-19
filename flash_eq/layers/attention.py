@@ -215,10 +215,14 @@ class EquivariantAttention(nn.Module):
         out_repr: Output representation.
         num_heads: Number of attention heads. Must divide out_repr.mult.
         num_bins: Number of distance bins for radial weight interpolation.
+        num_bases: Number of radial basis functions. If None, uses independent
+            weights per bin. If set (e.g., 16), uses radial basis functions
+            for parameter efficiency (recommended for high L).
         min_dist: Minimum distance in Angstroms.
         max_dist: Maximum distance in Angstroms.
         log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
         sigma: Gaussian smoothing kernel width for radial weights.
+            Only used when num_bases=None.
         use_layer_norm: Apply LayerNorm to scalars before attention.
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
@@ -241,6 +245,7 @@ class EquivariantAttention(nn.Module):
         out_repr: Repr,
         num_heads: int = 1,
         num_bins: int = 100,
+        num_bases: int | None = None,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
@@ -259,6 +264,7 @@ class EquivariantAttention(nn.Module):
             in_repr=in_repr,
             out_repr=out_repr,
             num_bins=num_bins,
+            num_bases=num_bases,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,

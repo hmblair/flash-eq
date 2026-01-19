@@ -262,3 +262,152 @@ class BinnedModule(nn.Module):
         bin_lo = normalized.floor().int().clamp(max=self.num_bins - 1)
         interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
         return bin_lo, interp_weight
+
+
+class BinnedRadialBasis(nn.Module):
+    """Radial basis function weights with binned output for CUDA kernel.
+
+    Uses K radial basis functions to parameterize the weight table, reducing
+    parameters from O(num_bins × out × in × weight_dim) to O(K × out × in × weight_dim).
+
+    The basis functions are evaluated at bin centers to produce the full table
+    needed by the CUDA kernel. This enforces smooth radial functions while
+    maintaining computational efficiency.
+
+    Args:
+        num_bins: Number of bins (default: 100).
+        shape: Shape of output per bin, e.g., (out_mult, in_mult, weight_dim).
+        num_bases: Number of radial basis functions (default: 16).
+        min_val: Minimum distance value (default: 0.0).
+        max_val: Maximum distance value (default: 10.0).
+        log: If True, use logarithmic bin spacing.
+        trainable_bases: If True, basis centers/widths are learnable (default: False).
+
+    Example:
+        >>> # Instead of 100 × 64 × 64 × 85 = 34.8M params
+        >>> # Uses 16 × 64 × 64 × 85 = 5.6M params
+        >>> binned = BinnedRadialBasis(
+        ...     num_bins=100, shape=(64, 64, 85), num_bases=16
+        ... )
+        >>> table = binned()  # (101, 64, 64, 85) - same interface as BinnedModule
+    """
+
+    def __init__(
+        self,
+        num_bins: int = 100,
+        shape: tuple[int, ...] = (),
+        num_bases: int = 16,
+        min_val: float = 0.0,
+        max_val: float = 10.0,
+        log: bool = False,
+        trainable_bases: bool = False,
+    ) -> None:
+        super().__init__()
+
+        if log and min_val <= 0:
+            raise ValueError("min_val must be > 0 for log spacing")
+
+        self.num_bins = num_bins
+        self.shape = shape
+        self.num_bases = num_bases
+        self.min_val = min_val
+        self.max_val = max_val
+        self.log = log
+
+        # Radial basis function centers and widths
+        if log:
+            centers = torch.logspace(
+                torch.tensor(min_val).log10().item(),
+                torch.tensor(max_val).log10().item(),
+                num_bases,
+            )
+        else:
+            centers = torch.linspace(min_val, max_val, num_bases)
+
+        spacing = (max_val - min_val) / max(num_bases - 1, 1)
+        widths = torch.full((num_bases,), spacing)
+
+        if trainable_bases:
+            self.centers = nn.Parameter(centers)
+            self.widths = nn.Parameter(widths)
+        else:
+            self.register_buffer('centers', centers)
+            self.register_buffer('widths', widths)
+
+        # Learnable coefficients: (num_bases, *shape)
+        self.coefficients = nn.Parameter(torch.empty(num_bases, *shape))
+        if shape:
+            # Xavier init treating shape[0] as fan_out
+            nn.init.xavier_uniform_(self.coefficients.view(num_bases, shape[0], -1))
+        else:
+            nn.init.zeros_(self.coefficients)
+
+        # Precompute bin edge positions
+        if log:
+            self.register_buffer(
+                'bin_edges',
+                torch.logspace(
+                    torch.tensor(min_val).log10().item(),
+                    torch.tensor(max_val).log10().item(),
+                    num_bins + 1,
+                )
+            )
+            self._log_min = torch.tensor(min_val).log().item()
+            self._inv_log_range = 1.0 / (torch.tensor(max_val / min_val).log().item())
+        else:
+            self.register_buffer(
+                'bin_edges',
+                torch.linspace(min_val, max_val, num_bins + 1)
+            )
+
+    def _evaluate_basis(self, r: torch.Tensor) -> torch.Tensor:
+        """Evaluate Gaussian basis functions at given distances.
+
+        Args:
+            r: (N,) distance values.
+
+        Returns:
+            (N, num_bases) basis function values.
+        """
+        eps = get_epsilon(r.dtype)
+        # Ensure widths are positive
+        widths = self.widths.abs().clamp(min=eps) if isinstance(self.widths, nn.Parameter) else self.widths.clamp(min=eps)
+        diff = (r.unsqueeze(-1) - self.centers) / widths
+        return torch.exp(-diff ** 2)
+
+    def forward(self) -> torch.Tensor:
+        """Compute binned weight table from basis functions.
+
+        Returns:
+            Table of shape (num_bins+1, *shape).
+        """
+        # Evaluate basis functions at bin edges: (num_bins+1, num_bases)
+        basis_values = self._evaluate_basis(self.bin_edges)
+
+        # Weighted sum of coefficients: (num_bins+1, *shape)
+        # basis_values: (num_bins+1, K), coefficients: (K, *shape)
+        # Result: (num_bins+1, *shape)
+        table = torch.einsum('bk,k...->b...', basis_values, self.coefficients)
+
+        return table
+
+    def bin_indices(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute bin indices and interpolation weights for given values.
+
+        Args:
+            values: (N,) distance values to bin.
+
+        Returns:
+            bin_lo: (N,) lower bin indices as int32.
+            interp_weight: (N,) interpolation weights in [0, 1].
+        """
+        if self.log:
+            normalized = (values.float().clamp(min=self.min_val).log() - self._log_min) * self._inv_log_range * self.num_bins
+        else:
+            inv_bin_width = self.num_bins / (self.max_val - self.min_val)
+            normalized = (values.float() - self.min_val) * inv_bin_width
+
+        normalized = normalized.clamp(0.0, self.num_bins)
+        bin_lo = normalized.floor().int().clamp(max=self.num_bins - 1)
+        interp_weight = (normalized - bin_lo.float()).clamp(0.0, 1.0)
+        return bin_lo, interp_weight

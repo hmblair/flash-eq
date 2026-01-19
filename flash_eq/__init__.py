@@ -18,8 +18,7 @@ Radial weights:
     - BinnedRadialBasis: Parameter-efficient radial basis function weights
 """
 
-from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD
-from .basis import WignerDBasis
+from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD, WignerDBasis
 from .layers.radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 from .layers import (
     EquivariantEdgewiseLinear,

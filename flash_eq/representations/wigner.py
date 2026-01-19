@@ -1,22 +1,169 @@
-"""Wigner-D basis matrices for SO(3)-equivariant layers.
+"""Wigner-D matrices for SO(3)-equivariant operations.
 
-This module provides the WignerDBasis class for computing Wigner-D matrices
-from direction vectors. These matrices transform between the standard spherical
-harmonic basis and the m-diagonalized basis used by equivariant layers.
+This module provides:
+- WignerD: Computes Wigner D-matrices for a representation
+- WignerDBasis: Computes basis matrices from direction vectors
 
 The key insight is that Wigner-D matrices depend only on directions, not on
 layer-specific parameters. By computing them once and sharing across layers,
 we avoid redundant computation in multi-layer networks.
 
 Reference: docs/theory.tex, Section 2
+
+Author: Hamish M. Blair <hmblair@stanford.edu>
 """
+from __future__ import annotations
 
 from typing import Sequence, cast
 
 import torch
 import torch.nn as nn
 
-from .representations import Repr, WignerD
+from ..utils import get_epsilon
+from .types import Repr
+
+
+class WignerD(nn.Module):
+    """Wigner D-matrix computation for a representation.
+
+    Computes rotation matrices (Wigner D-matrices) for a given Repr.
+
+    Args:
+        repr: The representation to compute rotations for.
+
+    Example:
+        >>> repr = Repr(lvals=[0, 1, 2])
+        >>> wigner = WignerD(repr)
+        >>> axis = torch.tensor([[0., 0., 1.]])
+        >>> angle = torch.tensor([3.14159 / 4])
+        >>> D = wigner.rot(axis, angle)
+    """
+
+    def __init__(self, repr: Repr) -> None:
+        super().__init__()
+        self.repr = repr
+
+        # Build generators eagerly (always FP32 - see _apply)
+        NUM_GENS = 3
+        dim = repr.dim()
+        gens = torch.zeros(NUM_GENS, dim, dim)
+
+        cumdim = 0
+        for irrep in repr.irreps:
+            gens[
+                ...,
+                cumdim: cumdim + irrep.dim(),
+                cumdim: cumdim + irrep.dim(),
+            ] = irrep._generators()
+            cumdim += irrep.dim()
+
+        self.register_buffer('generators', gens.view(3, -1))
+
+    def _apply(self, fn):
+        """Override to keep generators in FP32 when FP16 would be used.
+
+        torch.linalg.matrix_exp is numerically unstable in FP16, so we promote
+        FP16 generators back to FP32. FP64 is left alone for full precision.
+        """
+        super()._apply(fn)
+        # Only promote to FP32 if generators became FP16 (matrix_exp is broken in FP16)
+        if self.generators.dtype == torch.float16:
+            self.generators = self.generators.float()
+        return self
+
+    def rot(
+        self,
+        axis: torch.Tensor,
+        angle: torch.Tensor,
+        cartesian: bool = False,
+    ) -> torch.Tensor:
+        """Compute the Wigner D-matrix for a rotation.
+
+        Args:
+            axis: Rotation axis of shape (..., 3).
+                  Should be normalized (or will be treated as direction).
+            angle: Rotation angle in radians of shape (...).
+            cartesian: If False (default), axis components index generators as
+                  [Lz, Lx, Ly]. This means axis=(0,0,1) rotates around the SH
+                  z-axis, producing m-diagonal Wigner-D matrices.
+                  If True, axis is in Cartesian (x,y,z) coordinates and is
+                  permuted to [z,x,y] to match the generator ordering.
+
+        Returns:
+            Wigner D-matrix of shape (..., dim, dim).
+        """
+        if cartesian:
+            # Permute axis to match generator ordering in real SH basis
+            # (ax, ay, az) -> (az, ax, ay)
+            axis = axis[..., [2, 0, 1]]
+
+        dim = self.repr.dim()
+        *b, _ = axis.size()
+        input_dtype = axis.dtype
+
+        # FP16 matrix_exp is numerically unstable (produces NaN/Inf).
+        # Compute in FP32, then cast back. Generators are always stored as FP32.
+        if input_dtype == torch.float16:
+            axis = axis.float()
+            angle = angle.float()
+
+        gens = (axis @ self.generators).view(*b, dim, dim)
+        K = angle[..., None, None] * gens
+
+        rot = torch.linalg.matrix_exp(K)
+        rot = torch.nan_to_num(rot, 0.0)
+
+        # Cast back to input dtype
+        if input_dtype == torch.float16:
+            rot = rot.half()
+
+        # Restore identity for degree-0 (scalar) irreps
+        cdims = self.repr.cumdims()
+        for i, irrep in enumerate(self.repr.irreps):
+            if irrep.l == 0:
+                rot[..., cdims[i], cdims[i]] = 1.0
+
+        return rot
+
+    def rot_to_ez(
+        self,
+        directions: torch.Tensor,
+        cartesian: bool = False,
+    ) -> torch.Tensor:
+        """Compute Wigner D-matrix for rotation taking e_z to direction.
+
+        This computes the rotation matrix D such that applying D to features
+        is equivalent to rotating the coordinate frame so that e_z points
+        along the given direction.
+
+        Args:
+            directions: (..., 3) direction vectors (need not be normalized)
+            cartesian: If True, directions are in Cartesian coordinates.
+
+        Returns:
+            D: (..., dim, dim) Wigner D-matrix
+        """
+        eps = get_epsilon(directions.dtype)
+
+        # Normalize direction
+        d = directions / (torch.linalg.norm(directions, dim=-1, keepdim=True) + eps)
+
+        # Rotation axis is perpendicular to both e_z and d
+        # axis = e_z × d = (-d_y, d_x, 0)
+        axis = torch.stack([
+            -d[..., 1],
+            d[..., 0],
+            torch.zeros_like(d[..., 0])
+        ], dim=-1)
+
+        # Normalize axis (handle d ≈ ±e_z case)
+        axis_norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
+        axis = axis / (axis_norm + eps)
+
+        # Angle is arccos(e_z · d) = arccos(d_z)
+        angle = torch.arccos(d[..., 2].clamp(-1 + eps, 1 - eps))
+
+        return self.rot(axis, angle, cartesian).mT
 
 
 def _build_m_order_permutation(lvals: torch.Tensor) -> torch.Tensor:

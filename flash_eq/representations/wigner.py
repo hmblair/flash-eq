@@ -3,6 +3,7 @@
 This module provides:
 - WignerD: Computes Wigner D-matrices for a representation
 - WignerDBasis: Computes basis matrices from direction vectors
+- random_rotation: Generate random SO(3) rotations
 
 The key insight is that Wigner-D matrices depend only on directions, not on
 layer-specific parameters. By computing them once and sharing across layers,
@@ -14,6 +15,7 @@ Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from __future__ import annotations
 
+import math
 from typing import Sequence, cast
 
 import torch
@@ -21,6 +23,45 @@ import torch.nn as nn
 
 from ..utils import get_epsilon
 from .types import Repr
+
+
+def random_rotation(
+    shape: tuple[int, ...] = (),
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate random SO(3) rotation(s) as axis-angle representation.
+
+    Args:
+        shape: Batch shape for the output tensors. Default () returns unbatched.
+        device: Device for output tensors.
+        dtype: Data type for output tensors.
+
+    Returns:
+        axis: (*shape, 3) unit vectors representing rotation axes
+        angle: (*shape,) rotation angles in radians [0, 2π)
+
+    Example:
+        >>> axis, angle = random_rotation()  # Single rotation
+        >>> axis.shape, angle.shape
+        (torch.Size([3]), torch.Size([]))
+
+        >>> axis, angle = random_rotation((10,))  # Batch of 10
+        >>> axis.shape, angle.shape
+        (torch.Size([10, 3]), torch.Size([10]))
+
+        >>> axis, angle = random_rotation((2, 3))  # 2x3 batch
+        >>> axis.shape, angle.shape
+        (torch.Size([2, 3, 3]), torch.Size([2, 3]))
+    """
+    # Random unit vector (uniform on sphere)
+    axis = torch.randn((*shape, 3), device=device, dtype=dtype)
+    axis = axis / axis.norm(dim=-1, keepdim=True)
+
+    # Random angle in [0, 2π)
+    angle = torch.rand(shape, device=device, dtype=dtype) * 2 * math.pi
+
+    return axis, angle
 
 
 class WignerD(nn.Module):

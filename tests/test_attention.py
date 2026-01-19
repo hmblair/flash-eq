@@ -119,7 +119,7 @@ class TestEquivariantEdgeAttention:
 
         # Random rotation
         axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        D = wigner.rot(axis, angle)
 
         # Rotate features
         edge_features_rotated = torch.einsum('ij,...j->...i', D, edge_features)
@@ -157,7 +157,7 @@ class TestEquivariantEdgeAttention:
 
         # Random rotation
         axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Attention then rotate
         out_original = attn(edge_features, dst, num_nodes)
@@ -231,7 +231,7 @@ class TestFullPipeline:
 
         # Random rotation
         axis, angle, R = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Forward then rotate output
         P, Q = basis(directions)

@@ -1,28 +1,39 @@
 """Shared test helpers for flash-eq tests."""
 
-import math
 import torch
-from scipy.spatial.transform import Rotation
+
+from flash_eq import Repr, WignerD
+from flash_eq import random_rotation as _random_axis_angle
 
 
-def random_rotation(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+# Cached WignerD for l=1 (3D rotation matrices)
+_WIGNER_L1: WignerD | None = None
+
+
+def _get_wigner_l1() -> WignerD:
+    """Get cached WignerD for l=1."""
+    global _WIGNER_L1
+    if _WIGNER_L1 is None:
+        _WIGNER_L1 = WignerD(Repr([1]))
+    return _WIGNER_L1
+
+
+def random_rotation(
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a random SO(3) rotation.
 
     Returns:
-        axis: (1, 3) rotation axis (unit vector)
-        angle: (1,) rotation angle in radians
+        axis: (3,) rotation axis (unit vector)
+        angle: () rotation angle in radians
         R: (3, 3) Cartesian rotation matrix
     """
-    axis_np = torch.randn(3).numpy()
-    axis_np = axis_np / (axis_np ** 2).sum() ** 0.5
-    angle_np = float(torch.rand(1) * 2 * math.pi)
+    axis, angle = _random_axis_angle(device=device, dtype=dtype)
 
-    rotvec = axis_np * angle_np
-    R_np = Rotation.from_rotvec(rotvec).as_matrix()
-
-    axis = torch.tensor(axis_np, device=device, dtype=torch.float32).unsqueeze(0)
-    angle = torch.tensor([angle_np], device=device, dtype=torch.float32)
-    R = torch.tensor(R_np, device=device, dtype=torch.float32)
+    # Get 3x3 rotation matrix using WignerD with l=1
+    wigner = _get_wigner_l1().to(device)
+    R = wigner.rot(axis, angle, cartesian=True)
 
     return axis, angle, R
 

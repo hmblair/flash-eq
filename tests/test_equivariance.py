@@ -65,8 +65,8 @@ def test_equivariance(cuda_device, lvals_in, lvals_out):
 
     # Random rotation
     axis, angle, R = random_rotation(cuda_device)
-    D_in = wigner_in.rot(axis, angle).squeeze(0)
-    D_out = wigner_out.rot(axis, angle).squeeze(0)
+    D_in = wigner_in.rot(axis, angle)
+    D_out = wigner_out.rot(axis, angle)
 
     P, Q = basis(directions)
 
@@ -115,8 +115,8 @@ def test_equivariance_multiple_rotations(cuda_device, lvals_in, lvals_out):
 
     for i in range(3):
         axis, angle, R = random_rotation(cuda_device)
-        D_in = wigner_in.rot(axis, angle).squeeze(0)
-        D_out = wigner_out.rot(axis, angle).squeeze(0)
+        D_in = wigner_in.rot(axis, angle)
+        D_out = wigner_out.rot(axis, angle)
 
         P, Q = basis(directions)
         output1 = layer(P, Q, node_features, distances, src_indices)
@@ -154,7 +154,7 @@ def test_equivariance_high_lmax(cuda_device):
     directions = directions / directions.norm(dim=-1, keepdim=True)
 
     axis, angle, R = random_rotation(cuda_device)
-    D = wigner.rot(axis, angle).squeeze(0)
+    D = wigner.rot(axis, angle)
 
     P, Q = basis(directions)
     output1 = layer(P, Q, node_features, distances, src_indices)
@@ -199,7 +199,7 @@ def test_gradient_equivariance(cuda_device, lvals):
     wigner = WignerD(in_repr).to(cuda_device)
 
     axis, angle, R = random_rotation(cuda_device)
-    D = wigner.rot(axis, angle).squeeze(0)
+    D = wigner.rot(axis, angle)
 
     src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device, dtype=torch.int64)
     distances = torch.rand(num_edges, device=cuda_device) * 5.0

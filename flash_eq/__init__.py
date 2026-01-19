@@ -18,7 +18,7 @@ Radial weights:
     - BinnedRadialBasis: Parameter-efficient radial basis function weights
 """
 
-from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD, WignerDBasis
+from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD, WignerDBasis, random_rotation
 from .layers.radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 from .layers import (
     EquivariantEdgewiseLinear,
@@ -44,6 +44,7 @@ __all__ = [
     "Repr",
     "ProductRepr",
     "WignerD",
+    "random_rotation",
     # Layers
     "EquivariantEdgewiseLinear",
     "EquivariantAttention",

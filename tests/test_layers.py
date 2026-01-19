@@ -7,35 +7,12 @@ Tests rotation invariance (RepNorm) and equivariance (other layers).
 import math
 import torch
 import pytest
-from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from flash_eq import (
-    Repr, WignerD,
+    Repr, WignerD, random_rotation,
     RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm,
     SeparableEquivariantLayerNorm, GraphPooling,
 )
-
-
-def random_rotation(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate a random rotation.
-
-    Returns:
-        axis: (1, 3) rotation axis
-        angle: (1,) rotation angle
-        D: Wigner-D matrix for the rotation
-    """
-    axis_np = torch.randn(3).numpy()
-    axis_np = axis_np / (axis_np ** 2).sum() ** 0.5
-    angle_np = float(torch.rand(1) * 2 * math.pi)
-
-    rotvec = axis_np * angle_np
-    R_np = Rotation.from_rotvec(rotvec).as_matrix()
-
-    axis = torch.tensor(axis_np, device=device, dtype=torch.float32).unsqueeze(0)
-    angle = torch.tensor([angle_np], device=device, dtype=torch.float32)
-    R = torch.tensor(R_np, device=device, dtype=torch.float32)
-
-    return axis, angle, R
 
 
 LVALS_CONFIGS = [
@@ -72,8 +49,8 @@ class TestRepNorm:
         norms_before = norm(x)
 
         # Apply random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        axis, angle = random_rotation(device=device)
+        D = wigner.rot(axis, angle)
         x_rot = torch.einsum('ij,bmj->bmi', D, x)
 
         # Compute norms after rotation
@@ -124,8 +101,8 @@ class TestEquivariantLinear:
         x = torch.randn(16, mult, dim, device=device)
 
         # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        axis, angle = random_rotation(device=device)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Apply layer, then rotate
         out1 = layer(x)
@@ -194,8 +171,8 @@ class TestEquivariantGating:
         x = torch.randn(16, mult, dim, device=device)
 
         # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        axis, angle = random_rotation(device=device)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Apply layer, then rotate
         out1 = layer(x)
@@ -249,8 +226,8 @@ class TestEquivariantLayerNorm:
         x = torch.randn(16, mult, dim, device=device)
 
         # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        axis, angle = random_rotation(device=device)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Apply layer, then rotate
         out1 = layer(x)
@@ -306,8 +283,8 @@ class TestSeparableEquivariantLayerNorm:
         x = torch.randn(16, mult, dim, device=device)
 
         # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        axis, angle = random_rotation(device=device)
+        D = wigner.rot(axis, angle)
 
         # Method 1: Apply layer, then rotate
         out1 = layer(x)
@@ -644,3 +621,60 @@ class TestGraphPooling:
         assert out.shape == (num_nodes, 32, 9)
         # Verify it ran without error and produced finite values
         assert torch.isfinite(out).all()
+
+
+class TestWignerDScipyEquivalence:
+    """Test that WignerD l=1 matches scipy rotation matrices."""
+
+    def test_matches_scipy_single_rotation(self, device):
+        """WignerD(Repr([1])) with cartesian=True should match scipy."""
+        pytest.importorskip("scipy")
+        from scipy.spatial.transform import Rotation
+        import numpy as np
+
+        torch.manual_seed(42)
+
+        wigner = WignerD(Repr([1])).to(device)
+
+        for _ in range(10):
+            # Generate random rotation via scipy
+            rot_scipy = Rotation.random()
+            rotvec = rot_scipy.as_rotvec()
+            angle_np = np.linalg.norm(rotvec)
+            axis_np = rotvec / (angle_np + 1e-10) if angle_np > 1e-10 else np.array([0., 0., 1.])
+
+            R_scipy = rot_scipy.as_matrix()
+
+            # Compute via WignerD
+            axis = torch.tensor(axis_np, device=device, dtype=torch.float32)
+            angle = torch.tensor(angle_np, device=device, dtype=torch.float32)
+            R_wigner = wigner.rot(axis, angle, cartesian=True).cpu().numpy()
+
+            # Should match within float32 precision
+            max_diff = np.abs(R_scipy - R_wigner).max()
+            assert max_diff < 1e-5, f"WignerD doesn't match scipy: max_diff={max_diff:.2e}"
+
+    def test_matches_scipy_batched(self, device):
+        """Batched WignerD should match scipy for each rotation."""
+        pytest.importorskip("scipy")
+        from scipy.spatial.transform import Rotation
+        import numpy as np
+
+        torch.manual_seed(123)
+
+        wigner = WignerD(Repr([1])).to(device)
+        batch_size = 20
+
+        # Generate batch of random rotations
+        axes, angles = random_rotation((batch_size,), device=device)
+        R_wigner = wigner.rot(axes, angles, cartesian=True).cpu().numpy()
+
+        # Compare each with scipy
+        for i in range(batch_size):
+            axis_np = axes[i].cpu().numpy()
+            angle_np = angles[i].cpu().numpy()
+            rotvec = axis_np * angle_np
+            R_scipy = Rotation.from_rotvec(rotvec).as_matrix()
+
+            max_diff = np.abs(R_scipy - R_wigner[i]).max()
+            assert max_diff < 1e-5, f"Rotation {i}: max_diff={max_diff:.2e}"

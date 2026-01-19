@@ -18,7 +18,7 @@ Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 
 from .types import Irrep, ProductIrrep, Repr, ProductRepr
-from .wigner import WignerD, WignerDBasis
+from .wigner import WignerD, WignerDBasis, random_rotation
 
 __all__ = [
     # Types
@@ -29,4 +29,6 @@ __all__ = [
     # Wigner matrices
     "WignerD",
     "WignerDBasis",
+    # Utilities
+    "random_rotation",
 ]

@@ -132,8 +132,8 @@ class TestEquivariantTransformerBlock:
 
         # Random rotation
         axis, angle, R = random_rotation(cuda_device)
-        D_in = wigner_in.rot(axis, angle).squeeze(0)
-        D_out = wigner_out.rot(axis, angle).squeeze(0)
+        D_in = wigner_in.rot(axis, angle)
+        D_out = wigner_out.rot(axis, angle)
 
         # Method 1: Forward then rotate output
         P, Q = basis(directions)
@@ -179,8 +179,8 @@ class TestEquivariantTransformerBlock:
 
         # Random rotation
         axis, angle, R = random_rotation(cuda_device)
-        D_in = wigner_in.rot(axis, angle).squeeze(0)
-        D_out = wigner_out.rot(axis, angle).squeeze(0)
+        D_in = wigner_in.rot(axis, angle)
+        D_out = wigner_out.rot(axis, angle)
 
         # Method 1: Forward then rotate output
         P, Q = basis(directions)
@@ -343,8 +343,8 @@ class TestEquivariantTransformer:
 
         # Random rotation
         axis, angle, R = random_rotation(cuda_device)
-        D_in = wigner_in.rot(axis, angle).squeeze(0)
-        D_out = wigner_out.rot(axis, angle).squeeze(0)
+        D_in = wigner_in.rot(axis, angle)
+        D_out = wigner_out.rot(axis, angle)
 
         # Method 1: Forward then rotate
         matrices = basis(directions)

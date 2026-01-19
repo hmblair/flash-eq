@@ -104,7 +104,7 @@ class TestS2ActivationEquivariance:
 
         # Get rotation
         axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        D = wigner.rot(axis, angle)
 
         # Method 1: forward then rotate
         y1 = act(x)
@@ -134,7 +134,7 @@ class TestS2ActivationEquivariance:
         x = torch.randn(batch_size, mult, dim, device=device)
 
         axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle).squeeze(0)
+        D = wigner.rot(axis, angle)
         x_rot = torch.einsum('ij,bmj->bmi', D, x)
 
         errors = []

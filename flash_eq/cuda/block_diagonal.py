@@ -82,6 +82,25 @@ def _check_cuda_available() -> None:
     _cuda_available = True
 
 
+def _get_gpu_arch() -> str:
+    """Get the compute capability of the current GPU."""
+    major, minor = torch.cuda.get_device_capability()
+    return f"{major}.{minor}"
+
+
+def _arch_supported(gpu_arch: str, compiled_archs: list[str]) -> bool:
+    """Check if GPU architecture is supported by compiled binary."""
+    if gpu_arch in compiled_archs:
+        return True
+    # Check PTX forward compatibility (e.g., "9.0+PTX" supports 9.0+)
+    for arch in compiled_archs:
+        if arch.endswith("+PTX"):
+            base = arch.replace("+PTX", "")
+            if gpu_arch >= base:
+                return True
+    return False
+
+
 def _get_cuda_module():
     """Load the CUDA extension (pre-built or JIT compiled)."""
     global _cuda_module
@@ -91,14 +110,29 @@ def _get_cuda_module():
     if _cuda_module is not None:
         return _cuda_module
 
-    # Try to import pre-built extension first
+    # Check if pre-built extension supports this GPU
+    gpu_arch = _get_gpu_arch()
     try:
-        from .. import _block_diagonal_cuda
-        _cuda_module = _block_diagonal_cuda
-        logger.debug("Loaded pre-built CUDA extension")
-        return _cuda_module
+        from .._build_info import COMPILED_ARCHS
+        use_prebuilt = _arch_supported(gpu_arch, COMPILED_ARCHS)
+        if not use_prebuilt:
+            logger.info(
+                f"GPU arch {gpu_arch} not in pre-built archs {COMPILED_ARCHS}, "
+                "falling back to JIT compilation"
+            )
     except ImportError:
-        logger.debug("Pre-built CUDA extension not found, falling back to JIT compilation")
+        # No build info = no pre-built extension
+        use_prebuilt = False
+
+    # Try to import pre-built extension if supported
+    if use_prebuilt:
+        try:
+            from .. import _block_diagonal_cuda
+            _cuda_module = _block_diagonal_cuda
+            logger.debug(f"Loaded pre-built CUDA extension for arch {gpu_arch}")
+            return _cuda_module
+        except ImportError:
+            logger.debug("Pre-built CUDA extension not found, falling back to JIT compilation")
 
     # Fall back to JIT compilation
     from torch.utils.cpp_extension import load

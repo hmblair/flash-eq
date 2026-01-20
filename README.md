@@ -1,6 +1,6 @@
 # flash-eq
 
-Fast, memory-efficient SO(3)-equivariant linear layers using Wigner-D diagonalization.
+Fast, memory-efficient SO(3)-equivariant graph neural networks using Wigner-D diagonalization.
 
 ## Installation
 
@@ -14,32 +14,40 @@ Requires PyTorch >= 2.0 with CUDA support. The CUDA kernel is JIT-compiled on fi
 
 ```python
 import torch
-from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr
+from flash_eq import EquivariantTransformer, Graph, Repr
 
-# Define representations (l=0,1,2 with 32 channels)
-in_repr = Repr(lvals=[0, 1, 2], mult=32)
-out_repr = Repr(lvals=[0, 1, 2], mult=32)
+# Define representations
+in_repr = Repr(lvals=[0, 1], mult=32)       # Input: scalars + vectors
+hidden_repr = Repr(lvals=[0, 1, 2], mult=64) # Hidden: up to L=2
+out_repr = Repr(lvals=[0], mult=1)           # Output: scalar prediction
 
-# Create layer and basis
-layer = EquivariantEdgewiseLinear(in_repr, out_repr).cuda()
-basis = WignerDBasis([in_repr, out_repr]).cuda()
+# Create model
+model = EquivariantTransformer(
+    in_repr, hidden_repr, out_repr,
+    num_layers=4,
+    num_heads=8,
+).cuda()
 
 # Input data
-num_nodes, num_edges = 1000, 5000
-node_features = torch.randn(num_nodes, 32, in_repr.dim(), device='cuda')
-src_indices = torch.randint(0, num_nodes, (num_edges,), device='cuda')
-directions = torch.randn(num_edges, 3, device='cuda')
-directions = directions / directions.norm(dim=-1, keepdim=True)
-distances = torch.rand(num_edges, device='cuda') * 10.0
+num_nodes = 100
+coordinates = torch.randn(num_nodes, 3, device='cuda')
+node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device='cuda')
 
-# Compute basis matrices (once per forward pass, shared across layers)
-P, Q = basis(directions)  # One matrix per repr in the input list
+# Graph connectivity (e.g., k-nearest neighbors)
+graph = Graph.random(num_nodes, num_edges=500, device='cuda')
+# Or from explicit indices:
+# graph = Graph(src=src_indices, dst=dst_indices, num_nodes=num_nodes)
 
-# Gather node features to edges, then apply layer
-edge_features = node_features[src_indices]
-output = layer(P, Q, edge_features, distances)
-# output.shape = (num_edges, 32, out_repr.dim())
+# Forward pass
+output = model(coordinates, node_features, graph)
+# output.shape = (num_nodes, 1, 1)
 ```
+
+The model automatically:
+- Computes edge vectors and distances from coordinates
+- Constructs Wigner-D basis matrices for SO(3) equivariance
+- Applies distance-dependent radial weights
+- Pools edge features back to nodes
 
 ## API Reference
 
@@ -56,6 +64,78 @@ repr = Repr(lvals=[0, 1, 2], mult=32)
 repr.dim      # Total dimension: 1 + 3 + 5 = 9
 repr.lvals    # [0, 1, 2]
 repr.mult     # 32
+```
+
+### Graph
+
+Lightweight container for graph connectivity in COO format.
+
+```python
+from flash_eq import Graph
+
+# From explicit indices
+graph = Graph(
+    src=src_indices,    # (num_edges,) source node indices
+    dst=dst_indices,    # (num_edges,) destination node indices
+    num_nodes=100,
+)
+
+# Random graph for testing
+graph = Graph.random(num_nodes=100, num_edges=500, device='cuda')
+
+graph.num_edges  # Number of edges
+graph.device     # Device of tensors
+graph.to('cuda') # Move to device
+```
+
+### EquivariantTransformer
+
+Full equivariant transformer model with input projection, transformer blocks, and output projection.
+
+```python
+from flash_eq import EquivariantTransformer, Repr, Graph
+
+model = EquivariantTransformer(
+    in_repr=Repr([0, 1], mult=32),        # Input representation
+    hidden_repr=Repr([0, 1, 2], mult=64), # Hidden representation
+    out_repr=Repr([0], mult=1),           # Output representation
+    num_layers=6,                          # Number of transformer blocks
+    num_heads=8,                           # Attention heads
+    num_bases=16,                          # Radial basis functions (recommended)
+    max_dist=10.0,                         # Maximum distance for radial weights
+).cuda()
+
+# Forward pass
+output = model(coordinates, node_features, graph)
+```
+
+**Arguments:**
+- `coordinates`: `(num_nodes, 3)` node positions
+- `node_features`: `(num_nodes, mult_in, dim_in)` input features
+- `graph`: Graph with edge connectivity
+
+**Returns:**
+- `output`: `(num_nodes, mult_out, dim_out)` transformed features
+
+### EquivariantTransformerBlock
+
+Single transformer block for building custom architectures.
+
+```python
+from flash_eq import EquivariantTransformerBlock, WignerDBasis, Repr, Graph
+
+block = EquivariantTransformerBlock(
+    in_repr=Repr([0, 1, 2], mult=64),
+    out_repr=Repr([0, 1, 2], mult=64),
+    num_heads=8,
+).cuda()
+
+# Compute basis matrices
+basis = WignerDBasis([in_repr, out_repr]).cuda()
+P, Q = basis(directions)
+
+# Forward pass
+output = block(P, Q, node_features, distances, graph)
 ```
 
 ### WignerDBasis

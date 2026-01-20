@@ -25,6 +25,8 @@ class RepNorm(nn.Module):
 
     Args:
         repr: The representation specifying the tensor structure.
+        epsilon: Small constant for numerical stability. If None, uses
+            dtype-aware default.
 
     Example:
         >>> repr = Repr(lvals=[0, 1, 2])
@@ -33,9 +35,10 @@ class RepNorm(nn.Module):
         >>> norms = norm(st)  # shape: (32, 3)
     """
 
-    def __init__(self, repr: Repr) -> None:
+    def __init__(self, repr: Repr, epsilon: float | None = None) -> None:
         super().__init__()
         self.num_reps = repr.nreps()
+        self._epsilon = epsilon
 
         # Create indices mapping each dimension to its irrep index
         cdims = repr.cumdims()
@@ -48,7 +51,8 @@ class RepNorm(nn.Module):
     def forward(self, st: torch.Tensor) -> torch.Tensor:
         """Compute the norm of each irrep component.
 
-        Uses vectorized scatter_add for GPU efficiency.
+        Uses vectorized scatter_add for GPU efficiency. Adds epsilon before
+        sqrt to avoid NaN gradients when components are zero.
 
         Args:
             st: Spherical tensor of shape (..., dim).
@@ -56,6 +60,7 @@ class RepNorm(nn.Module):
         Returns:
             Norms of shape (..., nreps).
         """
+        epsilon = self._epsilon if self._epsilon is not None else get_epsilon(st.dtype)
         sq = st * st
 
         result = torch.zeros(
@@ -65,7 +70,7 @@ class RepNorm(nn.Module):
         ix = self.indices.expand(sq.shape)  # type: ignore[operator]
         result.scatter_add_(-1, ix, sq)
 
-        return result.sqrt()
+        return (result + epsilon).sqrt()
 
 
 class _ChannelLayerNorm(nn.Module):

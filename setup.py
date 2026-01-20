@@ -10,13 +10,26 @@ try:
     import torch
     if torch.cuda.is_available() or os.environ.get("CUDA_HOME"):
         from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+        # Support multiple GPU architectures:
+        # - A100: sm_80 (Ampere)
+        # - L40S: sm_89 (Ada Lovelace)
+        # - H100: sm_90 (Hopper)
+        nvcc_args = [
+            "-O3",
+            "--use_fast_math",
+            "-gencode=arch=compute_80,code=sm_80",  # A100
+            "-gencode=arch=compute_89,code=sm_89",  # L40S
+            "-gencode=arch=compute_90,code=sm_90",  # H100
+        ]
+
         ext_modules.append(
             CUDAExtension(
                 name="flash_eq._block_diagonal_cuda",
                 sources=["flash_eq/cuda/csrc/block_diagonal.cu"],
                 extra_compile_args={
                     "cxx": ["-O3"],
-                    "nvcc": ["-O3", "--use_fast_math"],
+                    "nvcc": nvcc_args,
                 },
             )
         )

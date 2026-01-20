@@ -290,10 +290,10 @@ def benchmark_graph_pooling(
     edge_features = torch.randn(
         scenario.num_edges, scenario.mult, scenario.dim, device=device, dtype=dtype
     )
-    dst_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
+    graph = Graph.random(scenario.num_nodes, scenario.num_edges, device=device)
 
     try:
-        return benchmark(lambda: pool(edge_features, dst_indices, scenario.num_nodes))
+        return benchmark(lambda: pool(edge_features, graph))
     except torch.cuda.OutOfMemoryError:
         return None
 
@@ -348,14 +348,14 @@ def benchmark_edge_attention(
         dtype=dtype,
         requires_grad=True,
     )
-    dst_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
+    graph = Graph.random(scenario.num_nodes, scenario.num_edges, device=device)
     target = torch.randn(
         scenario.num_edges, scenario.mult, scenario.dim, device=device, dtype=dtype
     )
 
     def train_step():
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = attn(Q, K, V, dst_indices, scenario.num_nodes)
+            output = attn(Q, K, V, graph)
             loss = ((output - target) ** 2).mean()
         loss.backward()
         # Clear gradients manually since attn has no learnable params

@@ -9,7 +9,7 @@ import torch
 import pytest
 
 from flash_eq import (
-    Repr, WignerD, random_rotation,
+    Graph, Repr, WignerD, random_rotation,
     RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm,
     SeparableEquivariantLayerNorm, GraphPooling,
 )
@@ -449,9 +449,9 @@ class TestGraphPooling:
 
         num_nodes, num_edges, channels, dim = 10, 100, 8, 9
         edge_features = torch.randn(num_edges, channels, dim, device=device)
-        dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+        graph = Graph.random(num_nodes, num_edges, device=device)
 
-        out = pool(edge_features, dst_indices, num_nodes)
+        out = pool(edge_features, graph)
 
         assert out.shape == (num_nodes, channels, dim)
 
@@ -462,9 +462,9 @@ class TestGraphPooling:
 
         for dtype in [torch.float32, torch.float64]:
             edge_features = torch.randn(50, 4, 9, device=device, dtype=dtype)
-            dst_indices = torch.randint(0, 10, (50,), device=device)
+            graph = Graph.random(10, 50, device=device)
 
-            out = pool(edge_features, dst_indices, 10)
+            out = pool(edge_features, graph)
             assert out.dtype == dtype
 
     def test_sum_correctness(self, device):
@@ -478,9 +478,11 @@ class TestGraphPooling:
             [[5.0, 6.0]],  # edge 2 -> node 1
             [[7.0, 8.0]],  # edge 3 -> node 1
         ], device=device)
-        dst_indices = torch.tensor([0, 0, 1, 1], device=device)
+        dst = torch.tensor([0, 0, 1, 1], device=device)
+        src = torch.zeros_like(dst)  # dummy src for Graph
+        graph = Graph(src=src, dst=dst, num_nodes=2)
 
-        out = pool(edge_features, dst_indices, num_nodes=2)
+        out = pool(edge_features, graph)
 
         expected = torch.tensor([
             [[4.0, 6.0]],   # 1+3, 2+4
@@ -498,9 +500,11 @@ class TestGraphPooling:
             [[4.0, 8.0]],  # edge 1 -> node 0
             [[9.0, 3.0]],  # edge 2 -> node 1
         ], device=device)
-        dst_indices = torch.tensor([0, 0, 1], device=device)
+        dst = torch.tensor([0, 0, 1], device=device)
+        src = torch.zeros_like(dst)
+        graph = Graph(src=src, dst=dst, num_nodes=2)
 
-        out = pool(edge_features, dst_indices, num_nodes=2)
+        out = pool(edge_features, graph)
 
         expected = torch.tensor([
             [[3.0, 6.0]],  # mean of [2,4] and [4,8]
@@ -518,9 +522,11 @@ class TestGraphPooling:
             [[3.0, 2.0]],  # edge 1 -> node 0
             [[7.0, 8.0]],  # edge 2 -> node 1
         ], device=device)
-        dst_indices = torch.tensor([0, 0, 1], device=device)
+        dst = torch.tensor([0, 0, 1], device=device)
+        src = torch.zeros_like(dst)
+        graph = Graph(src=src, dst=dst, num_nodes=2)
 
-        out = pool(edge_features, dst_indices, num_nodes=2)
+        out = pool(edge_features, graph)
 
         expected = torch.tensor([
             [[3.0, 5.0]],  # max(1,3), max(5,2)
@@ -534,9 +540,11 @@ class TestGraphPooling:
         pool = GraphPooling(reduce='sum')
 
         edge_features = torch.zeros(0, 4, 9, device=device)
-        dst_indices = torch.zeros(0, dtype=torch.long, device=device)
+        src = torch.zeros(0, dtype=torch.long, device=device)
+        dst = torch.zeros(0, dtype=torch.long, device=device)
+        graph = Graph(src=src, dst=dst, num_nodes=5)
 
-        out = pool(edge_features, dst_indices, num_nodes=5)
+        out = pool(edge_features, graph)
 
         assert out.shape == (5, 4, 9)
         assert (out == 0).all()
@@ -549,10 +557,12 @@ class TestGraphPooling:
 
         # All edges go to node 0, nodes 1-4 have no edges
         edge_features = torch.randn(10, 4, 9, device=device)
-        dst_indices = torch.zeros(10, dtype=torch.long, device=device)
+        dst = torch.zeros(10, dtype=torch.long, device=device)
+        src = torch.zeros_like(dst)
+        graph = Graph(src=src, dst=dst, num_nodes=5)
 
         for pool in [pool_sum, pool_mean, pool_max]:
-            out = pool(edge_features, dst_indices, num_nodes=5)
+            out = pool(edge_features, graph)
 
             # Nodes 1-4 should be zero
             assert (out[1:] == 0).all()
@@ -565,9 +575,11 @@ class TestGraphPooling:
 
         num_edges = 100
         edge_features = torch.ones(num_edges, 2, 3, device=device)
-        dst_indices = torch.zeros(num_edges, dtype=torch.long, device=device)
+        dst = torch.zeros(num_edges, dtype=torch.long, device=device)
+        src = torch.zeros_like(dst)
+        graph = Graph(src=src, dst=dst, num_nodes=10)
 
-        out = pool(edge_features, dst_indices, num_nodes=10)
+        out = pool(edge_features, graph)
 
         # Node 0 should have sum = num_edges
         assert torch.allclose(out[0], torch.full((2, 3), float(num_edges), device=device))
@@ -579,9 +591,11 @@ class TestGraphPooling:
         pool = GraphPooling(reduce='sum')
 
         edge_features = torch.tensor([[[1.0, 2.0, 3.0]]], device=device)
-        dst_indices = torch.tensor([2], device=device)
+        dst = torch.tensor([2], device=device)
+        src = torch.zeros_like(dst)
+        graph = Graph(src=src, dst=dst, num_nodes=5)
 
-        out = pool(edge_features, dst_indices, num_nodes=5)
+        out = pool(edge_features, graph)
 
         assert out.shape == (5, 1, 3)
         assert torch.allclose(out[2], edge_features[0])
@@ -604,9 +618,9 @@ class TestGraphPooling:
         pool = GraphPooling(reduce=reduce)
 
         edge_features = torch.randn(50, 4, 9, device=device, requires_grad=True)
-        dst_indices = torch.randint(0, 10, (50,), device=device)
+        graph = Graph.random(10, 50, device=device)
 
-        out = pool(edge_features, dst_indices, num_nodes=10)
+        out = pool(edge_features, graph)
         loss = out.sum()
         loss.backward()
 
@@ -619,9 +633,9 @@ class TestGraphPooling:
 
         num_nodes, num_edges = 1000, 100000
         edge_features = torch.randn(num_edges, 32, 9, device=device)
-        dst_indices = torch.randint(0, num_nodes, (num_edges,), device=device)
+        graph = Graph.random(num_nodes, num_edges, device=device)
 
-        out = pool(edge_features, dst_indices, num_nodes)
+        out = pool(edge_features, graph)
 
         assert out.shape == (num_nodes, 32, 9)
         # Verify it ran without error and produced finite values

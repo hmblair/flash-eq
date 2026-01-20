@@ -19,6 +19,7 @@ Radial weights:
 """
 
 from .representations import Irrep, ProductIrrep, Repr, ProductRepr, WignerD, WignerDBasis, random_rotation
+from .graph import Graph
 from .layers.radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
 from .layers import (
     EquivariantEdgewiseLinear,
@@ -46,6 +47,8 @@ __all__ = [
     "ProductRepr",
     "WignerD",
     "random_rotation",
+    # Graph
+    "Graph",
     # Layers
     "EquivariantEdgewiseLinear",
     "EquivariantAttention",

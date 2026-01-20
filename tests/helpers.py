@@ -2,7 +2,7 @@
 
 import torch
 
-from flash_eq import Repr, WignerD
+from flash_eq import Graph, Repr, WignerD
 from flash_eq import random_rotation as _random_axis_angle
 
 
@@ -41,17 +41,14 @@ def random_rotation(
 def make_graph(
     num_nodes: int,
     num_edges: int,
-    device: torch.device = torch.device('cpu'),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create random graph edge indices (may include self-loops).
+    device: torch.device | str = "cpu",
+) -> Graph:
+    """Create random graph (may include self-loops).
 
     Returns:
-        src_indices: (num_edges,) source node for each edge
-        dst_indices: (num_edges,) destination node for each edge
+        Graph with random edges.
     """
-    src = torch.randint(0, num_nodes, (num_edges,), device=device)
-    dst = torch.randint(0, num_nodes, (num_edges,), device=device)
-    return src, dst
+    return Graph.random(num_nodes, num_edges, device=device)
 
 
 def check_equivariance(

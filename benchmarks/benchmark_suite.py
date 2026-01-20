@@ -30,6 +30,7 @@ from flash_eq import (
     EquivariantEdgewiseLinear,
     EquivariantTransformer,
     EquivariantTransformerBlock,
+    Graph,
     GraphPooling,
     Repr,
     S2Activation,
@@ -452,8 +453,7 @@ def benchmark_transformer_block(
         dtype=dtype,
         requires_grad=True,
     )
-    src_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
-    dst_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
+    graph = Graph.random(scenario.num_nodes, scenario.num_edges, device=device)
     directions = torch.randn(scenario.num_edges, 3, device=device, dtype=dtype)
     directions = directions / directions.norm(dim=-1, keepdim=True)
     distances = torch.rand(scenario.num_edges, device=device, dtype=dtype) * 10.0
@@ -466,9 +466,7 @@ def benchmark_transformer_block(
     def train_step():
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = block(
-                P, Q, node_features, distances, src_indices, dst_indices, scenario.num_nodes
-            )
+            output = block(P, Q, node_features, distances, graph)
             loss = ((output - target) ** 2).mean()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -522,8 +520,7 @@ def benchmark_transformer(
         dtype=dtype,
         requires_grad=True,
     )
-    src_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
-    dst_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
+    graph = Graph.random(scenario.num_nodes, scenario.num_edges, device=device)
     target = torch.randn(
         scenario.num_nodes, scenario.mult, out_repr.dim(), device=device, dtype=dtype
     )
@@ -531,7 +528,7 @@ def benchmark_transformer(
     def train_step():
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = model(coordinates, node_features, src_indices, dst_indices)
+            output = model(coordinates, node_features, graph)
             loss = ((output - target) ** 2).mean()
         scaler.scale(loss).backward()
         scaler.step(optimizer)

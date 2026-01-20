@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..graph import Graph
 from ..representations import Repr, WignerDBasis
 from .attention import EquivariantAttention
 from .linear import EquivariantLinear
@@ -62,7 +63,7 @@ class EquivariantTransformerBlock(nn.Module):
         s2_precision: Lebedev precision for S² grid (default 47, 770 points).
 
     Example:
-        >>> from flash_eq import Repr, WignerDBasis
+        >>> from flash_eq import Repr, Graph, WignerDBasis
         >>> from flash_eq.layers import EquivariantTransformerBlock
         >>>
         >>> in_repr = Repr(lvals=[0, 1], mult=32)
@@ -74,8 +75,9 @@ class EquivariantTransformerBlock(nn.Module):
         ... ).cuda()
         >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>>
+        >>> graph = Graph.random(num_nodes=100, num_edges=1000).to('cuda')
         >>> P, Q = basis(directions)
-        >>> output = block(P, Q, node_features, distances, src, dst, num_nodes)
+        >>> output = block(P, Q, node_features, distances, graph)
     """
 
     def __init__(
@@ -156,9 +158,7 @@ class EquivariantTransformerBlock(nn.Module):
         Q: torch.Tensor,
         node_features: torch.Tensor,
         distances: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
-        num_nodes: int,
+        graph: Graph,
         edge_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply equivariant transformer block.
@@ -168,9 +168,7 @@ class EquivariantTransformerBlock(nn.Module):
             Q: (num_edges, dim_out, dim_out) output basis matrix from WignerDBasis.
             node_features: (num_nodes, mult_in, dim_in) input node features.
             distances: (num_edges,) edge distances.
-            src_indices: (num_edges,) source node index for each edge.
-            dst_indices: (num_edges,) destination node index for each edge.
-            num_nodes: Total number of nodes.
+            graph: Graph containing edge indices and node count.
             edge_features: Optional (num_edges, mult_in, dim_in) edge features
                 to add to gathered node features before the linear transformation.
                 Useful for injecting edge-level information like positional encodings.
@@ -181,7 +179,7 @@ class EquivariantTransformerBlock(nn.Module):
         # Self-attention block
         x_norm = self.norm1(node_features)
         attn_out = self.attn(
-            P, Q, x_norm, distances, src_indices, dst_indices, num_nodes,
+            P, Q, x_norm, distances, graph,
             edge_features=edge_features,
         )
 
@@ -231,7 +229,7 @@ class EquivariantTransformer(nn.Module):
         s2_precision: Lebedev precision for S² grid (default 47).
 
     Example:
-        >>> from flash_eq import Repr
+        >>> from flash_eq import Repr, Graph
         >>> from flash_eq.layers import EquivariantTransformer
         >>>
         >>> in_repr = Repr(lvals=[0, 1], mult=32)
@@ -244,7 +242,8 @@ class EquivariantTransformer(nn.Module):
         ... ).cuda()
         >>>
         >>> # Forward pass with coordinates - basis computed internally
-        >>> output = model(coordinates, node_features, src, dst)
+        >>> graph = Graph.random(num_nodes=100, num_edges=1000).to('cuda')
+        >>> output = model(coordinates, node_features, graph)
     """
 
     def __init__(
@@ -322,24 +321,20 @@ class EquivariantTransformer(nn.Module):
         self,
         coordinates: torch.Tensor,
         node_features: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
+        graph: Graph,
     ) -> torch.Tensor:
         """Apply equivariant transformer.
 
         Args:
             coordinates: (num_nodes, 3) node coordinates.
             node_features: (num_nodes, mult_in, dim_in) input features.
-            src_indices: (num_edges,) source node index for each edge.
-            dst_indices: (num_edges,) destination node index for each edge.
+            graph: Graph containing edge indices and node count.
 
         Returns:
             (num_nodes, mult_out, dim_out) transformed features.
         """
-        num_nodes = coordinates.shape[0]
-
         # Compute edge vectors and distances
-        edge_vectors = coordinates[src_indices] - coordinates[dst_indices]
+        edge_vectors = coordinates[graph.src] - coordinates[graph.dst]
         distances = edge_vectors.norm(dim=-1)
 
         # Compute basis matrices (WignerDBasis normalizes directions internally)
@@ -362,7 +357,7 @@ class EquivariantTransformer(nn.Module):
             else:
                 Q = M_hidden
 
-            x = layer(P, Q, x, distances, src_indices, dst_indices, num_nodes)
+            x = layer(P, Q, x, distances, graph)
 
         return self.final_norm(x)
 

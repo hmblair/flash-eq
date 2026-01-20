@@ -10,6 +10,7 @@ at r=0 for l>0.
 import torch
 
 from flash_eq import (
+    Graph,
     Repr,
     EquivariantEdgewiseLinear,
     EquivariantTransformerBlock,
@@ -98,6 +99,7 @@ class TestSelfLoopEquivariance:
         num_nodes = 10
         src = torch.arange(num_nodes, device=cuda_device)
         dst = torch.arange(num_nodes, device=cuda_device)
+        graph = Graph(src=src, dst=dst, num_nodes=num_nodes)
 
         # Zero distances and directions (self-loops)
         distances = torch.zeros(num_nodes, device=cuda_device)
@@ -120,10 +122,10 @@ class TestSelfLoopEquivariance:
         P, Q = basis(directions)
 
         with torch.no_grad():
-            out1 = block(P, Q, node_features, distances, src, dst, num_nodes)
+            out1 = block(P, Q, node_features, distances, graph)
             out1_rot = torch.einsum('ij,ncj->nci', D, out1)
 
-            out2 = block(P, Q, features_rot, distances, src, dst, num_nodes)
+            out2 = block(P, Q, features_rot, distances, graph)
 
         rel_diff = (out1_rot - out2).abs().max() / (out2.abs().max() + 1e-8)
         assert rel_diff < 1e-5, f"Self-loop equivariance failed: rel_diff={rel_diff:.2e}"
@@ -137,6 +139,7 @@ class TestSelfLoopEquivariance:
         num_nodes = 10
         src = torch.arange(num_nodes, device=cuda_device)
         dst = torch.arange(num_nodes, device=cuda_device)
+        graph = Graph(src=src, dst=dst, num_nodes=num_nodes)
 
         distances = torch.zeros(num_nodes, device=cuda_device)
         directions = torch.zeros(num_nodes, 3, device=cuda_device)
@@ -155,10 +158,10 @@ class TestSelfLoopEquivariance:
         P, Q = basis(directions)
 
         with torch.no_grad():
-            out1 = block(P, Q, node_features, distances, src, dst, num_nodes)
+            out1 = block(P, Q, node_features, distances, graph)
             out1_rot = torch.einsum('ij,ncj->nci', D, out1)
 
-            out2 = block(P, Q, features_rot, distances, src, dst, num_nodes)
+            out2 = block(P, Q, features_rot, distances, graph)
 
         rel_diff = (out1_rot - out2).abs().max() / (out2.abs().max() + 1e-8)
         assert rel_diff < 1e-4, f"Self-loop equivariance failed: rel_diff={rel_diff:.2e}"

@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..graph import Graph
+
 
 def _expand_indices(dst_indices: torch.Tensor, channels: int, dim: int) -> torch.Tensor:
     """Expand (num_edges,) indices to (num_edges, channels, dim) for scatter."""
@@ -73,9 +75,9 @@ class GraphPooling(nn.Module):
 
     Example:
         >>> pool = GraphPooling(reduce='sum')
+        >>> graph = Graph.random(num_nodes=100, num_edges=1000)
         >>> edge_features = torch.randn(1000, 32, 9)  # 1000 edges, 32 channels, dim=9
-        >>> dst_indices = torch.randint(0, 100, (1000,))  # 100 destination nodes
-        >>> node_features = pool(edge_features, dst_indices, num_nodes=100)
+        >>> node_features = pool(edge_features, graph)
         >>> node_features.shape
         torch.Size([100, 32, 9])
     """
@@ -90,20 +92,18 @@ class GraphPooling(nn.Module):
     def forward(
         self,
         edge_features: torch.Tensor,
-        dst_indices: torch.Tensor,
-        num_nodes: int,
+        graph: Graph,
     ) -> torch.Tensor:
         """Aggregate edge features to destination nodes.
 
         Args:
             edge_features: (num_edges, channels, dim) edge feature tensor.
-            dst_indices: (num_edges,) destination node index for each edge.
-            num_nodes: Total number of nodes in the graph.
+            graph: Graph containing edge indices and node count.
 
         Returns:
             node_features: (num_nodes, channels, dim) aggregated node features.
         """
-        return self._pool_fn(edge_features, dst_indices, num_nodes)
+        return self._pool_fn(edge_features, graph.dst, graph.num_nodes)
 
     def extra_repr(self) -> str:
         return f"reduce='{self.reduce}'"

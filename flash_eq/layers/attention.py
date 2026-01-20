@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..graph import Graph
 from ..representations import Repr
 from .linear import EquivariantLinear, EquivariantEdgewiseLinear
 from .norm import EquivariantLayerNorm
@@ -35,10 +36,11 @@ class EquivariantEdgeAttention(nn.Module):
 
     Example:
         >>> attn = EquivariantEdgeAttention(num_heads=4, qk_dim=36)
+        >>> graph = Graph.random(num_nodes=100, num_edges=1000)
         >>> Q = torch.randn(1000, 4, 36)  # (E, H, qk_dim)
         >>> K = torch.randn(1000, 4, 36)  # (E, H, qk_dim)
         >>> V = torch.randn(1000, 32, 9)  # (E, mult, dim)
-        >>> output = attn(Q, K, V, dst_indices, num_nodes=100)
+        >>> output = attn(Q, K, V, graph)
     """
 
     def __init__(
@@ -59,8 +61,7 @@ class EquivariantEdgeAttention(nn.Module):
         Q: torch.Tensor,
         K: torch.Tensor,
         V: torch.Tensor,
-        dst_indices: torch.Tensor,
-        num_nodes: int,
+        graph: Graph,
     ) -> torch.Tensor:
         """Apply attention to edge features.
 
@@ -68,8 +69,7 @@ class EquivariantEdgeAttention(nn.Module):
             Q: (num_edges, num_heads, qk_dim) query features from dst nodes.
             K: (num_edges, num_heads, qk_dim) key features from src nodes.
             V: (num_edges, mult, dim) value features (edge features).
-            dst_indices: (num_edges,) destination node index for each edge.
-            num_nodes: Total number of destination nodes.
+            graph: Graph containing edge indices and node count.
 
         Returns:
             Attention-weighted edge features, shape (num_edges, mult, dim).
@@ -78,7 +78,7 @@ class EquivariantEdgeAttention(nn.Module):
         logits = (Q * K).sum(-1) * self.scale  # (E, H)
 
         # Softmax over neighbors (edges to same destination)
-        attn_weights = self._neighbor_softmax(logits, dst_indices, num_nodes)
+        attn_weights = self._neighbor_softmax(logits, graph.dst, graph.num_nodes)
         attn_weights = self.dropout(attn_weights)  # (E, H)
 
         # Apply attention weights to values
@@ -178,15 +178,16 @@ class EquivariantAttention(nn.Module):
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
 
     Example:
-        >>> from flash_eq import Repr, WignerDBasis, EquivariantAttention
+        >>> from flash_eq import Repr, Graph, WignerDBasis, EquivariantAttention
         >>>
         >>> repr = Repr(lvals=[0, 1, 2], mult=32)
         >>> layer = EquivariantAttention(repr, repr, num_heads=4).cuda()
         >>> basis = WignerDBasis([repr, repr]).cuda()
         >>>
         >>> # Graph data
+        >>> graph = Graph.random(num_nodes=100, num_edges=1000).to('cuda')
         >>> P, Q = basis(directions)
-        >>> output = layer(P, Q, node_features, distances, src, dst, num_nodes)
+        >>> output = layer(P, Q, node_features, distances, graph)
     """
 
     def __init__(
@@ -250,9 +251,7 @@ class EquivariantAttention(nn.Module):
         Q_basis: torch.Tensor,
         node_features: torch.Tensor,
         distances: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_indices: torch.Tensor,
-        num_nodes: int,
+        graph: Graph,
         edge_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply equivariant attention layer.
@@ -262,36 +261,34 @@ class EquivariantAttention(nn.Module):
             Q_basis: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
             node_features: (num_nodes, mult_in, dim_in) node features.
             distances: (num_edges,) edge distances.
-            src_indices: (num_edges,) source node for each edge.
-            dst_indices: (num_edges,) destination node for each edge.
-            num_nodes: Total number of nodes.
+            graph: Graph containing edge indices and node count.
             edge_features: Optional (num_edges, mult_in, dim_in) edge features
                 to add to gathered node features before the V projection.
 
         Returns:
             output: (num_nodes, mult_out, dim_out) updated node features.
         """
-        E = src_indices.shape[0]
+        E = graph.num_edges
         mult = self.in_repr.mult
 
         # Fused Q/K: normalize once, project to 2x mult, then split and gather
         QK = self.linear_qk(self.norm_qk(node_features))  # (N, 2*mult, dim)
-        Q = QK[:, :mult][dst_indices]  # (E, mult, dim)
-        K = QK[:, mult:][src_indices]  # (E, mult, dim)
+        Q = QK[:, :mult][graph.dst]  # (E, mult, dim)
+        K = QK[:, mult:][graph.src]  # (E, mult, dim)
 
         # Reshape for multi-head: (E, H, qk_dim) where qk_dim = (mult/H) * dim
         Q = Q.view(E, self.num_heads, -1)
         K = K.view(E, self.num_heads, -1)
 
         # V from source nodes through edgewise linear
-        gathered = node_features[src_indices]
+        gathered = node_features[graph.src]
         if edge_features is not None:
             gathered = gathered + edge_features
         V = self.linear_v(P, Q_basis, gathered, distances)  # (E, mult_out, dim_out)
 
         # Apply attention and aggregate
-        weighted = self.attention(Q, K, V, dst_indices, num_nodes)
-        return self.pool(weighted, dst_indices, num_nodes)
+        weighted = self.attention(Q, K, V, graph)
+        return self.pool(weighted, graph)
 
     def extra_repr(self) -> str:
         return (

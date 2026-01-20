@@ -207,6 +207,10 @@ class WignerD(nn.Module):
         is equivalent to rotating the coordinate frame so that e_z points
         along the given direction.
 
+        For zero-length direction vectors (e.g., from self-loops), the result
+        preserves l=0 (scalar) components and zeros out l>0 components, since
+        there is no well-defined direction to align with.
+
         Args:
             directions: (..., 3) direction vectors (need not be normalized)
             cartesian: If True, directions are in Cartesian coordinates.

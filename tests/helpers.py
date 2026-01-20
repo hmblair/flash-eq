@@ -43,7 +43,7 @@ def make_graph(
     num_edges: int,
     device: torch.device = torch.device('cpu'),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create random graph edge indices.
+    """Create random graph edge indices (may include self-loops).
 
     Returns:
         src_indices: (num_edges,) source node for each edge

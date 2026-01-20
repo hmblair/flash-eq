@@ -212,3 +212,63 @@ Create a minimal training script to verify the model can learn, using ciffy for 
 - Overfit single structure (loss → 0)
 - Generalize across multiple structures (loss decreases)
 - Equivariance preserved (rotate input → output rotates accordingly)
+
+## Kernel Optimization and Cleanup Opportunities
+
+  1. Redundant Block Parameter Computation
+
+  - compute_block_params() (lines 213-244) loops over all m' < m calling count_l_geq_m()
+   for each, which itself loops over all l-values
+  - Called in every kernel for every edge - O(mmax × num_lvals) per edge
+  - Fix: Precompute BlockParams array once on CPU and pass as constant memory
+
+  2. Inefficient get_l_for_index() Loop
+
+  - Lines 128-137: Linear scan through lvals array every time called
+  - Called inside the innermost loops (#pragma unroll 4)
+  - Fix: Precompute l-value lookup table per m-block, store in constant memory
+
+  3. Duplicate sh_weight Computation
+
+  - sh_weight = dist / (dist + sh_scale) computed identically in forward,
+  backward_features, and backward_table kernels
+  - Could potentially fuse kernels or precompute
+
+  4. Code Duplication Between m=0 and m>0 Kernels
+
+  - 6 kernels (forward_m0/mpos, backward_features_m0/mpos, backward_table_m0/mpos)
+  - Significant shared structure with minor differences
+  - Fix: Template on m-type with constexpr branches, or macro-based generation
+
+  5. Parameter Bloat
+
+  - Each kernel takes 15+ parameters (lines 340-351)
+  - Fix: Bundle into structs (e.g., RepresentationInfo, EdgeData)
+
+  6. Texture Memory for Radial Table
+
+  - radial_table accessed via __ldg() (read-only cache)
+  - Access pattern is strided but coherent within bins
+  - Fix: Consider texture memory for hardware interpolation (though current binning is custom)
+
+  7. Block-Level Reduction for grad_distances
+
+  - Currently: warp reduction + atomicAdd per warp (lines 798-802)
+  - Fix: Full block reduction could eliminate atomics entirely for this edge
+
+  8. Redundant Scaling Computation
+
+  - ipowf(sh_weight, l_total) computed separately for each weight in backward_table
+  - Same l_total values repeat across channels
+  - Fix: Precompute scale factors for each (l_in, l_out) pair in shared memory
+
+  9. Shared Memory Optimization
+
+  - Current: loads full Cin × n_in features into shared memory
+  - For large Cin, could use tiled approach with register blocking
+
+  10. Branch Divergence in if (l_total > 0)
+
+  - Lines 407-409, 594-596: Conditional inside loop
+  - Usually l_total > 0 for most cases, so branch is predictable
+  - Minor: Could hoist check outside loop if all l_total > 0 for a block

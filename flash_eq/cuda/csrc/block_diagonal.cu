@@ -48,6 +48,58 @@ struct InterpState {
 };
 
 /**
+ * Binning parameters for distance-to-bin conversion.
+ * For linear: normalized = (dist - min_val) * inv_bin_width
+ * For log: normalized = (log(dist) - log_min) * inv_log_range * num_bins
+ */
+struct BinningParams {
+    float param1;      // min_val (linear) or log_min (log)
+    float param2;      // inv_bin_width (linear) or inv_log_range (log)
+    int num_bins;
+};
+
+/**
+ * Compute binning from distance value.
+ * Template parameter LOG_BINS selects linear (false) or logarithmic (true) spacing.
+ */
+template <bool LOG_BINS>
+__device__ __forceinline__ InterpState compute_binning(float dist, BinningParams params) {
+    float normalized;
+    if constexpr (LOG_BINS) {
+        // Log spacing: normalized = (log(dist) - log_min) * inv_log_range * num_bins
+        normalized = (logf(fmaxf(dist, expf(params.param1))) - params.param1)
+                     * params.param2 * params.num_bins;
+    } else {
+        // Linear spacing: normalized = (dist - min_val) * inv_bin_width
+        normalized = (dist - params.param1) * params.param2;
+    }
+
+    normalized = fminf(fmaxf(normalized, 0.0f), static_cast<float>(params.num_bins));
+
+    InterpState state;
+    state.idx_lo = min(static_cast<int>(floorf(normalized)), params.num_bins - 1);
+    state.idx_hi = min(state.idx_lo + 1, params.num_bins);
+    state.t = normalized - static_cast<float>(state.idx_lo);
+    state.one_minus_t = 1.0f - state.t;
+    return state;
+}
+
+/**
+ * Compute derivative of interpolation weight w.r.t. distance.
+ * Used in backward pass to convert grad_interp_weight to grad_distance.
+ */
+template <bool LOG_BINS>
+__device__ __forceinline__ float binning_derivative(float dist, BinningParams params) {
+    if constexpr (LOG_BINS) {
+        // d(normalized)/d(dist) = inv_log_range * num_bins / dist
+        return params.param2 * params.num_bins / fmaxf(dist, expf(params.param1));
+    } else {
+        // d(normalized)/d(dist) = inv_bin_width
+        return params.param2;
+    }
+}
+
+/**
  * Block parameters describing layout of one m-block in the weight matrix.
  */
 struct BlockParams {
@@ -85,13 +137,38 @@ __device__ __forceinline__ int get_l_for_index(const int* lvals, int num_lvals, 
 }
 
 /**
+ * Integer power via repeated multiplication. Much faster than powf for small l.
+ */
+__device__ __forceinline__ float ipowf(float base, int exp) {
+    float result = 1.0f;
+    while (exp > 0) {
+        if (exp & 1) result *= base;
+        base *= base;
+        exp >>= 1;
+    }
+    return result;
+}
+
+/**
  * Compute solid harmonic scale factor: (r / (r + scale))^l
  * Returns 1.0 for l=0, smoothly suppresses higher l at short distances.
  */
 __device__ __forceinline__ float solid_harmonic_scale(float distance, float scale, int l) {
     if (l == 0) return 1.0f;
     float weight = distance / (distance + scale);
-    return powf(weight, l);
+    return ipowf(weight, l);
+}
+
+/**
+ * Compute derivative of solid harmonic scale factor w.r.t. distance.
+ * d/dr[(r/(r+s))^l] = (r/(r+s))^l * l * s / (r * (r+s))
+ * Returns 0.0 for l=0 since scaling is constant.
+ */
+__device__ __forceinline__ float solid_harmonic_scale_derivative(float distance, float scale, int l) {
+    if (l == 0) return 0.0f;
+    float r_plus_s = distance + scale;
+    float sh_scale = ipowf(distance / r_plus_s, l);
+    return sh_scale * l * scale / (distance * r_plus_s);
 }
 
 /**
@@ -166,23 +243,6 @@ __device__ __forceinline__ BlockParams compute_block_params(
     return bp;
 }
 
-/**
- * Load interpolation state for an edge.
- */
-template <typename scalar_t>
-__device__ __forceinline__ InterpState load_interp_state(
-    int64_t edge,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
-    int num_bins
-) {
-    InterpState state;
-    state.idx_lo = bin_lo[edge];
-    state.idx_hi = min(state.idx_lo + 1, num_bins);
-    state.t = static_cast<float>(interp_weight[edge]);
-    state.one_minus_t = 1.0f - state.t;
-    return state;
-}
 
 /**
  * Linearly interpolate a weight from the radial table.
@@ -276,19 +336,18 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
  * One CUDA block per edge.
  * Includes solid harmonic scaling: weights multiplied by (r/(r+scale))^(l_in+l_out)
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void forward_m0_kernel(
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     scalar_t* __restrict__ output,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     const int64_t edge = blockIdx.x;
     if (edge >= num_edges) return;
@@ -300,9 +359,10 @@ __global__ void forward_m0_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     // Load features into shared memory
     extern __shared__ float feat_shared[];
@@ -315,8 +375,6 @@ __global__ void forward_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute outputs
@@ -347,7 +405,7 @@ __global__ void forward_m0_kernel(
 
                 // Apply solid harmonic scaling: w *= (r/(r+scale))^(l_in+l_out)
                 if (l_total > 0) {
-                    w *= powf(sh_weight, l_total);
+                    w *= ipowf(sh_weight, l_total);
                 }
 
                 acc += w * f_ptr[i];
@@ -364,19 +422,18 @@ __global__ void forward_m0_kernel(
  * One CUDA block per (edge, m) pair where m ranges from 1 to mmax.
  * Includes solid harmonic scaling: weights multiplied by (r/(r+scale))^(l_in+l_out)
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void forward_mpos_kernel(
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     scalar_t* __restrict__ output,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     // blk indexes m values from 1 to mmax
     const int blk = blockIdx.x % mmax;
@@ -391,9 +448,10 @@ __global__ void forward_mpos_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     const int in_size = 2 * bp.n_in;  // Complex pairs
 
@@ -408,8 +466,6 @@ __global__ void forward_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute outputs: out[o] = sum over channels and inputs of rotation(a,b) * f[i]
@@ -444,7 +500,7 @@ __global__ void forward_mpos_kernel(
 
                 // Apply solid harmonic scaling: (a,b) *= (r/(r+scale))^(l_in+l_out)
                 // l_total >= 2 for m>0 blocks (since l >= m >= 1 for both in and out)
-                const float scale_factor = powf(sh_weight, l_total);
+                const float scale_factor = ipowf(sh_weight, l_total);
                 a *= scale_factor;
                 b *= scale_factor;
 
@@ -467,19 +523,18 @@ __global__ void forward_mpos_kernel(
  * Backward kernel for m=0: compute grad_features.
  * Includes solid harmonic scaling on weights.
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void backward_features_m0_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     scalar_t* __restrict__ grad_features,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     const int64_t edge = blockIdx.x;
     if (edge >= num_edges) return;
@@ -491,9 +546,10 @@ __global__ void backward_features_m0_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     // Load grad_output into shared memory
     extern __shared__ float grad_shared[];
@@ -506,8 +562,6 @@ __global__ void backward_features_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute grad_features
@@ -538,7 +592,7 @@ __global__ void backward_features_m0_kernel(
 
                 // Apply solid harmonic scaling
                 if (l_total > 0) {
-                    w *= powf(sh_weight, l_total);
+                    w *= ipowf(sh_weight, l_total);
                 }
 
                 grad += w * go_ptr[o];
@@ -555,19 +609,18 @@ __global__ void backward_features_m0_kernel(
  * Computes: grad_f = W^T @ grad_out (transpose of rotation).
  * Includes solid harmonic scaling on weights.
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void backward_features_mpos_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     scalar_t* __restrict__ grad_features,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     const int blk = blockIdx.x % mmax;
     const int64_t edge = blockIdx.x / mmax;
@@ -581,9 +634,10 @@ __global__ void backward_features_mpos_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     const int out_size = 2 * bp.n_out;
 
@@ -598,8 +652,6 @@ __global__ void backward_features_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
     const int table_stride = Cout * Cin * Wdim;
 
     // Compute grad_features for each complex input
@@ -633,7 +685,7 @@ __global__ void backward_features_mpos_kernel(
                                       interp.t, interp.one_minus_t);
 
                 // Apply solid harmonic scaling
-                const float scale_factor = powf(sh_weight, l_total);
+                const float scale_factor = ipowf(sh_weight, l_total);
                 a *= scale_factor;
                 b *= scale_factor;
 
@@ -653,24 +705,23 @@ __global__ void backward_features_mpos_kernel(
 //------------------------------------------------------------------------------
 
 /**
- * Backward kernel for m=0: compute grad_radial_table and grad_interp_weight.
+ * Backward kernel for m=0: compute grad_radial_table and grad_distance.
  * Includes solid harmonic scaling in gradient computation.
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void backward_table_m0_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     float* __restrict__ grad_radial_table,
-    float* __restrict__ grad_interp_weight,
+    float* __restrict__ grad_distances,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     const int64_t edge = blockIdx.x;
     if (edge >= num_edges) return;
@@ -682,9 +733,10 @@ __global__ void backward_table_m0_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     const int table_stride = Cout * Cin * Wdim;
     const int w_block_size = bp.n_out * bp.n_in;
@@ -711,10 +763,8 @@ __global__ void backward_table_m0_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
-
     float local_grad_t = 0.0f;
+    float local_grad_sh = 0.0f;  // Gradient through solid harmonic scaling
 
     // Compute weight gradients
     for (int w_idx = tid; w_idx < Cout * Cin * w_block_size; w_idx += THREADS) {
@@ -728,7 +778,7 @@ __global__ void backward_table_m0_kernel(
         const int l_in = get_l_for_index(lvals_in, num_lvals_in, 0, i);
         const int l_out = get_l_for_index(lvals_out, num_lvals_out, 0, o);
         const int l_total = l_in + l_out;
-        const float scale_factor = (l_total > 0) ? powf(sh_weight, l_total) : 1.0f;
+        const float scale_factor = (l_total > 0) ? ipowf(sh_weight, l_total) : 1.0f;
 
         const float f = feat_shared[ci * bp.n_in + i];
         const float go = grad_shared[co * bp.n_out + o];
@@ -744,38 +794,48 @@ __global__ void backward_table_m0_kernel(
 
         const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
         const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
-        // grad_t also needs scale factor
+        const float interp_weight = interp.one_minus_t * w_lo + interp.t * w_hi;
+
+        // Gradient through interpolation: d(output)/d(t) * d(t)/d(dist)
         local_grad_t += (w_hi - w_lo) * grad_w;
+
+        // Gradient through solid harmonic scaling: d(output)/d(scale) * d(scale)/d(dist)
+        // output = interp_weight * scale_factor * f, so d(output)/d(scale) = interp_weight * f * go
+        if (l_total > 0) {
+            local_grad_sh += interp_weight * f * go * solid_harmonic_scale_derivative(dist, sh_scale, l_total);
+        }
     }
 
-    // Warp reduction and atomic add for grad_interp_weight
+    // Warp reduction and atomic add for grad_distance
+    // Chain rule: grad_dist = grad_t * d(t)/d(dist) + grad_sh
     local_grad_t = warp_reduce_sum(local_grad_t);
+    local_grad_sh = warp_reduce_sum(local_grad_sh);
     if ((tid % 32) == 0) {
-        atomicAdd(&grad_interp_weight[edge], local_grad_t);
+        const float grad_dist = local_grad_t * binning_derivative<LOG_BINS>(dist, bin_params) + local_grad_sh;
+        atomicAdd(&grad_distances[edge], grad_dist);
     }
 }
 
 
 /**
- * Backward kernel for m>0: compute grad_radial_table and grad_interp_weight.
+ * Backward kernel for m>0: compute grad_radial_table and grad_distance.
  * Each thread computes gradient for one weight element (either 'a' or 'b').
  * Includes solid harmonic scaling in gradient computation.
  */
-template <typename scalar_t>
+template <typename scalar_t, bool LOG_BINS>
 __global__ void backward_table_mpos_kernel(
     const scalar_t* __restrict__ grad_output,
     const scalar_t* __restrict__ features,
     const scalar_t* __restrict__ radial_table,
-    const int* __restrict__ bin_lo,
-    const scalar_t* __restrict__ interp_weight,
     const scalar_t* __restrict__ distances,
     float sh_scale,
+    BinningParams bin_params,
     float* __restrict__ grad_radial_table,
-    float* __restrict__ grad_interp_weight,
+    float* __restrict__ grad_distances,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
     int num_lvals_in, int num_lvals_out, int mmax,
-    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim, int num_bins
+    int64_t num_edges, int Cin, int Cout, int Din, int Dout, int Wdim
 ) {
     const int blk = blockIdx.x % mmax;
     const int64_t edge = blockIdx.x / mmax;
@@ -789,9 +849,10 @@ __global__ void backward_table_mpos_kernel(
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
-    // Load distance for this edge and compute base weight for scaling
+    // Load distance for this edge and compute binning + solid harmonic scaling
     const float dist = static_cast<float>(distances[edge]);
     const float sh_weight = dist / (dist + sh_scale);
+    const InterpState interp = compute_binning<LOG_BINS>(dist, bin_params);
 
     const int in_size = 2 * bp.n_in;
     const int out_size = 2 * bp.n_out;
@@ -821,10 +882,8 @@ __global__ void backward_table_mpos_kernel(
     }
     __syncthreads();
 
-    // Interpolation state
-    const InterpState interp = load_interp_state(edge, bin_lo, interp_weight, num_bins);
-
     float local_grad_t = 0.0f;
+    float local_grad_sh = 0.0f;  // Gradient through solid harmonic scaling
 
     // Iterate over all weight elements: (co, ci, o, i, component)
     // Each weight pair (a, b) corresponds to one (output, input) connection
@@ -842,7 +901,7 @@ __global__ void backward_table_mpos_kernel(
         const int l_in = get_l_for_index(lvals_in, num_lvals_in, m, i);
         const int l_out = get_l_for_index(lvals_out, num_lvals_out, m, o);
         const int l_total = l_in + l_out;
-        const float scale_factor = powf(sh_weight, l_total);
+        const float scale_factor = ipowf(sh_weight, l_total);
 
         // Load feature and gradient
         const Complex f = load_complex(feat_shared + ci * in_size, i);
@@ -853,6 +912,7 @@ __global__ void backward_table_mpos_kernel(
         compute_weight_gradient(f, go, grad_a, grad_b);
         // grad_w includes the scale factor since output = w * scale_factor * f
         const float grad_w = scale_factor * ((is_b == 0) ? grad_a : grad_b);
+        const float unscaled_grad_w = (is_b == 0) ? grad_a : grad_b;
 
         // Accumulate to table gradient with interpolation
         const int table_idx = co * Cin * Wdim + ci * Wdim + bp.w_off + w_local;
@@ -865,13 +925,24 @@ __global__ void backward_table_mpos_kernel(
         // Gradient w.r.t. interpolation weight (also scaled)
         const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
         const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
+        const float interp_weight = interp.one_minus_t * w_lo + interp.t * w_hi;
+
+        // Gradient through interpolation: d(output)/d(t) * d(t)/d(dist)
         local_grad_t += (w_hi - w_lo) * grad_w;
+
+        // Gradient through solid harmonic scaling: d(output)/d(scale) * d(scale)/d(dist)
+        // output = interp_weight * scale_factor * f, d(output)/d(scale) = interp_weight * f * go
+        // Note: l_total >= 2 for m>0 (since l >= m >= 1 for both in and out)
+        local_grad_sh += interp_weight * unscaled_grad_w * solid_harmonic_scale_derivative(dist, sh_scale, l_total);
     }
 
-    // Warp reduction and atomic add for grad_interp_weight
+    // Warp reduction and atomic add for grad_distance
+    // Chain rule: grad_dist = grad_t * d(t)/d(dist) + grad_sh
     local_grad_t = warp_reduce_sum(local_grad_t);
+    local_grad_sh = warp_reduce_sum(local_grad_sh);
     if ((tid % 32) == 0) {
-        atomicAdd(&grad_interp_weight[edge], local_grad_t);
+        const float grad_dist = local_grad_t * binning_derivative<LOG_BINS>(dist, bin_params) + local_grad_sh;
+        atomicAdd(&grad_distances[edge], grad_dist);
     }
 }
 
@@ -883,21 +954,20 @@ __global__ void backward_table_mpos_kernel(
 std::vector<torch::Tensor> block_diagonal_forward_cuda(
     torch::Tensor features,
     torch::Tensor radial_table,
-    torch::Tensor bin_lo,
-    torch::Tensor interp_weight,
     torch::Tensor distances,
     float sh_scale,
+    float bin_param1,
+    float bin_param2,
+    int num_bins,
+    bool log_bins,
     torch::Tensor lvals_in,
     torch::Tensor lvals_out,
     int64_t Cout,
     int dim_out,
-    int num_bins,
     int max_in_size
 ) {
     CHECK_INPUT(features);
     CHECK_INPUT(radial_table);
-    CHECK_INPUT(bin_lo);
-    CHECK_INPUT(interp_weight);
     CHECK_INPUT(distances);
     CHECK_INPUT(lvals_in);
     CHECK_INPUT(lvals_out);
@@ -911,47 +981,81 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     const int num_lvals_out = static_cast<int>(lvals_out.size(0));
     const int mmax = std::max(lvals_in.max().item<int>(), lvals_out.max().item<int>());
 
+    BinningParams bin_params = {bin_param1, bin_param2, num_bins};
+
     auto output = torch::zeros({B, Cout, dim_out}, features.options());
 
     // Shared memory size: conservative estimate using max_in_size
     const size_t shared_size_m0 = Cin * num_lvals_in * sizeof(float);
     const size_t shared_size_mpos = Cin * max_in_size * sizeof(float);
 
-    // Launch m=0 kernel
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_m0", ([&] {
-        forward_m0_kernel<scalar_t><<<B, THREADS, shared_size_m0>>>(
-            features.data_ptr<scalar_t>(),
-            radial_table.data_ptr<scalar_t>(),
-            bin_lo.data_ptr<int>(),
-            interp_weight.data_ptr<scalar_t>(),
-            distances.data_ptr<scalar_t>(),
-            sh_scale,
-            output.data_ptr<scalar_t>(),
-            lvals_in.data_ptr<int>(),
-            lvals_out.data_ptr<int>(),
-            num_lvals_in, num_lvals_out, mmax,
-            B, Cin, Cout_int, Din, dim_out, Wdim, num_bins
-        );
-    }));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    // Launch m>0 kernel if mmax > 0
-    if (mmax > 0) {
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_mpos", ([&] {
-            forward_mpos_kernel<scalar_t><<<B * mmax, THREADS, shared_size_mpos>>>(
+    // Launch m=0 kernel with template dispatch for log_bins
+    if (log_bins) {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_m0", ([&] {
+            forward_m0_kernel<scalar_t, true><<<B, THREADS, shared_size_m0>>>(
                 features.data_ptr<scalar_t>(),
                 radial_table.data_ptr<scalar_t>(),
-                bin_lo.data_ptr<int>(),
-                interp_weight.data_ptr<scalar_t>(),
                 distances.data_ptr<scalar_t>(),
                 sh_scale,
+                bin_params,
                 output.data_ptr<scalar_t>(),
                 lvals_in.data_ptr<int>(),
                 lvals_out.data_ptr<int>(),
                 num_lvals_in, num_lvals_out, mmax,
-                B, Cin, Cout_int, Din, dim_out, Wdim, num_bins
+                B, Cin, Cout_int, Din, dim_out, Wdim
             );
         }));
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_m0", ([&] {
+            forward_m0_kernel<scalar_t, false><<<B, THREADS, shared_size_m0>>>(
+                features.data_ptr<scalar_t>(),
+                radial_table.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
+                bin_params,
+                output.data_ptr<scalar_t>(),
+                lvals_in.data_ptr<int>(),
+                lvals_out.data_ptr<int>(),
+                num_lvals_in, num_lvals_out, mmax,
+                B, Cin, Cout_int, Din, dim_out, Wdim
+            );
+        }));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // Launch m>0 kernel if mmax > 0
+    if (mmax > 0) {
+        if (log_bins) {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_mpos", ([&] {
+                forward_mpos_kernel<scalar_t, true><<<B * mmax, THREADS, shared_size_mpos>>>(
+                    features.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    output.data_ptr<scalar_t>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout_int, Din, dim_out, Wdim
+                );
+            }));
+        } else {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "forward_mpos", ([&] {
+                forward_mpos_kernel<scalar_t, false><<<B * mmax, THREADS, shared_size_mpos>>>(
+                    features.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    output.data_ptr<scalar_t>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout_int, Din, dim_out, Wdim
+                );
+            }));
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
@@ -963,10 +1067,12 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     torch::Tensor grad_output,
     torch::Tensor features,
     torch::Tensor radial_table,
-    torch::Tensor bin_lo,
-    torch::Tensor interp_weight,
     torch::Tensor distances,
     float sh_scale,
+    float bin_param1,
+    float bin_param2,
+    int num_bins,
+    bool log_bins,
     torch::Tensor lvals_in,
     torch::Tensor lvals_out,
     int dim_in,
@@ -976,8 +1082,6 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     CHECK_INPUT(grad_output);
     CHECK_INPUT(features);
     CHECK_INPUT(radial_table);
-    CHECK_INPUT(bin_lo);
-    CHECK_INPUT(interp_weight);
     CHECK_INPUT(distances);
     CHECK_INPUT(lvals_in);
     CHECK_INPUT(lvals_out);
@@ -988,16 +1092,17 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     const int Cout = static_cast<int>(grad_output.size(1));
     const int Dout = static_cast<int>(grad_output.size(2));
     const int64_t num_bins_plus_1 = radial_table.size(0);
-    const int num_bins = static_cast<int>(num_bins_plus_1 - 1);
     const int Wdim = static_cast<int>(radial_table.size(3));
     const int num_lvals_in = static_cast<int>(lvals_in.size(0));
     const int num_lvals_out = static_cast<int>(lvals_out.size(0));
     const int mmax = std::max(lvals_in.max().item<int>(), lvals_out.max().item<int>());
 
+    BinningParams bin_params = {bin_param1, bin_param2, num_bins};
+
     auto grad_features = torch::zeros({B, Cin, Din}, features.options());
     auto grad_radial_table = torch::zeros({num_bins_plus_1, Cout, Cin, Wdim},
                                            radial_table.options().dtype(torch::kFloat32));
-    auto grad_interp_weight = torch::zeros({B}, interp_weight.options().dtype(torch::kFloat32));
+    auto grad_distances = torch::zeros({B}, distances.options().dtype(torch::kFloat32));
 
     // Shared memory sizes
     const size_t shared_size_feat_m0 = Cout * num_lvals_out * sizeof(float);
@@ -1006,92 +1111,160 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     const size_t shared_size_table_mpos = (Cin * max_in_size + Cout * max_out_size) * sizeof(float);
 
     // Launch m=0 backward_features
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_m0", ([&] {
-        backward_features_m0_kernel<scalar_t><<<B, THREADS, shared_size_feat_m0>>>(
-            grad_output.data_ptr<scalar_t>(),
-            radial_table.data_ptr<scalar_t>(),
-            bin_lo.data_ptr<int>(),
-            interp_weight.data_ptr<scalar_t>(),
-            distances.data_ptr<scalar_t>(),
-            sh_scale,
-            grad_features.data_ptr<scalar_t>(),
-            lvals_in.data_ptr<int>(),
-            lvals_out.data_ptr<int>(),
-            num_lvals_in, num_lvals_out, mmax,
-            B, Cin, Cout, Din, Dout, Wdim, num_bins
-        );
-    }));
+    if (log_bins) {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_m0", ([&] {
+            backward_features_m0_kernel<scalar_t, true><<<B, THREADS, shared_size_feat_m0>>>(
+                grad_output.data_ptr<scalar_t>(),
+                radial_table.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
+                bin_params,
+                grad_features.data_ptr<scalar_t>(),
+                lvals_in.data_ptr<int>(),
+                lvals_out.data_ptr<int>(),
+                num_lvals_in, num_lvals_out, mmax,
+                B, Cin, Cout, Din, Dout, Wdim
+            );
+        }));
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_m0", ([&] {
+            backward_features_m0_kernel<scalar_t, false><<<B, THREADS, shared_size_feat_m0>>>(
+                grad_output.data_ptr<scalar_t>(),
+                radial_table.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
+                bin_params,
+                grad_features.data_ptr<scalar_t>(),
+                lvals_in.data_ptr<int>(),
+                lvals_out.data_ptr<int>(),
+                num_lvals_in, num_lvals_out, mmax,
+                B, Cin, Cout, Din, Dout, Wdim
+            );
+        }));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // Launch m=0 backward_table
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_m0", ([&] {
-        backward_table_m0_kernel<scalar_t><<<B, THREADS, shared_size_table_m0>>>(
-            grad_output.data_ptr<scalar_t>(),
-            features.data_ptr<scalar_t>(),
-            radial_table.data_ptr<scalar_t>(),
-            bin_lo.data_ptr<int>(),
-            interp_weight.data_ptr<scalar_t>(),
-            distances.data_ptr<scalar_t>(),
-            sh_scale,
-            grad_radial_table.data_ptr<float>(),
-            grad_interp_weight.data_ptr<float>(),
-            lvals_in.data_ptr<int>(),
-            lvals_out.data_ptr<int>(),
-            num_lvals_in, num_lvals_out, mmax,
-            B, Cin, Cout, Din, Dout, Wdim, num_bins
-        );
-    }));
+    if (log_bins) {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_m0", ([&] {
+            backward_table_m0_kernel<scalar_t, true><<<B, THREADS, shared_size_table_m0>>>(
+                grad_output.data_ptr<scalar_t>(),
+                features.data_ptr<scalar_t>(),
+                radial_table.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
+                bin_params,
+                grad_radial_table.data_ptr<float>(),
+                grad_distances.data_ptr<float>(),
+                lvals_in.data_ptr<int>(),
+                lvals_out.data_ptr<int>(),
+                num_lvals_in, num_lvals_out, mmax,
+                B, Cin, Cout, Din, Dout, Wdim
+            );
+        }));
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_m0", ([&] {
+            backward_table_m0_kernel<scalar_t, false><<<B, THREADS, shared_size_table_m0>>>(
+                grad_output.data_ptr<scalar_t>(),
+                features.data_ptr<scalar_t>(),
+                radial_table.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
+                bin_params,
+                grad_radial_table.data_ptr<float>(),
+                grad_distances.data_ptr<float>(),
+                lvals_in.data_ptr<int>(),
+                lvals_out.data_ptr<int>(),
+                num_lvals_in, num_lvals_out, mmax,
+                B, Cin, Cout, Din, Dout, Wdim
+            );
+        }));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     // m>0 kernels
     if (mmax > 0) {
         // backward_features m>0
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_mpos", ([&] {
-            backward_features_mpos_kernel<scalar_t><<<B * mmax, THREADS, shared_size_feat_mpos>>>(
-                grad_output.data_ptr<scalar_t>(),
-                radial_table.data_ptr<scalar_t>(),
-                bin_lo.data_ptr<int>(),
-                interp_weight.data_ptr<scalar_t>(),
-                distances.data_ptr<scalar_t>(),
-                sh_scale,
-                grad_features.data_ptr<scalar_t>(),
-                lvals_in.data_ptr<int>(),
-                lvals_out.data_ptr<int>(),
-                num_lvals_in, num_lvals_out, mmax,
-                B, Cin, Cout, Din, Dout, Wdim, num_bins
-            );
-        }));
+        if (log_bins) {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_mpos", ([&] {
+                backward_features_mpos_kernel<scalar_t, true><<<B * mmax, THREADS, shared_size_feat_mpos>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    grad_features.data_ptr<scalar_t>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout, Din, Dout, Wdim
+                );
+            }));
+        } else {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_features_mpos", ([&] {
+                backward_features_mpos_kernel<scalar_t, false><<<B * mmax, THREADS, shared_size_feat_mpos>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    grad_features.data_ptr<scalar_t>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout, Din, Dout, Wdim
+                );
+            }));
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
         // backward_table m>0
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_mpos", ([&] {
-            backward_table_mpos_kernel<scalar_t><<<B * mmax, THREADS, shared_size_table_mpos>>>(
-                grad_output.data_ptr<scalar_t>(),
-                features.data_ptr<scalar_t>(),
-                radial_table.data_ptr<scalar_t>(),
-                bin_lo.data_ptr<int>(),
-                interp_weight.data_ptr<scalar_t>(),
-                distances.data_ptr<scalar_t>(),
-                sh_scale,
-                grad_radial_table.data_ptr<float>(),
-                grad_interp_weight.data_ptr<float>(),
-                lvals_in.data_ptr<int>(),
-                lvals_out.data_ptr<int>(),
-                num_lvals_in, num_lvals_out, mmax,
-                B, Cin, Cout, Din, Dout, Wdim, num_bins
-            );
-        }));
+        if (log_bins) {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_mpos", ([&] {
+                backward_table_mpos_kernel<scalar_t, true><<<B * mmax, THREADS, shared_size_table_mpos>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    features.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    grad_radial_table.data_ptr<float>(),
+                    grad_distances.data_ptr<float>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout, Din, Dout, Wdim
+                );
+            }));
+        } else {
+            AT_DISPATCH_FLOATING_TYPES_AND_HALF(features.scalar_type(), "backward_table_mpos", ([&] {
+                backward_table_mpos_kernel<scalar_t, false><<<B * mmax, THREADS, shared_size_table_mpos>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    features.data_ptr<scalar_t>(),
+                    radial_table.data_ptr<scalar_t>(),
+                    distances.data_ptr<scalar_t>(),
+                    sh_scale,
+                    bin_params,
+                    grad_radial_table.data_ptr<float>(),
+                    grad_distances.data_ptr<float>(),
+                    lvals_in.data_ptr<int>(),
+                    lvals_out.data_ptr<int>(),
+                    num_lvals_in, num_lvals_out, mmax,
+                    B, Cin, Cout, Din, Dout, Wdim
+                );
+            }));
+        }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
     if (radial_table.scalar_type() != torch::kFloat32) {
         grad_radial_table = grad_radial_table.to(radial_table.scalar_type());
     }
-    if (interp_weight.scalar_type() != torch::kFloat32) {
-        grad_interp_weight = grad_interp_weight.to(interp_weight.scalar_type());
+    if (distances.scalar_type() != torch::kFloat32) {
+        grad_distances = grad_distances.to(distances.scalar_type());
     }
 
-    return {grad_features, grad_radial_table, grad_interp_weight};
+    return {grad_features, grad_radial_table, grad_distances};
 }
 
 

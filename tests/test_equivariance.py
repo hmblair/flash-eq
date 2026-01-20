@@ -263,3 +263,133 @@ def test_gradient_equivariance(cuda_device, lvals):
 
     # Compare: D @ grad1 should equal grad2
     check_equivariance(grad1_rotated, grad2, rtol=1e-4, msg="Gradient equivariance")
+
+
+@pytest.mark.parametrize("log_bins", [False, True])
+def test_distance_gradient_flow(cuda_device, log_bins):
+    """Test that gradients flow through to distances.
+
+    The CUDA kernel computes binning internally from distances, which requires
+    implementing the chain rule for gradient propagation. This test verifies
+    that gradients are computed and non-zero for the distance input.
+    """
+    torch.manual_seed(42)
+
+    lvals = [0, 1, 2]
+    mult = 4
+    num_nodes = 10
+    num_edges = 30
+    dim = sum(2 * l + 1 for l in lvals)
+
+    in_repr = Repr(lvals=lvals, mult=mult)
+    out_repr = Repr(lvals=lvals, mult=mult)
+
+    # Use min_dist > 0 for log_bins
+    min_dist = 0.5 if log_bins else 0.0
+    layer = EquivariantEdgewiseLinear(
+        in_repr, out_repr,
+        num_bins=50,
+        min_dist=min_dist,
+        max_dist=10.0,
+        log_bins=log_bins,
+    ).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
+
+    node_features = torch.randn(num_nodes, mult, dim, device=cuda_device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device, dtype=torch.int64)
+
+    # Distances with requires_grad=True
+    distances = torch.rand(num_edges, device=cuda_device) * 5.0 + min_dist + 0.1
+    distances = distances.requires_grad_(True)
+
+    directions = torch.randn(num_edges, 3, device=cuda_device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    P, Q = basis(directions)
+    edge_features = node_features[src_indices]
+
+    output = layer(P, Q, edge_features, distances)
+    loss = (output ** 2).sum()
+    loss.backward()
+
+    # Verify gradients exist and are non-zero
+    assert distances.grad is not None, "distances.grad should not be None"
+    assert distances.grad.shape == distances.shape, "grad shape mismatch"
+    assert distances.grad.abs().sum() > 0, "distances.grad should be non-zero"
+
+    # Verify gradients are finite
+    assert torch.isfinite(distances.grad).all(), "distances.grad contains non-finite values"
+
+
+@pytest.mark.parametrize("log_bins", [False, True])
+def test_distance_gradient_numerical(cuda_device, log_bins):
+    """Verify distance gradients numerically with finite differences.
+
+    This checks that the analytical gradient computed by the CUDA kernel's
+    chain rule implementation matches the numerical gradient.
+    """
+    torch.manual_seed(123)
+
+    lvals = [0, 1]
+    mult = 2
+    num_nodes = 5
+    num_edges = 10
+    dim = sum(2 * l + 1 for l in lvals)
+
+    in_repr = Repr(lvals=lvals, mult=mult)
+    out_repr = Repr(lvals=lvals, mult=mult)
+
+    min_dist = 0.5 if log_bins else 0.0
+    layer = EquivariantEdgewiseLinear(
+        in_repr, out_repr,
+        num_bins=50,
+        min_dist=min_dist,
+        max_dist=10.0,
+        log_bins=log_bins,
+    ).to(cuda_device)
+    basis = WignerDBasis([in_repr, out_repr]).to(cuda_device)
+
+    node_features = torch.randn(num_nodes, mult, dim, device=cuda_device)
+    src_indices = torch.randint(0, num_nodes, (num_edges,), device=cuda_device, dtype=torch.int64)
+    directions = torch.randn(num_edges, 3, device=cuda_device)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    P, Q = basis(directions)
+    edge_features = node_features[src_indices]
+
+    # Base distances
+    distances = torch.rand(num_edges, device=cuda_device) * 5.0 + min_dist + 0.5
+
+    # Compute analytical gradient
+    distances_grad = distances.clone().requires_grad_(True)
+    output = layer(P, Q, edge_features, distances_grad)
+    loss = (output ** 2).sum()
+    loss.backward()
+    analytical_grad = distances_grad.grad.clone()
+
+    # Compute numerical gradient via finite differences
+    eps = 1e-4
+    numerical_grad = torch.zeros_like(distances)
+    for i in range(num_edges):
+        # Forward
+        distances_plus = distances.clone()
+        distances_plus[i] += eps
+        output_plus = layer(P, Q, edge_features, distances_plus)
+        loss_plus = (output_plus ** 2).sum()
+
+        # Backward
+        distances_minus = distances.clone()
+        distances_minus[i] -= eps
+        output_minus = layer(P, Q, edge_features, distances_minus)
+        loss_minus = (output_minus ** 2).sum()
+
+        numerical_grad[i] = (loss_plus - loss_minus) / (2 * eps)
+
+    # Compare
+    rel_error = (analytical_grad - numerical_grad).abs() / (numerical_grad.abs() + 1e-8)
+    max_rel_error = rel_error.max().item()
+
+    assert max_rel_error < 0.05, (
+        f"Distance gradient mismatch (log_bins={log_bins}): "
+        f"max_rel_error={max_rel_error:.4f}"
+    )

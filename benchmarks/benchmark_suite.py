@@ -480,11 +480,12 @@ def benchmark_transformer(
         .to(device)
         .to(dtype)
     )
-    basis = WignerDBasis(model.get_basis_reprs()).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # Generate random coordinates for nodes
+    coordinates = torch.randn(scenario.num_nodes, 3, device=device, dtype=dtype) * 5.0
     node_features = torch.randn(
         scenario.num_nodes,
         scenario.mult,
@@ -495,21 +496,14 @@ def benchmark_transformer(
     )
     src_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
     dst_indices = torch.randint(0, scenario.num_nodes, (scenario.num_edges,), device=device)
-    directions = torch.randn(scenario.num_edges, 3, device=device, dtype=dtype)
-    directions = directions / directions.norm(dim=-1, keepdim=True)
-    distances = torch.rand(scenario.num_edges, device=device, dtype=dtype) * 10.0
     target = torch.randn(
         scenario.num_nodes, scenario.mult, out_repr.dim(), device=device, dtype=dtype
     )
 
-    matrices = basis(directions)
-
     def train_step():
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = model(
-                matrices, node_features, distances, src_indices, dst_indices, scenario.num_nodes
-            )
+            output = model(coordinates, node_features, src_indices, dst_indices)
             loss = ((output - target) ** 2).mean()
         scaler.scale(loss).backward()
         scaler.step(optimizer)

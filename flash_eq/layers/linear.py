@@ -161,14 +161,17 @@ class EquivariantEdgewiseLinear(nn.Module):
         # Includes solid harmonic scaling: weights *= (r/(r+scale))^(l_in+l_out)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
-        bin_lo, interp_weight = self.radial_weights.bin_indices(distances)
+        rw = self.radial_weights
+        bin_param1, bin_param2 = rw.binning_params()
         out_diag = block_diagonal_cuda(
             f_diag,
-            self.radial_weights(),
-            bin_lo,
-            interp_weight,
+            rw(),
             distances,
             self.product_repr,
+            bin_param1=bin_param1,
+            bin_param2=bin_param2,
+            num_bins=rw.num_bins,
+            log_bins=rw.log,
             sh_scale=self.solid_harmonic_scale,
         )
 

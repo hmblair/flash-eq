@@ -234,6 +234,20 @@ class BinnedModule(nn.Module):
         smoothed = smoothed.reshape(*self.shape, n_bins)
         return smoothed.permute(len(self.shape), *range(len(self.shape)))
 
+    def binning_params(self) -> tuple[float, float]:
+        """Return binning parameters for the CUDA kernel.
+
+        Returns:
+            (param1, param2) where:
+            - For linear: (min_val, inv_bin_width)
+            - For log: (log_min, inv_log_range)
+        """
+        if self.log:
+            return (self._log_min, self._inv_log_range)
+        else:
+            inv_bin_width = self.num_bins / (self.max_val - self.min_val)
+            return (self.min_val, inv_bin_width)
+
     def bin_indices(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute bin indices and interpolation weights for given values.
 
@@ -386,6 +400,20 @@ class BinnedRadialBasis(nn.Module):
         table = torch.einsum('bk,k...->b...', basis_values, self.coefficients)
 
         return table
+
+    def binning_params(self) -> tuple[float, float]:
+        """Return binning parameters for the CUDA kernel.
+
+        Returns:
+            (param1, param2) where:
+            - For linear: (min_val, inv_bin_width)
+            - For log: (log_min, inv_log_range)
+        """
+        if self.log:
+            return (self._log_min, self._inv_log_range)
+        else:
+            inv_bin_width = self.num_bins / (self.max_val - self.min_val)
+            return (self.min_val, inv_bin_width)
 
     def bin_indices(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute bin indices and interpolation weights for given values.

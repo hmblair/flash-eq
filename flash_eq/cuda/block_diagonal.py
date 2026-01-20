@@ -168,19 +168,20 @@ def _get_cuda_module():
 # =============================================================================
 
 class _BlockDiagonalFunction(Function):
-    """Autograd function wrapping the CUDA kernel with bin-sorted edges."""
+    """Autograd function wrapping the CUDA kernel with distance-sorted edges."""
 
     @staticmethod
     def forward(
         ctx: FunctionCtx,
         features: torch.Tensor,
         radial_table: torch.Tensor,
-        bin_lo: torch.Tensor,
-        interp_weight: torch.Tensor,
         distances: torch.Tensor,
         sh_scale: float,
-        channels_out: int,
+        bin_param1: float,
+        bin_param2: float,
         num_bins: int,
+        log_bins: bool,
+        channels_out: int,
         lvals_in: torch.Tensor,
         lvals_out: torch.Tensor,
         dim_out: int,
@@ -189,40 +190,43 @@ class _BlockDiagonalFunction(Function):
     ) -> torch.Tensor:
         cuda_module = _get_cuda_module()
 
-        # Sort edges by bin for better memory access patterns
-        sort_idx = torch.argsort(bin_lo)
+        # Sort edges by distance for better memory access patterns
+        # (since binning is monotonic, sorting by distance is equivalent to sorting by bin)
+        sort_idx = torch.argsort(distances)
         unsort_idx = torch.argsort(sort_idx)
 
         features_sorted = features[sort_idx]
-        bin_lo_sorted = bin_lo[sort_idx]
-        interp_weight_sorted = interp_weight[sort_idx]
         distances_sorted = distances[sort_idx]
 
         output_sorted, = cuda_module.forward(
             features_sorted,
             radial_table,
-            bin_lo_sorted,
-            interp_weight_sorted,
             distances_sorted,
             sh_scale,
+            bin_param1,
+            bin_param2,
+            num_bins,
+            log_bins,
             lvals_in,
             lvals_out,
             channels_out,
             dim_out,
-            num_bins,
             max_in_size
         )
 
         # Unsort output back to original edge order
         output = output_sorted[unsort_idx]
 
-        ctx.save_for_backward(features_sorted, radial_table, bin_lo_sorted,
-                              interp_weight_sorted, distances_sorted, lvals_in, lvals_out,
-                              sort_idx, unsort_idx)
+        ctx.save_for_backward(features_sorted, radial_table, distances_sorted,
+                              lvals_in, lvals_out, sort_idx, unsort_idx)
         ctx.dim_in = features.size(2)  # type: ignore[attr-defined]
         ctx.max_in_size = max_in_size  # type: ignore[attr-defined]
         ctx.max_out_size = max_out_size  # type: ignore[attr-defined]
         ctx.sh_scale = sh_scale  # type: ignore[attr-defined]
+        ctx.bin_param1 = bin_param1  # type: ignore[attr-defined]
+        ctx.bin_param2 = bin_param2  # type: ignore[attr-defined]
+        ctx.num_bins = num_bins  # type: ignore[attr-defined]
+        ctx.log_bins = log_bins  # type: ignore[attr-defined]
 
         return output
 
@@ -231,21 +235,23 @@ class _BlockDiagonalFunction(Function):
         ctx: FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, ...]:
-        (features_sorted, radial_table, bin_lo_sorted, interp_weight_sorted,
-         distances_sorted, lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors  # type: ignore[attr-defined]
+        (features_sorted, radial_table, distances_sorted,
+         lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors  # type: ignore[attr-defined]
         cuda_module = _get_cuda_module()
 
         # Sort grad_output to match the sorted forward pass order
         grad_output_sorted = grad_output[sort_idx]
 
-        grad_features_sorted, grad_radial_table, grad_interp_weight_sorted = cuda_module.backward(
+        grad_features_sorted, grad_radial_table, grad_distances_sorted = cuda_module.backward(
             grad_output_sorted,
             features_sorted,
             radial_table,
-            bin_lo_sorted,
-            interp_weight_sorted,
             distances_sorted,
             ctx.sh_scale,  # type: ignore[attr-defined]
+            ctx.bin_param1,  # type: ignore[attr-defined]
+            ctx.bin_param2,  # type: ignore[attr-defined]
+            ctx.num_bins,  # type: ignore[attr-defined]
+            ctx.log_bins,  # type: ignore[attr-defined]
             lvals_in,
             lvals_out,
             ctx.dim_in,  # type: ignore[attr-defined]
@@ -255,10 +261,10 @@ class _BlockDiagonalFunction(Function):
 
         # Unsort gradients back to original edge order
         grad_features = grad_features_sorted[unsort_idx]
-        grad_interp_weight = grad_interp_weight_sorted[unsort_idx]
+        grad_distances = grad_distances_sorted[unsort_idx]
 
-        return (grad_features, grad_radial_table, None, grad_interp_weight,
-                None, None, None, None, None, None, None, None, None)
+        return (grad_features, grad_radial_table, grad_distances,
+                None, None, None, None, None, None, None, None, None, None, None)
 
 
 # =============================================================================
@@ -293,10 +299,12 @@ def _compute_block_sizes(lvals_in: torch.Tensor, lvals_out: torch.Tensor) -> tup
 def block_diagonal_cuda(
     features: torch.Tensor,
     radial_table: torch.Tensor,
-    bin_lo: torch.Tensor,
-    interp_weight: torch.Tensor,
     distances: torch.Tensor,
     product_repr: "ProductRepr",
+    bin_param1: float,
+    bin_param2: float,
+    num_bins: int,
+    log_bins: bool = False,
     sh_scale: float = 0.1,
 ) -> torch.Tensor:
     """Apply block-diagonal multiplication with binned radial weights.
@@ -317,13 +325,13 @@ def block_diagonal_cuda(
             Edge features in m-first diagonal basis.
         radial_table: (num_bins + 1, channels_out, channels_in, weight_dim)
             Block-diagonal weights at bin edges.
-        bin_lo: (num_edges,) int32
-            Lower bin index for each edge (from BinnedModule.bin_indices).
-        interp_weight: (num_edges,)
-            Interpolation weight in [0, 1] for each edge.
         distances: (num_edges,)
-            Edge distances for solid harmonic scaling.
+            Edge distances for radial binning and solid harmonic scaling.
         product_repr: ProductRepr describing input/output representation structure.
+        bin_param1: First binning parameter (min_val for linear, log_min for log).
+        bin_param2: Second binning parameter (inv_bin_width for linear, inv_log_range for log).
+        num_bins: Number of bins.
+        log_bins: Whether to use logarithmic bin spacing (default False).
         sh_scale: Length scale for solid harmonic scaling (default 0.1).
 
     Returns:
@@ -332,7 +340,6 @@ def block_diagonal_cuda(
     """
     device = features.device
     num_edges = features.size(0)
-    num_bins = radial_table.size(0) - 1
     channels_out = radial_table.size(1)
     dim_out = product_repr.rep2.dim()
 
@@ -343,8 +350,6 @@ def block_diagonal_cuda(
     # Ensure contiguous memory layout for CUDA kernel
     features = features.contiguous()
     radial_table = radial_table.contiguous()
-    bin_lo = bin_lo.contiguous()
-    interp_weight = interp_weight.to(features.dtype).contiguous()
     distances = distances.to(features.dtype).contiguous()
 
     # Extract lvals tensors from representations
@@ -356,6 +361,7 @@ def block_diagonal_cuda(
 
     # Run kernel
     return _BlockDiagonalFunction.apply(
-        features, radial_table, bin_lo, interp_weight, distances, sh_scale,
-        channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size
+        features, radial_table, distances, sh_scale,
+        bin_param1, bin_param2, num_bins, log_bins,
+        channels_out, lvals_in, lvals_out, dim_out, max_in_size, max_out_size
     )

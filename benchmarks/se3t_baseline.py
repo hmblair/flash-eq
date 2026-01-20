@@ -12,7 +12,6 @@ This serves as a reference for comparing against flash-eq's optimized approach.
 
 import torch
 import torch.nn as nn
-from typing import List, Tuple
 
 
 def compute_freq_sum(lmax: int) -> int:

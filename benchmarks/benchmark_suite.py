@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
-import torch.nn as nn
 
 from flash_eq import (
     EquivariantEdgeAttention,
@@ -535,7 +534,7 @@ def run_component_benchmarks(
     print_header(f"Component Benchmarks ({precision})")
 
     # Column widths
-    name_w, scenario_w, time_w, mem_w, tput_w = 22, 32, 12, 10, 18
+    _name_w, scenario_w, time_w, mem_w, tput_w = 22, 32, 12, 10, 18
 
     # Results storage for summary
     all_results: dict[str, dict[str, BenchmarkResult | None]] = {}

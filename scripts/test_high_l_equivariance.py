@@ -63,6 +63,6 @@ if __name__ == "__main__":
             try:
                 err = test_equivariance(l_max, precision=prec)
                 row += f"{err*100:.2f}%".ljust(14)
-            except Exception as e:
+            except Exception:
                 row += "ERR".ljust(14)
         print(row)

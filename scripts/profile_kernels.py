@@ -1,7 +1,6 @@
 """Profile time distribution between m=0 and m>0 kernels."""
 
 import torch
-import torch.nn as nn
 from flash_eq import EquivariantEdgewiseLinear, WignerDBasis, Repr
 
 

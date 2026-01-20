@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch>=2.0"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "torch>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash-eq"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fast, memory-efficient SO(3)-equivariant linear layers"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    { name = "Hamish Blair" }
+    { name = "Hamish M. Blair", email = "hmblair@stanford.edu" }
 ]
 keywords = ["equivariant", "SO3", "neural-networks", "geometric-deep-learning"]
 classifiers = [
@@ -22,9 +22,12 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "sphericart-torch>=1.0",
-    "h5py",
-    "ciffy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hmblair/flash-eq"
+Repository = "https://github.com/hmblair/flash-eq"
+Issues = "https://github.com/hmblair/flash-eq/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -37,3 +40,9 @@ include = ["flash_eq*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools_scm]
+version_file = "flash_eq/_version.py"
+
+[tool.ruff.lint]
+ignore = ["E741"]  # Allow 'l' as variable name (standard physics notation for angular momentum)

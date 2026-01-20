@@ -217,6 +217,7 @@ class SeparableS2Activation(nn.Module):
             )
 
         # Gating: use scalar features to gate higher degrees
+        self.gate_linear: nn.Linear | None = None
         if use_gate and self.n_higher > 0:
             # Project scalar features to gate values for each higher-degree irrep
             n_higher_irreps = len(higher_lvals)
@@ -232,8 +233,6 @@ class SeparableS2Activation(nn.Module):
                 torch.tensor(gate_indices, dtype=torch.long)
             )
             self.n_higher_irreps = n_higher_irreps
-        else:
-            self.gate_linear = None
 
         self.apply(init_linear_weights)
 
@@ -257,6 +256,7 @@ class SeparableS2Activation(nn.Module):
         f_higher = f[..., self._higher_indices]  # (..., mult, n_higher)
 
         # Apply S² activation to higher degrees
+        assert self.s2_act is not None  # guaranteed when n_higher > 0
         f_higher = self.s2_act(f_higher)
 
         # Optional gating by scalar features

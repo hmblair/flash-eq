@@ -8,7 +8,6 @@ at r=0 for l>0.
 """
 
 import torch
-import pytest
 
 from flash_eq import (
     Repr,

@@ -54,7 +54,7 @@ def test_equivariance(cuda_device, lvals_in, lvals_out):
     num_nodes = 20
     num_edges = 50
     dim_in = sum(2 * l + 1 for l in lvals_in)
-    dim_out = sum(2 * l + 1 for l in lvals_out)
+    sum(2 * l + 1 for l in lvals_out)
 
     in_repr = Repr(lvals=lvals_in, mult=mult)
     out_repr = Repr(lvals=lvals_out, mult=mult)
@@ -108,7 +108,7 @@ def test_equivariance_multiple_rotations(cuda_device, lvals_in, lvals_out):
     num_nodes = 20
     num_edges = 50
     dim_in = sum(2 * l + 1 for l in lvals_in)
-    dim_out = sum(2 * l + 1 for l in lvals_out)
+    sum(2 * l + 1 for l in lvals_out)
 
     in_repr = Repr(lvals=lvals_in, mult=mult)
     out_repr = Repr(lvals=lvals_out, mult=mult)

@@ -15,7 +15,6 @@ Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from __future__ import annotations
 
-import math
 from typing import Sequence, cast
 
 import torch

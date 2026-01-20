@@ -136,6 +136,7 @@ class EquivariantTransformerBlock(nn.Module):
         self.mlp_up = EquivariantLinear(out_repr, mlp_hidden_repr, bias=True)
 
         # Choose activation: S² activation (EquiformerV2) or gating
+        self.mlp_act: nn.Module
         if use_s2_activation:
             self.mlp_act = SeparableS2Activation(
                 mlp_hidden_repr,

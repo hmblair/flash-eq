@@ -5,12 +5,11 @@ Tests boundary conditions and degenerate inputs that could cause runtime failure
 """
 
 import torch
-import pytest
 
 from flash_eq import (
     Repr, EquivariantEdgewiseLinear, WignerDBasis,
     RepNorm, EquivariantLinear, EquivariantGating, EquivariantLayerNorm,
-    RadialBasisFunctions, RadialMLP, BinnedModule,
+    RadialBasisFunctions, BinnedModule,
 )
 
 

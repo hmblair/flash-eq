@@ -14,7 +14,7 @@ import pytest
 
 from flash_eq import Repr, WignerD, S2Activation, SeparableS2Activation
 
-from .helpers import random_rotation, check_equivariance
+from .helpers import random_rotation
 
 
 # S2Activation supports non-contiguous l values

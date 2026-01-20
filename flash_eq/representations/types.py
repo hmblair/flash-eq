@@ -199,7 +199,7 @@ class Repr:
         if not isinstance(mult, int) or mult < 1:
             raise ValueError(f"Multiplicity must be a positive integer, got {mult}")
 
-        self.irreps = [Irrep(l, mult) for l in lvals]
+        self.irreps = [Irrep(int(l), mult) for l in lvals]
         self.lvals = torch.tensor([irrep.l for irrep in self.irreps], dtype=torch.long)
         self.mult = mult
 

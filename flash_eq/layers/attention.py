@@ -1,12 +1,13 @@
 """Equivariant graph attention layers.
 
 Implements attention from EquiformerV2 (Liao et al., ICLR 2024) Section 3.2.
-Operates on edge features in standard spherical harmonic basis.
+Uses full equivariant Q/K projections - dot product of equivariant features is invariant.
 
 Pipeline:
-    edge_features = EquivariantEdgewiseLinear(...)  # (E, mult, dim)
-    edge_features = EquivariantEdgeAttention(...)   # (E, mult, dim)
-    node_features = GraphPooling(...)               # (N, mult, dim)
+    Q = EquivariantLinear(norm(node_features))[dst]
+    K = EquivariantLinear(norm(node_features))[src]
+    V = EquivariantEdgewiseLinear(node_features[src])
+    output = GraphPooling(attention(Q, K, V))
 
 Author: Hamish M. Blair <hmblair@stanford.edu>
 """
@@ -16,121 +17,72 @@ import torch
 import torch.nn as nn
 
 from ..representations import Repr
-from .linear import EquivariantEdgewiseLinear
+from .linear import EquivariantLinear, EquivariantEdgewiseLinear
+from .norm import EquivariantLayerNorm
 from .pooling import GraphPooling
 
 
 class EquivariantEdgeAttention(nn.Module):
-    """Attention mechanism for equivariant edge features.
+    """Low-level attention mechanism for pre-computed Q, K, V tensors.
 
-    Computes scalar attention weights from l=0 components and applies
-    them to full equivariant features. The softmax normalizes over all
-    edges with the same destination node (i.e., over neighbors).
-
-    Features:
-        - Attention re-normalization (LayerNorm on scalars before softmax)
-        - Multi-head attention (splits multiplicity dimension)
-        - Operates in standard SH basis (after Q transform)
+    Takes Q, K, V tensors and applies scaled dot-product attention with
+    neighbor softmax (normalizing over edges to the same destination).
 
     Args:
-        repr: Representation of edge features (must include l=0).
-        num_heads: Number of attention heads. Must divide repr.mult.
-        use_layer_norm: Apply LayerNorm to scalars before attention (recommended).
+        num_heads: Number of attention heads.
+        qk_dim: Dimension of Q/K per head (for scaling).
         dropout: Dropout rate for attention weights.
 
     Example:
-        >>> repr = Repr(lvals=[0, 1, 2], mult=32)
-        >>> attn = EquivariantEdgeAttention(repr, num_heads=8)
-        >>>
-        >>> # edge_features from EquivariantEdgewiseLinear
-        >>> edge_features = torch.randn(1000, 32, 9)  # (E, mult, dim)
-        >>> dst_indices = torch.randint(0, 100, (1000,))
-        >>>
-        >>> weighted = attn(edge_features, dst_indices, num_nodes=100)
+        >>> attn = EquivariantEdgeAttention(num_heads=4, qk_dim=36)
+        >>> Q = torch.randn(1000, 4, 36)  # (E, H, qk_dim)
+        >>> K = torch.randn(1000, 4, 36)  # (E, H, qk_dim)
+        >>> V = torch.randn(1000, 32, 9)  # (E, mult, dim)
+        >>> output = attn(Q, K, V, dst_indices, num_nodes=100)
     """
-
-    _scalar_locs: torch.Tensor
 
     def __init__(
         self,
-        repr: Repr,
-        num_heads: int = 1,
-        use_layer_norm: bool = True,
+        num_heads: int,
+        qk_dim: int,
         dropout: float = 0.0,
     ):
         super().__init__()
 
-        if repr.mult % num_heads != 0:
-            raise ValueError(f"num_heads ({num_heads}) must divide mult ({repr.mult})")
-
-        self.repr = repr
         self.num_heads = num_heads
-        self.head_dim = repr.mult // num_heads
-
-        # Locate scalar (l=0) components
-        nscalar, scalar_locs = repr.find_scalar()
-        if nscalar == 0:
-            raise ValueError(
-                f"Representation must include l=0 for attention. "
-                f"Got lvals={repr.lvals.tolist()}"
-            )
-        self.nscalar = nscalar
-        self.register_buffer('_scalar_locs', torch.tensor(scalar_locs, dtype=torch.long))
-
-        # Scalar feature dimension: mult * nscalar
-        scalar_dim = repr.mult * nscalar
-        head_scalar_dim = self.head_dim * nscalar
-
-        # Attention re-normalization (Section 3.2)
-        self.layer_norm = nn.LayerNorm(scalar_dim) if use_layer_norm else nn.Identity()
-
-        # Attention projection: scalars -> logit
-        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
-        self.attn_proj = nn.Linear(head_scalar_dim, 1, bias=False)
-        nn.init.xavier_uniform_(self.attn_proj.weight)
-
+        self.qk_dim = qk_dim
+        self.scale = qk_dim ** -0.5
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(
         self,
-        edge_features: torch.Tensor,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
         dst_indices: torch.Tensor,
         num_nodes: int,
     ) -> torch.Tensor:
         """Apply attention to edge features.
 
         Args:
-            edge_features: (num_edges, mult, dim) edge features in standard SH basis.
+            Q: (num_edges, num_heads, qk_dim) query features from dst nodes.
+            K: (num_edges, num_heads, qk_dim) key features from src nodes.
+            V: (num_edges, mult, dim) value features (edge features).
             dst_indices: (num_edges,) destination node index for each edge.
             num_nodes: Total number of destination nodes.
 
         Returns:
             Attention-weighted edge features, shape (num_edges, mult, dim).
         """
-        E, mult, dim = edge_features.shape
-
-        # Extract scalar (l=0) features: (E, mult, nscalar)
-        scalars = edge_features[..., self._scalar_locs]
-
-        # Flatten for LayerNorm: (E, mult * nscalar)
-        scalars_flat = scalars.reshape(E, -1)
-
-        # Attention re-normalization
-        scalars_flat = self.layer_norm(scalars_flat)
-
-        # Reshape for multi-head: (E, num_heads, head_dim * nscalar)
-        scalars_heads = scalars_flat.view(E, self.num_heads, -1)
-
-        # Compute attention logits
-        logits = self.attn_proj(self.leaky_relu(scalars_heads))  # (E, H, 1)
-        logits = logits.squeeze(-1)  # (E, H)
+        # Scaled dot-product attention
+        logits = (Q * K).sum(-1) * self.scale  # (E, H)
 
         # Softmax over neighbors (edges to same destination)
         attn_weights = self._neighbor_softmax(logits, dst_indices, num_nodes)
         attn_weights = self.dropout(attn_weights)  # (E, H)
 
-        # Apply attention weights to features
-        return self._apply_attention(edge_features, attn_weights)
+        # Apply attention weights to values
+        return self._apply_attention(V, attn_weights)
 
     def _neighbor_softmax(
         self,
@@ -169,51 +121,50 @@ class EquivariantEdgeAttention(nn.Module):
 
     def _apply_attention(
         self,
-        features: torch.Tensor,
+        V: torch.Tensor,
         attn_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Multiply features by attention weights.
+        """Multiply values by attention weights.
 
         Args:
-            features: (E, mult, dim) edge features.
+            V: (E, mult, dim) edge features.
             attn_weights: (E, H) attention weights per head.
 
         Returns:
             Weighted features, shape (E, mult, dim).
         """
-        E, mult, dim = features.shape
+        E, mult, dim = V.shape
 
         if self.num_heads == 1:
             # Single head: broadcast weight over all channels
-            return features * attn_weights.view(E, 1, 1)
+            return V * attn_weights.view(E, 1, 1)
 
         # Multi-head: each head weights its portion of channels
-        features = features.view(E, self.num_heads, self.head_dim, dim)
+        head_dim = mult // self.num_heads
+        V = V.view(E, self.num_heads, head_dim, dim)
         attn_weights = attn_weights.view(E, self.num_heads, 1, 1)
-        return (features * attn_weights).view(E, mult, dim)
+        return (V * attn_weights).view(E, mult, dim)
 
     def extra_repr(self) -> str:
-        return (
-            f"repr={self.repr}, num_heads={self.num_heads}, "
-            f"nscalar={self.nscalar}"
-        )
+        return f"num_heads={self.num_heads}, qk_dim={self.qk_dim}"
 
 
 class EquivariantAttention(nn.Module):
     """SO(3)-equivariant graph attention layer.
 
-    Combines the full message-passing pipeline:
-        1. EquivariantEdgewiseLinear: Transform node features to edge features
-        2. EquivariantEdgeAttention: Apply attention weighting on edges
-        3. GraphPooling: Aggregate edge features back to nodes
+    Combines equivariant Q/K projections with the full message-passing pipeline:
+        1. Q, K: EquivariantLinear projections from node features (gathered to edges)
+        2. V: EquivariantEdgewiseLinear transformation of edge features
+        3. Attention: Scaled dot-product with neighbor softmax
+        4. Pooling: Aggregate weighted edges back to nodes
 
-    This is the primary building block for equivariant graph neural networks,
-    implementing the attention mechanism from EquiformerV2 (Liao et al., 2024).
+    The key insight is that the dot product of equivariant features is invariant
+    under rotation, so we can use full equivariant Q/K features (not just scalars).
 
     Args:
         in_repr: Input representation (Repr with lvals and mult).
         out_repr: Output representation.
-        num_heads: Number of attention heads. Must divide out_repr.mult.
+        num_heads: Number of attention heads. Must divide both in_repr.mult and out_repr.mult.
         num_bins: Number of distance bins for radial weight interpolation.
         num_bases: Number of radial basis functions. If None, uses independent
             weights per bin. If set (e.g., 16), uses radial basis functions
@@ -223,7 +174,6 @@ class EquivariantAttention(nn.Module):
         log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
         sigma: Gaussian smoothing kernel width for radial weights.
             Only used when num_bases=None.
-        use_layer_norm: Apply LayerNorm to scalars before attention.
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
 
@@ -250,17 +200,37 @@ class EquivariantAttention(nn.Module):
         max_dist: float = 10.0,
         log_bins: bool = False,
         sigma: float = 1.0,
-        use_layer_norm: bool = True,
         dropout: float = 0.0,
         reduce: str = 'sum',
     ):
         super().__init__()
 
+        if in_repr.mult % num_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must divide in_repr.mult ({in_repr.mult})")
+        if out_repr.mult % num_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must divide out_repr.mult ({out_repr.mult})")
+
         self.in_repr = in_repr
         self.out_repr = out_repr
+        self.num_heads = num_heads
 
-        # Edgewise linear transformation
-        self.linear = EquivariantEdgewiseLinear(
+        # Fused Q/K projection: single norm + linear with 2x output mult, then split
+        self.norm_qk = EquivariantLayerNorm(in_repr)
+        qk_repr = Repr(lvals=in_repr.lvals, mult=in_repr.mult * 2)
+        self.linear_qk = EquivariantLinear(in_repr, qk_repr, bias=False)
+
+        # Q/K dimension per head: (mult / H) * dim
+        qk_dim = (in_repr.mult // num_heads) * in_repr.dim()
+
+        # Low-level attention mechanism
+        self.attention = EquivariantEdgeAttention(
+            num_heads=num_heads,
+            qk_dim=qk_dim,
+            dropout=dropout,
+        )
+
+        # V projection: in_repr -> out_repr (can change lvals via edgewise linear)
+        self.linear_v = EquivariantEdgewiseLinear(
             in_repr=in_repr,
             out_repr=out_repr,
             num_bins=num_bins,
@@ -271,21 +241,13 @@ class EquivariantAttention(nn.Module):
             sigma=sigma,
         )
 
-        # Edge attention
-        self.attention = EquivariantEdgeAttention(
-            repr=out_repr,
-            num_heads=num_heads,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
-        )
-
         # Aggregation
         self.pool = GraphPooling(reduce=reduce)
 
     def forward(
         self,
         P: torch.Tensor,
-        Q: torch.Tensor,
+        Q_basis: torch.Tensor,
         node_features: torch.Tensor,
         distances: torch.Tensor,
         src_indices: torch.Tensor,
@@ -297,37 +259,42 @@ class EquivariantAttention(nn.Module):
 
         Args:
             P: (num_edges, dim_in, dim_in) input basis from WignerDBasis.
-            Q: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
-            node_features: (num_nodes, channels_in, dim_in) node features.
+            Q_basis: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
+            node_features: (num_nodes, mult_in, dim_in) node features.
             distances: (num_edges,) edge distances.
             src_indices: (num_edges,) source node for each edge.
             dst_indices: (num_edges,) destination node for each edge.
             num_nodes: Total number of nodes.
-            edge_features: Optional (num_edges, channels_in, dim_in) edge features
-                to add to gathered node features before the linear transformation.
-                Useful for injecting edge-level information like positional encodings.
+            edge_features: Optional (num_edges, mult_in, dim_in) edge features
+                to add to gathered node features before the V projection.
 
         Returns:
-            output: (num_nodes, channels_out, dim_out) updated node features.
+            output: (num_nodes, mult_out, dim_out) updated node features.
         """
-        # Gather node features to edges
-        gathered = node_features[src_indices]
+        E = src_indices.shape[0]
+        mult = self.in_repr.mult
 
-        # Add optional edge features (e.g., positional encodings)
+        # Fused Q/K: normalize once, project to 2x mult, then split and gather
+        QK = self.linear_qk(self.norm_qk(node_features))  # (N, 2*mult, dim)
+        Q = QK[:, :mult][dst_indices]  # (E, mult, dim)
+        K = QK[:, mult:][src_indices]  # (E, mult, dim)
+
+        # Reshape for multi-head: (E, H, qk_dim) where qk_dim = (mult/H) * dim
+        Q = Q.view(E, self.num_heads, -1)
+        K = K.view(E, self.num_heads, -1)
+
+        # V from source nodes through edgewise linear
+        gathered = node_features[src_indices]
         if edge_features is not None:
             gathered = gathered + edge_features
+        V = self.linear_v(P, Q_basis, gathered, distances)  # (E, mult_out, dim_out)
 
-        # Transform through equivariant linear
-        out = self.linear(P, Q, gathered, distances)
-
-        # Apply attention weighting
-        out = self.attention(out, dst_indices, num_nodes)
-
-        # Aggregate to nodes
-        return self.pool(out, dst_indices, num_nodes)
+        # Apply attention and aggregate
+        weighted = self.attention(Q, K, V, dst_indices, num_nodes)
+        return self.pool(weighted, dst_indices, num_nodes)
 
     def extra_repr(self) -> str:
         return (
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
-            f"num_heads={self.attention.num_heads}, reduce='{self.pool.reduce}'"
+            f"num_heads={self.num_heads}, reduce='{self.pool.reduce}'"
         )

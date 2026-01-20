@@ -121,7 +121,6 @@ class EquivariantTransformerBlock(nn.Module):
             max_dist=max_dist,
             log_bins=log_bins,
             sigma=sigma,
-            use_layer_norm=True,
             dropout=dropout,
             reduce='sum',
         )
@@ -131,7 +130,7 @@ class EquivariantTransformerBlock(nn.Module):
 
         # MLP: out_repr -> expanded -> out_repr
         mlp_hidden_mult = out_repr.mult * mlp_ratio
-        mlp_hidden_repr = Repr(lvals=out_repr.lvals.tolist(), mult=mlp_hidden_mult)
+        mlp_hidden_repr = Repr(lvals=out_repr.lvals, mult=mlp_hidden_mult)
 
         self.mlp_up = EquivariantLinear(out_repr, mlp_hidden_repr, bias=True)
 

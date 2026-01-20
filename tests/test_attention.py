@@ -1,12 +1,8 @@
-"""Tests for equivariant edge attention.
+"""Tests for equivariant attention layers.
 
 Tests:
-    - Forward pass shape and device handling
-    - Attention weights sum to 1 per destination node
-    - Attention weight invariance under rotation
-    - Full equivariance: D @ Attention(f) = Attention(D @ f)
-    - Multi-head attention
-    - Integration with EquivariantEdgewiseLinear pipeline (CUDA only)
+    - EquivariantEdgeAttention: Low-level Q/K/V attention
+    - EquivariantAttention: Full message-passing layer with equivariance
 
 Author: Hamish M. Blair <hmblair@stanford.edu>
 """
@@ -17,10 +13,8 @@ from flash_eq import (
     Repr,
     WignerD,
     WignerDBasis,
-    EquivariantEdgewiseLinear,
-    GraphPooling,
 )
-from flash_eq.layers.attention import EquivariantEdgeAttention
+from flash_eq.layers.attention import EquivariantEdgeAttention, EquivariantAttention
 
 from .helpers import random_rotation, make_graph, check_equivariance
 
@@ -39,56 +33,67 @@ NUM_HEADS_CONFIGS = [1, 2, 4]
 
 
 class TestEquivariantEdgeAttention:
-    """Test suite for EquivariantEdgeAttention."""
+    """Test suite for EquivariantEdgeAttention (low-level Q/K/V attention)."""
 
-    @pytest.mark.parametrize("lvals,mult", REPR_CONFIGS)
-    def test_forward_shape(self, device, lvals, mult):
+    def test_forward_shape(self, device):
         """Test that forward pass produces correct output shape."""
-        repr = Repr(lvals=lvals, mult=mult)
+        num_heads = 4
+        qk_dim = 36
+        mult = 8
+        dim = 9
         num_nodes, num_edges = 20, 100
 
-        attn = EquivariantEdgeAttention(repr, num_heads=1).to(device)
+        attn = EquivariantEdgeAttention(num_heads=num_heads, qk_dim=qk_dim).to(device)
         _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, mult, repr.dim(), device=device)
 
-        out = attn(edge_features, dst, num_nodes)
+        Q = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        K = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        V = torch.randn(num_edges, mult, dim, device=device)
 
-        assert out.shape == edge_features.shape
+        out = attn(Q, K, V, dst, num_nodes)
+
+        assert out.shape == V.shape
         assert out.device.type == device.type
 
     @pytest.mark.parametrize("num_heads", NUM_HEADS_CONFIGS)
     def test_multihead_shape(self, device, num_heads):
         """Test multi-head attention produces correct shape."""
+        qk_dim = 36
         mult = 8  # Divisible by all NUM_HEADS_CONFIGS
-        repr = Repr(lvals=[0, 1, 2], mult=mult)
+        dim = 9
         num_nodes, num_edges = 20, 100
 
-        attn = EquivariantEdgeAttention(repr, num_heads=num_heads).to(device)
+        attn = EquivariantEdgeAttention(num_heads=num_heads, qk_dim=qk_dim).to(device)
         _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, mult, repr.dim(), device=device)
 
-        out = attn(edge_features, dst, num_nodes)
+        Q = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        K = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        V = torch.randn(num_edges, mult, dim, device=device)
 
-        assert out.shape == edge_features.shape
+        out = attn(Q, K, V, dst, num_nodes)
+
+        assert out.shape == V.shape
 
     def test_attention_weights_sum_to_one(self, device):
         """Test that attention weights sum to 1 per destination node."""
-        repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_heads = 2
+        qk_dim = 36
+        mult = 8
+        dim = 9
         num_nodes, num_edges = 20, 100
 
-        attn = EquivariantEdgeAttention(repr, num_heads=2, dropout=0.0).to(device)
+        attn = EquivariantEdgeAttention(num_heads=num_heads, qk_dim=qk_dim, dropout=0.0).to(device)
         _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, repr.mult, repr.dim(), device=device)
+
+        Q = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        K = torch.randn(num_edges, num_heads, qk_dim, device=device)
 
         # Manually compute attention weights
-        scalars = edge_features[..., attn._scalar_locs].reshape(num_edges, -1)
-        scalars = attn.layer_norm(scalars)
-        scalars_heads = scalars.view(num_edges, attn.num_heads, -1)
-        logits = attn.attn_proj(attn.leaky_relu(scalars_heads)).squeeze(-1)
+        logits = (Q * K).sum(-1) * attn.scale
         weights = attn._neighbor_softmax(logits, dst, num_nodes)
 
         # Sum weights per destination node
-        weight_sums = torch.zeros(num_nodes, attn.num_heads, device=device)
+        weight_sums = torch.zeros(num_nodes, num_heads, device=device)
         idx = dst.unsqueeze(-1).expand_as(weights)
         weight_sums.scatter_add_(0, idx, weights)
 
@@ -100,134 +105,97 @@ class TestEquivariantEdgeAttention:
             if nodes_with_edges[i]:
                 assert torch.allclose(
                     weight_sums[i],
-                    torch.ones(attn.num_heads, device=device),
+                    torch.ones(num_heads, device=device),
                     atol=1e-5,
                 ), f"Node {i}: weights sum to {weight_sums[i]}, expected 1.0"
 
-    @pytest.mark.parametrize("lvals,mult", REPR_CONFIGS)
-    def test_attention_weight_invariance(self, device, lvals, mult):
-        """Test that attention weights are invariant under rotation.
-
-        Attention weights are computed from scalar (l=0) features,
-        which are rotation-invariant.
-        """
-        torch.manual_seed(42)
-        repr = Repr(lvals=lvals, mult=mult)
-        num_nodes, num_edges = 20, 100
-
-        attn = EquivariantEdgeAttention(repr, num_heads=2, dropout=0.0).to(device)
-        wigner = WignerD(repr).to(device)
-        _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, mult, repr.dim(), device=device)
-
-        # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle)
-
-        # Rotate features
-        edge_features_rotated = torch.einsum('ij,...j->...i', D, edge_features)
-
-        # Compute attention weights for both
-        def get_weights(features):
-            scalars = features[..., attn._scalar_locs].reshape(num_edges, -1)
-            scalars = attn.layer_norm(scalars)
-            scalars_heads = scalars.view(num_edges, attn.num_heads, -1)
-            logits = attn.attn_proj(attn.leaky_relu(scalars_heads)).squeeze(-1)
-            return attn._neighbor_softmax(logits, dst, num_nodes)
-
-        weights_original = get_weights(edge_features)
-        weights_rotated = get_weights(edge_features_rotated)
-
-        assert torch.allclose(weights_original, weights_rotated, atol=1e-5), \
-            f"Attention weights changed under rotation. " \
-            f"Max diff: {(weights_original - weights_rotated).abs().max()}"
-
-    @pytest.mark.parametrize("lvals,mult", REPR_CONFIGS)
-    @pytest.mark.parametrize("num_heads", NUM_HEADS_CONFIGS)
-    def test_equivariance(self, device, lvals, mult, num_heads):
-        """Test full equivariance: D @ Attention(f) = Attention(D @ f)."""
-        if mult % num_heads != 0:
-            pytest.skip(f"mult={mult} not divisible by num_heads={num_heads}")
-
-        torch.manual_seed(42)
-        repr = Repr(lvals=lvals, mult=mult)
-        num_nodes, num_edges = 20, 100
-
-        attn = EquivariantEdgeAttention(repr, num_heads=num_heads, dropout=0.0).to(device)
-        wigner = WignerD(repr).to(device)
-        _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, mult, repr.dim(), device=device)
-
-        # Random rotation
-        axis, angle, _ = random_rotation(device)
-        D = wigner.rot(axis, angle)
-
-        # Method 1: Attention then rotate
-        out_original = attn(edge_features, dst, num_nodes)
-        out_then_rotate = torch.einsum('ij,...j->...i', D, out_original)
-
-        # Method 2: Rotate then attention
-        edge_features_rotated = torch.einsum('ij,...j->...i', D, edge_features)
-        rotate_then_out = attn(edge_features_rotated, dst, num_nodes)
-
-        check_equivariance(out_then_rotate, rotate_then_out, rtol=1e-4)
-
-    def test_no_l0_raises(self):
-        """Test that repr without l=0 raises an error."""
-        repr_no_scalar = Repr(lvals=[1, 2], mult=8)
-
-        with pytest.raises(ValueError, match="must include l=0"):
-            EquivariantEdgeAttention(repr_no_scalar)
-
-    def test_num_heads_divides_mult(self):
-        """Test that num_heads must divide mult."""
-        repr = Repr(lvals=[0, 1, 2], mult=8)
-
-        # Should work
-        for h in [1, 2, 4, 8]:
-            EquivariantEdgeAttention(repr, num_heads=h)
-
-        # Should fail
-        with pytest.raises(ValueError, match="must divide mult"):
-            EquivariantEdgeAttention(repr, num_heads=3)
-
     def test_dropout_determinism(self, device):
         """Test that dropout is applied in training but not eval."""
-        repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_heads = 2
+        qk_dim = 36
+        mult = 8
+        dim = 9
         num_nodes, num_edges = 20, 100
 
-        attn = EquivariantEdgeAttention(repr, num_heads=1, dropout=0.5).to(device)
+        attn = EquivariantEdgeAttention(num_heads=num_heads, qk_dim=qk_dim, dropout=0.5).to(device)
         _, dst = make_graph(num_nodes, num_edges, device)
-        edge_features = torch.randn(num_edges, repr.mult, repr.dim(), device=device)
+
+        Q = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        K = torch.randn(num_edges, num_heads, qk_dim, device=device)
+        V = torch.randn(num_edges, mult, dim, device=device)
 
         # Eval mode should be deterministic
         attn.eval()
-        out1 = attn(edge_features, dst, num_nodes)
-        out2 = attn(edge_features, dst, num_nodes)
+        out1 = attn(Q, K, V, dst, num_nodes)
+        out2 = attn(Q, K, V, dst, num_nodes)
         assert torch.allclose(out1, out2), "Eval mode should be deterministic"
 
 
-class TestFullPipeline:
-    """Test attention integrated with EquivariantEdgewiseLinear (CUDA only)."""
+class TestEquivariantAttention:
+    """Test suite for EquivariantAttention (full message-passing layer)."""
 
-    def test_pipeline_equivariance(self, cuda_device):
-        """Test equivariance: EdgewiseLinear -> Attention -> Pooling."""
-        torch.manual_seed(42)
+    @pytest.mark.parametrize("lvals,mult", REPR_CONFIGS)
+    def test_forward_shape(self, cuda_device, lvals, mult):
+        """Test that forward pass produces correct output shape."""
         device = cuda_device
-
-        repr = Repr(lvals=[0, 1, 2], mult=8)
+        repr = Repr(lvals=lvals, mult=mult)
         num_nodes, num_edges = 20, 100
 
-        # Create layers
+        layer = EquivariantAttention(repr, repr, num_heads=1).to(device)
         basis = WignerDBasis([repr, repr]).to(device)
-        linear = EquivariantEdgewiseLinear(repr, repr).to(device)
-        attn = EquivariantEdgeAttention(repr, num_heads=2, dropout=0.0).to(device)
-        pool = GraphPooling(reduce='sum')
+
+        src, dst = make_graph(num_nodes, num_edges, device)
+        node_features = torch.randn(num_nodes, mult, repr.dim(), device=device)
+        directions = torch.randn(num_edges, 3, device=device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=device) * 5 + 0.5
+
+        P, Q = basis(directions)
+        out = layer(P, Q, node_features, distances, src, dst, num_nodes)
+
+        assert out.shape == node_features.shape
+        assert out.device.type == device.type
+
+    @pytest.mark.parametrize("num_heads", NUM_HEADS_CONFIGS)
+    def test_multihead_shape(self, cuda_device, num_heads):
+        """Test multi-head attention produces correct shape."""
+        device = cuda_device
+        mult = 8  # Divisible by all NUM_HEADS_CONFIGS
+        repr = Repr(lvals=[0, 1, 2], mult=mult)
+        num_nodes, num_edges = 20, 100
+
+        layer = EquivariantAttention(repr, repr, num_heads=num_heads).to(device)
+        basis = WignerDBasis([repr, repr]).to(device)
+
+        src, dst = make_graph(num_nodes, num_edges, device)
+        node_features = torch.randn(num_nodes, mult, repr.dim(), device=device)
+        directions = torch.randn(num_edges, 3, device=device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=device) * 5 + 0.5
+
+        P, Q = basis(directions)
+        out = layer(P, Q, node_features, distances, src, dst, num_nodes)
+
+        assert out.shape == node_features.shape
+
+    @pytest.mark.parametrize("lvals,mult", REPR_CONFIGS)
+    @pytest.mark.parametrize("num_heads", NUM_HEADS_CONFIGS)
+    def test_equivariance(self, cuda_device, lvals, mult, num_heads):
+        """Test full equivariance: D @ Attention(f) = Attention(D @ f, R @ dirs)."""
+        if mult % num_heads != 0:
+            pytest.skip(f"mult={mult} not divisible by num_heads={num_heads}")
+
+        device = cuda_device
+        torch.manual_seed(42)
+        repr = Repr(lvals=lvals, mult=mult)
+        num_nodes, num_edges = 20, 100
+
+        layer = EquivariantAttention(repr, repr, num_heads=num_heads, dropout=0.0).to(device)
+        basis = WignerDBasis([repr, repr]).to(device)
         wigner = WignerD(repr).to(device)
 
-        # Create graph and features
         src, dst = make_graph(num_nodes, num_edges, device)
-        node_features = torch.randn(num_nodes, repr.mult, repr.dim(), device=device)
+        node_features = torch.randn(num_nodes, mult, repr.dim(), device=device)
         directions = torch.randn(num_edges, 3, device=device)
         directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
         distances = torch.rand(num_edges, device=device) * 5 + 0.5
@@ -238,10 +206,7 @@ class TestFullPipeline:
 
         # Method 1: Forward then rotate output
         P, Q = basis(directions)
-        edge_feat = node_features[src]  # gather to edges
-        edge_feat = linear(P, Q, edge_feat, distances)
-        edge_feat = attn(edge_feat, dst, num_nodes)
-        out_original = pool(edge_feat, dst, num_nodes)
+        out_original = layer(P, Q, node_features, distances, src, dst, num_nodes)
         out_then_rotate = torch.einsum('ij,...j->...i', D, out_original)
 
         # Method 2: Rotate inputs then forward
@@ -249,13 +214,63 @@ class TestFullPipeline:
         directions_rot = torch.einsum('ij,...j->...i', R, directions)
 
         P_rot, Q_rot = basis(directions_rot)
-        edge_feat_rot = node_features_rot[src]  # gather to edges
-        edge_feat_rot = linear(P_rot, Q_rot, edge_feat_rot, distances)
-        edge_feat_rot = attn(edge_feat_rot, dst, num_nodes)
-        rotate_then_out = pool(edge_feat_rot, dst, num_nodes)
+        rotate_then_out = layer(P_rot, Q_rot, node_features_rot, distances, src, dst, num_nodes)
 
-        # Looser tolerance for full pipeline due to accumulated numerical error
-        check_equivariance(out_then_rotate, rotate_then_out, rtol=5e-3, msg="Pipeline equivariance")
+        check_equivariance(out_then_rotate, rotate_then_out, rtol=5e-3, msg="Attention equivariance")
+
+    def test_num_heads_divides_mult(self):
+        """Test that num_heads must divide mult."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+
+        # Should work
+        for h in [1, 2, 4, 8]:
+            EquivariantAttention(repr, repr, num_heads=h)
+
+        # Should fail
+        with pytest.raises(ValueError, match="must divide"):
+            EquivariantAttention(repr, repr, num_heads=3)
+
+    def test_different_in_out_repr(self, cuda_device):
+        """Test with different input and output representations."""
+        device = cuda_device
+        in_repr = Repr(lvals=[0, 1], mult=8)
+        out_repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_nodes, num_edges = 20, 100
+
+        layer = EquivariantAttention(in_repr, out_repr, num_heads=2).to(device)
+        basis = WignerDBasis([in_repr, out_repr]).to(device)
+
+        src, dst = make_graph(num_nodes, num_edges, device)
+        node_features = torch.randn(num_nodes, 8, in_repr.dim(), device=device)
+        directions = torch.randn(num_edges, 3, device=device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=device) * 5 + 0.5
+
+        P, Q = basis(directions)
+        out = layer(P, Q, node_features, distances, src, dst, num_nodes)
+
+        assert out.shape == (num_nodes, 8, out_repr.dim())
+
+    def test_with_edge_features(self, cuda_device):
+        """Test with optional edge features."""
+        device = cuda_device
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_nodes, num_edges = 20, 100
+
+        layer = EquivariantAttention(repr, repr, num_heads=2).to(device)
+        basis = WignerDBasis([repr, repr]).to(device)
+
+        src, dst = make_graph(num_nodes, num_edges, device)
+        node_features = torch.randn(num_nodes, 8, repr.dim(), device=device)
+        edge_features = torch.randn(num_edges, 8, repr.dim(), device=device)
+        directions = torch.randn(num_edges, 3, device=device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=device) * 5 + 0.5
+
+        P, Q = basis(directions)
+        out = layer(P, Q, node_features, distances, src, dst, num_nodes, edge_features=edge_features)
+
+        assert out.shape == node_features.shape
 
 
 if __name__ == '__main__':

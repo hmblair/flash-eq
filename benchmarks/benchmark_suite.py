@@ -302,19 +302,44 @@ def benchmark_edge_attention(
     dtype: torch.dtype = torch.float32,
     use_amp: bool = False,
 ) -> BenchmarkResult | None:
-    """Benchmark EquivariantEdgeAttention forward + backward."""
+    """Benchmark EquivariantEdgeAttention forward + backward.
+
+    Uses the low-level Q/K/V API with pre-computed tensors.
+    """
     clear_memory()
     device = torch.device("cuda")
 
+    # Q/K dimension per head: (mult / num_heads) * dim
+    qk_dim = (scenario.mult // scenario.num_heads) * scenario.dim
+
     attn = (
-        EquivariantEdgeAttention(scenario.repr, num_heads=scenario.num_heads, dropout=0.0)
+        EquivariantEdgeAttention(
+            num_heads=scenario.num_heads,
+            qk_dim=qk_dim,
+            dropout=0.0,
+        )
         .to(device)
         .to(dtype)
     )
-    optimizer = torch.optim.Adam(attn.parameters(), lr=1e-4)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    edge_features = torch.randn(
+    # Pre-computed Q, K, V tensors (simulating what EquivariantAttention computes)
+    Q = torch.randn(
+        scenario.num_edges,
+        scenario.num_heads,
+        qk_dim,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    K = torch.randn(
+        scenario.num_edges,
+        scenario.num_heads,
+        qk_dim,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    V = torch.randn(
         scenario.num_edges,
         scenario.mult,
         scenario.dim,
@@ -328,17 +353,21 @@ def benchmark_edge_attention(
     )
 
     def train_step():
-        optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=use_amp):
-            output = attn(edge_features, dst_indices, scenario.num_nodes)
+            output = attn(Q, K, V, dst_indices, scenario.num_nodes)
             loss = ((output - target) ** 2).mean()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        # Clear gradients manually since attn has no learnable params
+        if Q.grad is not None:
+            Q.grad.zero_()
+        if K.grad is not None:
+            K.grad.zero_()
+        if V.grad is not None:
+            V.grad.zero_()
 
     try:
         result = benchmark(train_step)
-        result.extra = {"num_params": sum(p.numel() for p in attn.parameters())}
+        result.extra = {"num_params": 0, "qk_dim": qk_dim}
         return result
     except torch.cuda.OutOfMemoryError:
         return None

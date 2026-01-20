@@ -14,7 +14,6 @@ import torch.nn as nn
 from ..representations import Repr, ProductRepr
 from ..cuda.block_diagonal import block_diagonal_cuda
 from .radial import BinnedModule, BinnedRadialBasis
-from .scaling import SolidHarmonicScaling
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -120,12 +119,6 @@ class EquivariantEdgewiseLinear(nn.Module):
                 sigma=sigma,
             )
 
-        # Solid harmonic scaling for input and output features
-        # Input scaling: suppresses l>0 input at short distances
-        # Output scaling: suppresses l>0 created by tensor product at short distances
-        self.input_scaling = SolidHarmonicScaling(in_repr, scale=solid_harmonic_scale)
-        self.output_scaling = SolidHarmonicScaling(out_repr, scale=solid_harmonic_scale)
-
     def forward(
         self,
         P: torch.Tensor,
@@ -158,19 +151,14 @@ class EquivariantEdgewiseLinear(nn.Module):
         """
 
         # =====================================================================
-        # Step 1: Apply solid harmonic scaling to input
-        # Scale l>0 components by (r / (r + scale))^l
-        # =====================================================================
-        edge_features = self.input_scaling(edge_features, distances)
-
-        # =====================================================================
-        # Step 2: Transform to m-first diagonal basis (PyTorch matmul)
+        # Step 1: Transform to m-first diagonal basis (PyTorch matmul)
         # f_diag = P^T @ edge_features, equivalent to edge_features @ P
         # =====================================================================
         f_diag = torch.bmm(edge_features, P)
 
         # =====================================================================
-        # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)
+        # Step 2: Block-diagonal multiply with radial weights (CUDA kernel)
+        # Includes solid harmonic scaling: weights *= (r/(r+scale))^(l_in+l_out)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
         bin_lo, interp_weight = self.radial_weights.bin_indices(distances)
@@ -179,20 +167,16 @@ class EquivariantEdgewiseLinear(nn.Module):
             self.radial_weights(),
             bin_lo,
             interp_weight,
+            distances,
             self.product_repr,
+            sh_scale=self.solid_harmonic_scale,
         )
 
         # =====================================================================
-        # Step 4: Transform back to standard SH basis (PyTorch matmul)
+        # Step 3: Transform back to standard SH basis (PyTorch matmul)
         # out = Q @ out_diag, equivalent to out_diag @ Q^T
         # =====================================================================
-        output = torch.bmm(out_diag, Q.mT)
-
-        # =====================================================================
-        # Step 5: Apply solid harmonic scaling to output
-        # Suppresses l>0 components created by tensor product at short distances
-        # =====================================================================
-        return self.output_scaling(output, distances)
+        return torch.bmm(out_diag, Q.mT)
 
     def extra_repr(self) -> str:
         rw = self.radial_weights

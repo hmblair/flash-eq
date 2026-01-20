@@ -65,6 +65,36 @@ struct BlockParams {
 //------------------------------------------------------------------------------
 
 /**
+ * Get the l-value for the idx-th element within an m-block.
+ * Within m-block, contributions come from l-values with l >= m, in order.
+ * @param lvals Array of l-values in the representation
+ * @param num_lvals Number of l-values
+ * @param m The magnetic quantum number for this block
+ * @param idx Index within the m-block (0-indexed)
+ * @return The l-value corresponding to this index
+ */
+__device__ __forceinline__ int get_l_for_index(const int* lvals, int num_lvals, int m, int idx) {
+    int count = 0;
+    for (int i = 0; i < num_lvals; i++) {
+        if (lvals[i] >= m) {
+            if (count == idx) return lvals[i];
+            count++;
+        }
+    }
+    return 0;  // Should not reach here if idx is valid
+}
+
+/**
+ * Compute solid harmonic scale factor: (r / (r + scale))^l
+ * Returns 1.0 for l=0, smoothly suppresses higher l at short distances.
+ */
+__device__ __forceinline__ float solid_harmonic_scale(float distance, float scale, int l) {
+    if (l == 0) return 1.0f;
+    float weight = distance / (distance + scale);
+    return powf(weight, l);
+}
+
+/**
  * Load a complex number from interleaved storage.
  * Storage format: [re_0, im_0, re_1, im_1, ...]
  */
@@ -244,6 +274,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 /**
  * Forward kernel for m=0 block (real scalars).
  * One CUDA block per edge.
+ * Includes solid harmonic scaling: weights multiplied by (r/(r+scale))^(l_in+l_out)
  */
 template <typename scalar_t>
 __global__ void forward_m0_kernel(
@@ -251,6 +282,8 @@ __global__ void forward_m0_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     scalar_t* __restrict__ output,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
@@ -266,6 +299,10 @@ __global__ void forward_m0_kernel(
     const BlockParams bp = compute_block_params(0, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     // Load features into shared memory
     extern __shared__ float feat_shared[];
@@ -287,6 +324,9 @@ __global__ void forward_m0_kernel(
         const int co = out_idx / bp.n_out;
         const int o = out_idx % bp.n_out;
 
+        // Get output l-value for this index
+        const int l_out = get_l_for_index(lvals_out, num_lvals_out, 0, o);
+
         float acc = 0.0f;
         const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + bp.w_off;
         const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + bp.w_off;
@@ -297,9 +337,19 @@ __global__ void forward_m0_kernel(
 
             #pragma unroll 4
             for (int i = 0; i < bp.n_in; i++) {
+                // Get input l-value and compute total scaling exponent
+                const int l_in = get_l_for_index(lvals_in, num_lvals_in, 0, i);
+                const int l_total = l_in + l_out;
+
                 const int w_idx = w_ci_off + o * bp.n_in + i;
-                const float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
-                                            interp.t, interp.one_minus_t);
+                float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                      interp.t, interp.one_minus_t);
+
+                // Apply solid harmonic scaling: w *= (r/(r+scale))^(l_in+l_out)
+                if (l_total > 0) {
+                    w *= powf(sh_weight, l_total);
+                }
+
                 acc += w * f_ptr[i];
             }
         }
@@ -312,6 +362,7 @@ __global__ void forward_m0_kernel(
 /**
  * Forward kernel for m>0 blocks (complex-like 2x2 structure).
  * One CUDA block per (edge, m) pair where m ranges from 1 to mmax.
+ * Includes solid harmonic scaling: weights multiplied by (r/(r+scale))^(l_in+l_out)
  */
 template <typename scalar_t>
 __global__ void forward_mpos_kernel(
@@ -319,6 +370,8 @@ __global__ void forward_mpos_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     scalar_t* __restrict__ output,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
@@ -337,6 +390,10 @@ __global__ void forward_mpos_kernel(
     const BlockParams bp = compute_block_params(m, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     const int in_size = 2 * bp.n_in;  // Complex pairs
 
@@ -360,6 +417,9 @@ __global__ void forward_mpos_kernel(
         const int co = out_idx / bp.n_out;
         const int o = out_idx % bp.n_out;
 
+        // Get output l-value for this index
+        const int l_out = get_l_for_index(lvals_out, num_lvals_out, m, o);
+
         Complex acc = {0.0f, 0.0f};
         const int w_base_lo = interp.idx_lo * table_stride + co * Cin * Wdim + bp.w_off;
         const int w_base_hi = interp.idx_hi * table_stride + co * Cin * Wdim + bp.w_off;
@@ -370,13 +430,23 @@ __global__ void forward_mpos_kernel(
 
             #pragma unroll 4
             for (int i = 0; i < bp.n_in; i++) {
+                // Get input l-value and compute total scaling exponent
+                const int l_in = get_l_for_index(lvals_in, num_lvals_in, m, i);
+                const int l_total = l_in + l_out;
+
                 const Complex f = load_complex(f_ptr, i);
                 const int w_idx = w_ci_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
-                const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
-                                            interp.t, interp.one_minus_t);
-                const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
-                                            interp.t, interp.one_minus_t);
+                float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                      interp.t, interp.one_minus_t);
+                float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                                      interp.t, interp.one_minus_t);
+
+                // Apply solid harmonic scaling: (a,b) *= (r/(r+scale))^(l_in+l_out)
+                // l_total >= 2 for m>0 blocks (since l >= m >= 1 for both in and out)
+                const float scale_factor = powf(sh_weight, l_total);
+                a *= scale_factor;
+                b *= scale_factor;
 
                 complex_mul_add(a, b, f, acc);
             }
@@ -395,6 +465,7 @@ __global__ void forward_mpos_kernel(
 
 /**
  * Backward kernel for m=0: compute grad_features.
+ * Includes solid harmonic scaling on weights.
  */
 template <typename scalar_t>
 __global__ void backward_features_m0_kernel(
@@ -402,6 +473,8 @@ __global__ void backward_features_m0_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     scalar_t* __restrict__ grad_features,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
@@ -417,6 +490,10 @@ __global__ void backward_features_m0_kernel(
     const BlockParams bp = compute_block_params(0, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     // Load grad_output into shared memory
     extern __shared__ float grad_shared[];
@@ -438,6 +515,9 @@ __global__ void backward_features_m0_kernel(
         const int ci = in_idx / bp.n_in;
         const int i = in_idx % bp.n_in;
 
+        // Get input l-value
+        const int l_in = get_l_for_index(lvals_in, num_lvals_in, 0, i);
+
         float grad = 0.0f;
         const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + bp.w_off;
         const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + bp.w_off;
@@ -448,9 +528,19 @@ __global__ void backward_features_m0_kernel(
 
             #pragma unroll 4
             for (int o = 0; o < bp.n_out; o++) {
+                // Get output l-value and compute total scaling exponent
+                const int l_out = get_l_for_index(lvals_out, num_lvals_out, 0, o);
+                const int l_total = l_in + l_out;
+
                 const int w_idx = w_co_off + o * bp.n_in + i;
-                const float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
-                                            interp.t, interp.one_minus_t);
+                float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                      interp.t, interp.one_minus_t);
+
+                // Apply solid harmonic scaling
+                if (l_total > 0) {
+                    w *= powf(sh_weight, l_total);
+                }
+
                 grad += w * go_ptr[o];
             }
         }
@@ -463,6 +553,7 @@ __global__ void backward_features_m0_kernel(
 /**
  * Backward kernel for m>0: compute grad_features.
  * Computes: grad_f = W^T @ grad_out (transpose of rotation).
+ * Includes solid harmonic scaling on weights.
  */
 template <typename scalar_t>
 __global__ void backward_features_mpos_kernel(
@@ -470,6 +561,8 @@ __global__ void backward_features_mpos_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     scalar_t* __restrict__ grad_features,
     const int* __restrict__ lvals_in,
     const int* __restrict__ lvals_out,
@@ -487,6 +580,10 @@ __global__ void backward_features_mpos_kernel(
     const BlockParams bp = compute_block_params(m, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     const int out_size = 2 * bp.n_out;
 
@@ -510,6 +607,9 @@ __global__ void backward_features_mpos_kernel(
         const int ci = in_idx / bp.n_in;
         const int i = in_idx % bp.n_in;
 
+        // Get input l-value
+        const int l_in = get_l_for_index(lvals_in, num_lvals_in, m, i);
+
         Complex grad_f = {0.0f, 0.0f};
         const int w_base_lo = interp.idx_lo * table_stride + ci * Wdim + bp.w_off;
         const int w_base_hi = interp.idx_hi * table_stride + ci * Wdim + bp.w_off;
@@ -520,13 +620,22 @@ __global__ void backward_features_mpos_kernel(
 
             #pragma unroll 4
             for (int o = 0; o < bp.n_out; o++) {
+                // Get output l-value and compute total scaling exponent
+                const int l_out = get_l_for_index(lvals_out, num_lvals_out, m, o);
+                const int l_total = l_in + l_out;
+
                 const Complex go = load_complex(go_ptr, o);
                 const int w_idx = w_co_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
-                const float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
-                                            interp.t, interp.one_minus_t);
-                const float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
-                                            interp.t, interp.one_minus_t);
+                float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                                      interp.t, interp.one_minus_t);
+                float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                                      interp.t, interp.one_minus_t);
+
+                // Apply solid harmonic scaling
+                const float scale_factor = powf(sh_weight, l_total);
+                a *= scale_factor;
+                b *= scale_factor;
 
                 complex_mul_add_transpose(a, b, go, grad_f);
             }
@@ -545,6 +654,7 @@ __global__ void backward_features_mpos_kernel(
 
 /**
  * Backward kernel for m=0: compute grad_radial_table and grad_interp_weight.
+ * Includes solid harmonic scaling in gradient computation.
  */
 template <typename scalar_t>
 __global__ void backward_table_m0_kernel(
@@ -553,6 +663,8 @@ __global__ void backward_table_m0_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     float* __restrict__ grad_radial_table,
     float* __restrict__ grad_interp_weight,
     const int* __restrict__ lvals_in,
@@ -569,6 +681,10 @@ __global__ void backward_table_m0_kernel(
     const BlockParams bp = compute_block_params(0, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     const int table_stride = Cout * Cin * Wdim;
     const int w_block_size = bp.n_out * bp.n_in;
@@ -608,9 +724,16 @@ __global__ void backward_table_m0_kernel(
         const int o = w_local / bp.n_in;
         const int i = w_local % bp.n_in;
 
+        // Get l-values and compute scaling factor
+        const int l_in = get_l_for_index(lvals_in, num_lvals_in, 0, i);
+        const int l_out = get_l_for_index(lvals_out, num_lvals_out, 0, o);
+        const int l_total = l_in + l_out;
+        const float scale_factor = (l_total > 0) ? powf(sh_weight, l_total) : 1.0f;
+
         const float f = feat_shared[ci * bp.n_in + i];
         const float go = grad_shared[co * bp.n_out + o];
-        const float grad_w = f * go;
+        // grad_w includes the scale factor since output = w * scale_factor * f
+        const float grad_w = scale_factor * f * go;
 
         const int table_idx = co * Cin * Wdim + ci * Wdim + bp.w_off + w_local;
         const int addr_lo = interp.idx_lo * table_stride + table_idx;
@@ -621,6 +744,7 @@ __global__ void backward_table_m0_kernel(
 
         const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
         const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
+        // grad_t also needs scale factor
         local_grad_t += (w_hi - w_lo) * grad_w;
     }
 
@@ -635,6 +759,7 @@ __global__ void backward_table_m0_kernel(
 /**
  * Backward kernel for m>0: compute grad_radial_table and grad_interp_weight.
  * Each thread computes gradient for one weight element (either 'a' or 'b').
+ * Includes solid harmonic scaling in gradient computation.
  */
 template <typename scalar_t>
 __global__ void backward_table_mpos_kernel(
@@ -643,6 +768,8 @@ __global__ void backward_table_mpos_kernel(
     const scalar_t* __restrict__ radial_table,
     const int* __restrict__ bin_lo,
     const scalar_t* __restrict__ interp_weight,
+    const scalar_t* __restrict__ distances,
+    float sh_scale,
     float* __restrict__ grad_radial_table,
     float* __restrict__ grad_interp_weight,
     const int* __restrict__ lvals_in,
@@ -661,6 +788,10 @@ __global__ void backward_table_mpos_kernel(
     const BlockParams bp = compute_block_params(m, lvals_in, lvals_out,
                                                  num_lvals_in, num_lvals_out, mmax);
     if (bp.n_in == 0 || bp.n_out == 0) return;
+
+    // Load distance for this edge and compute base weight for scaling
+    const float dist = static_cast<float>(distances[edge]);
+    const float sh_weight = dist / (dist + sh_scale);
 
     const int in_size = 2 * bp.n_in;
     const int out_size = 2 * bp.n_out;
@@ -707,6 +838,12 @@ __global__ void backward_table_mpos_kernel(
         const int o = pair_idx / bp.n_in;
         const int i = pair_idx % bp.n_in;
 
+        // Get l-values and compute scaling factor
+        const int l_in = get_l_for_index(lvals_in, num_lvals_in, m, i);
+        const int l_out = get_l_for_index(lvals_out, num_lvals_out, m, o);
+        const int l_total = l_in + l_out;
+        const float scale_factor = powf(sh_weight, l_total);
+
         // Load feature and gradient
         const Complex f = load_complex(feat_shared + ci * in_size, i);
         const Complex go = load_complex(grad_shared + co * out_size, o);
@@ -714,7 +851,8 @@ __global__ void backward_table_mpos_kernel(
         // Compute gradient for this weight component
         float grad_a, grad_b;
         compute_weight_gradient(f, go, grad_a, grad_b);
-        const float grad_w = (is_b == 0) ? grad_a : grad_b;
+        // grad_w includes the scale factor since output = w * scale_factor * f
+        const float grad_w = scale_factor * ((is_b == 0) ? grad_a : grad_b);
 
         // Accumulate to table gradient with interpolation
         const int table_idx = co * Cin * Wdim + ci * Wdim + bp.w_off + w_local;
@@ -724,7 +862,7 @@ __global__ void backward_table_mpos_kernel(
         atomicAdd(&grad_radial_table[addr_lo], interp.one_minus_t * grad_w);
         atomicAdd(&grad_radial_table[addr_hi], interp.t * grad_w);
 
-        // Gradient w.r.t. interpolation weight
+        // Gradient w.r.t. interpolation weight (also scaled)
         const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
         const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
         local_grad_t += (w_hi - w_lo) * grad_w;
@@ -747,6 +885,8 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     torch::Tensor radial_table,
     torch::Tensor bin_lo,
     torch::Tensor interp_weight,
+    torch::Tensor distances,
+    float sh_scale,
     torch::Tensor lvals_in,
     torch::Tensor lvals_out,
     int64_t Cout,
@@ -758,6 +898,7 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     CHECK_INPUT(radial_table);
     CHECK_INPUT(bin_lo);
     CHECK_INPUT(interp_weight);
+    CHECK_INPUT(distances);
     CHECK_INPUT(lvals_in);
     CHECK_INPUT(lvals_out);
 
@@ -783,6 +924,8 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
             radial_table.data_ptr<scalar_t>(),
             bin_lo.data_ptr<int>(),
             interp_weight.data_ptr<scalar_t>(),
+            distances.data_ptr<scalar_t>(),
+            sh_scale,
             output.data_ptr<scalar_t>(),
             lvals_in.data_ptr<int>(),
             lvals_out.data_ptr<int>(),
@@ -800,6 +943,8 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
                 radial_table.data_ptr<scalar_t>(),
                 bin_lo.data_ptr<int>(),
                 interp_weight.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
                 output.data_ptr<scalar_t>(),
                 lvals_in.data_ptr<int>(),
                 lvals_out.data_ptr<int>(),
@@ -820,6 +965,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     torch::Tensor radial_table,
     torch::Tensor bin_lo,
     torch::Tensor interp_weight,
+    torch::Tensor distances,
+    float sh_scale,
     torch::Tensor lvals_in,
     torch::Tensor lvals_out,
     int dim_in,
@@ -831,6 +978,7 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
     CHECK_INPUT(radial_table);
     CHECK_INPUT(bin_lo);
     CHECK_INPUT(interp_weight);
+    CHECK_INPUT(distances);
     CHECK_INPUT(lvals_in);
     CHECK_INPUT(lvals_out);
 
@@ -864,6 +1012,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
             radial_table.data_ptr<scalar_t>(),
             bin_lo.data_ptr<int>(),
             interp_weight.data_ptr<scalar_t>(),
+            distances.data_ptr<scalar_t>(),
+            sh_scale,
             grad_features.data_ptr<scalar_t>(),
             lvals_in.data_ptr<int>(),
             lvals_out.data_ptr<int>(),
@@ -881,6 +1031,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
             radial_table.data_ptr<scalar_t>(),
             bin_lo.data_ptr<int>(),
             interp_weight.data_ptr<scalar_t>(),
+            distances.data_ptr<scalar_t>(),
+            sh_scale,
             grad_radial_table.data_ptr<float>(),
             grad_interp_weight.data_ptr<float>(),
             lvals_in.data_ptr<int>(),
@@ -900,6 +1052,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 radial_table.data_ptr<scalar_t>(),
                 bin_lo.data_ptr<int>(),
                 interp_weight.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
                 grad_features.data_ptr<scalar_t>(),
                 lvals_in.data_ptr<int>(),
                 lvals_out.data_ptr<int>(),
@@ -917,6 +1071,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 radial_table.data_ptr<scalar_t>(),
                 bin_lo.data_ptr<int>(),
                 interp_weight.data_ptr<scalar_t>(),
+                distances.data_ptr<scalar_t>(),
+                sh_scale,
                 grad_radial_table.data_ptr<float>(),
                 grad_interp_weight.data_ptr<float>(),
                 lvals_in.data_ptr<int>(),

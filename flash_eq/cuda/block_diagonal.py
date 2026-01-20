@@ -177,6 +177,8 @@ class _BlockDiagonalFunction(Function):
         radial_table: torch.Tensor,
         bin_lo: torch.Tensor,
         interp_weight: torch.Tensor,
+        distances: torch.Tensor,
+        sh_scale: float,
         channels_out: int,
         num_bins: int,
         lvals_in: torch.Tensor,
@@ -194,12 +196,15 @@ class _BlockDiagonalFunction(Function):
         features_sorted = features[sort_idx]
         bin_lo_sorted = bin_lo[sort_idx]
         interp_weight_sorted = interp_weight[sort_idx]
+        distances_sorted = distances[sort_idx]
 
         output_sorted, = cuda_module.forward(
             features_sorted,
             radial_table,
             bin_lo_sorted,
             interp_weight_sorted,
+            distances_sorted,
+            sh_scale,
             lvals_in,
             lvals_out,
             channels_out,
@@ -212,10 +217,12 @@ class _BlockDiagonalFunction(Function):
         output = output_sorted[unsort_idx]
 
         ctx.save_for_backward(features_sorted, radial_table, bin_lo_sorted,
-                              interp_weight_sorted, lvals_in, lvals_out, sort_idx, unsort_idx)
+                              interp_weight_sorted, distances_sorted, lvals_in, lvals_out,
+                              sort_idx, unsort_idx)
         ctx.dim_in = features.size(2)  # type: ignore[attr-defined]
         ctx.max_in_size = max_in_size  # type: ignore[attr-defined]
         ctx.max_out_size = max_out_size  # type: ignore[attr-defined]
+        ctx.sh_scale = sh_scale  # type: ignore[attr-defined]
 
         return output
 
@@ -225,7 +232,7 @@ class _BlockDiagonalFunction(Function):
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, ...]:
         (features_sorted, radial_table, bin_lo_sorted, interp_weight_sorted,
-         lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors  # type: ignore[attr-defined]
+         distances_sorted, lvals_in, lvals_out, sort_idx, unsort_idx) = ctx.saved_tensors  # type: ignore[attr-defined]
         cuda_module = _get_cuda_module()
 
         # Sort grad_output to match the sorted forward pass order
@@ -237,6 +244,8 @@ class _BlockDiagonalFunction(Function):
             radial_table,
             bin_lo_sorted,
             interp_weight_sorted,
+            distances_sorted,
+            ctx.sh_scale,  # type: ignore[attr-defined]
             lvals_in,
             lvals_out,
             ctx.dim_in,  # type: ignore[attr-defined]
@@ -249,7 +258,7 @@ class _BlockDiagonalFunction(Function):
         grad_interp_weight = grad_interp_weight_sorted[unsort_idx]
 
         return (grad_features, grad_radial_table, None, grad_interp_weight,
-                None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None)
 
 
 # =============================================================================
@@ -286,13 +295,19 @@ def block_diagonal_cuda(
     radial_table: torch.Tensor,
     bin_lo: torch.Tensor,
     interp_weight: torch.Tensor,
+    distances: torch.Tensor,
     product_repr: "ProductRepr",
+    sh_scale: float = 0.1,
 ) -> torch.Tensor:
     """Apply block-diagonal multiplication with binned radial weights.
 
     This is the core computational kernel for SO(3)-equivariant layers.
     It computes: out[e] = Λ(r[e]) @ f[e] for each edge e, where Λ(r) is
     a block-diagonal weight matrix interpolated from the radial table.
+
+    Includes solid harmonic scaling: weights are multiplied by
+    (r/(r+scale))^(l_in+l_out) to suppress higher angular momentum at
+    short distances, following the structure of solid harmonics.
 
     Input/output are in the m-first diagonal basis (not standard SH basis).
     The caller is responsible for P^T and Q basis transforms.
@@ -306,7 +321,10 @@ def block_diagonal_cuda(
             Lower bin index for each edge (from BinnedModule.bin_indices).
         interp_weight: (num_edges,)
             Interpolation weight in [0, 1] for each edge.
+        distances: (num_edges,)
+            Edge distances for solid harmonic scaling.
         product_repr: ProductRepr describing input/output representation structure.
+        sh_scale: Length scale for solid harmonic scaling (default 0.1).
 
     Returns:
         output: (num_edges, channels_out, dim_out)
@@ -327,6 +345,7 @@ def block_diagonal_cuda(
     radial_table = radial_table.contiguous()
     bin_lo = bin_lo.contiguous()
     interp_weight = interp_weight.to(features.dtype).contiguous()
+    distances = distances.to(features.dtype).contiguous()
 
     # Extract lvals tensors from representations
     lvals_in = product_repr.rep1.lvals.to(device=device, dtype=torch.int32).contiguous()
@@ -337,6 +356,6 @@ def block_diagonal_cuda(
 
     # Run kernel
     return _BlockDiagonalFunction.apply(
-        features, radial_table, bin_lo, interp_weight,
+        features, radial_table, bin_lo, interp_weight, distances, sh_scale,
         channels_out, num_bins, lvals_in, lvals_out, dim_out, max_in_size, max_out_size
     )

@@ -261,21 +261,16 @@ class TestEquivariantTransformer:
 
         num_nodes, num_edges = 20, 100
         src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        coordinates = torch.randn(num_nodes, 3, device=cuda_device)
         node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device=cuda_device)
-        directions = torch.randn(num_edges, 3, device=cuda_device)
-        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
-        distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
 
-        basis = WignerDBasis(model.get_basis_reprs()).to(cuda_device)
-        matrices = basis(directions)
-
-        output = model(matrices, node_features, distances, src, dst, num_nodes)
+        output = model(coordinates, node_features, src, dst)
 
         assert output.shape == (num_nodes, out_repr.mult, out_repr.dim())
         assert torch.isfinite(output).all()
 
-    def test_get_basis_reprs(self, cuda_device):
-        """Test that get_basis_reprs returns correct representations."""
+    def test_internal_basis(self, cuda_device):
+        """Test that transformer stores basis internally."""
         in_repr = Repr(lvals=[0, 1], mult=8)
         hidden_repr = Repr(lvals=[0, 1, 2], mult=16)
         out_repr = Repr(lvals=[0], mult=4)
@@ -285,11 +280,13 @@ class TestEquivariantTransformer:
             num_layers=3, num_heads=4
         )
 
-        reprs = model.get_basis_reprs()
-        assert len(reprs) == 3
-        assert reprs[0] is in_repr
-        assert reprs[1] is hidden_repr
-        assert reprs[2] is out_repr
+        # Check basis is stored internally
+        assert hasattr(model, 'basis')
+        assert isinstance(model.basis, WignerDBasis)
+        assert len(model._basis_reprs) == 3
+        assert model._basis_reprs[0] is in_repr
+        assert model._basis_reprs[1] is hidden_repr
+        assert model._basis_reprs[2] is out_repr
 
     def test_layer_structure(self, cuda_device):
         """Test that layers have correct repr configurations."""
@@ -337,12 +334,10 @@ class TestEquivariantTransformer:
 
         num_nodes, num_edges = 20, 100
         src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        # Center coordinates before rotation for proper equivariance test
+        coordinates = torch.randn(num_nodes, 3, device=cuda_device)
+        coordinates = coordinates - coordinates.mean(dim=0, keepdim=True)
         node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device=cuda_device)
-        directions = torch.randn(num_edges, 3, device=cuda_device)
-        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
-        distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
-
-        basis = WignerDBasis(model.get_basis_reprs()).to(cuda_device)
 
         # Random rotation
         axis, angle, R = random_rotation(cuda_device)
@@ -350,15 +345,13 @@ class TestEquivariantTransformer:
         D_out = wigner_out.rot(axis, angle)
 
         # Method 1: Forward then rotate
-        matrices = basis(directions)
-        output1 = model(matrices, node_features, distances, src, dst, num_nodes)
+        output1 = model(coordinates, node_features, src, dst)
         output1_rotated = torch.einsum('ij,ncj->nci', D_out, output1)
 
         # Method 2: Rotate then forward
         node_features_rotated = torch.einsum('ij,ncj->nci', D_in, node_features)
-        directions_rotated = torch.einsum('ij,ej->ei', R, directions)
-        matrices_rot = basis(directions_rotated)
-        output2 = model(matrices_rot, node_features_rotated, distances, src, dst, num_nodes)
+        coordinates_rotated = torch.einsum('ij,nj->ni', R, coordinates)
+        output2 = model(coordinates_rotated, node_features_rotated, src, dst)
 
         # Looser tolerance for multi-layer model
         check_equivariance(output1_rotated, output2, rtol=1e-2, msg="Full transformer equivariance")
@@ -376,18 +369,13 @@ class TestEquivariantTransformer:
 
         num_nodes, num_edges = 20, 100
         src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        coordinates = torch.randn(num_nodes, 3, device=cuda_device)
         node_features = torch.randn(
             num_nodes, in_repr.mult, in_repr.dim(),
             device=cuda_device, requires_grad=True
         )
-        directions = torch.randn(num_edges, 3, device=cuda_device)
-        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
-        distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
 
-        basis = WignerDBasis(model.get_basis_reprs()).to(cuda_device)
-        matrices = basis(directions)
-
-        output = model(matrices, node_features, distances, src, dst, num_nodes)
+        output = model(coordinates, node_features, src, dst)
         loss = (output ** 2).sum()
         loss.backward()
 
@@ -418,17 +406,142 @@ class TestEquivariantTransformer:
 
         num_nodes, num_edges = 20, 100
         src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        coordinates = torch.randn(num_nodes, 3, device=cuda_device)
+        node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device=cuda_device)
+
+        output = model(coordinates, node_features, src, dst)
+        # Output should be out_repr shape
+        assert output.shape == (num_nodes, out_repr.mult, out_repr.dim())
+
+
+class TestTransformerWithS2Activation:
+    """Tests for transformer with S² activation enabled."""
+
+    def test_block_with_s2_activation(self, cuda_device):
+        """Test transformer block with S² activation."""
+        in_repr = Repr(lvals=[0, 1, 2], mult=8)
+
+        block = EquivariantTransformerBlock(
+            in_repr, in_repr, num_heads=2,
+            use_s2_activation=True, s2_precision=47
+        ).to(cuda_device)
+
+        # Check that S² activation is used
+        assert block.use_s2_activation
+        assert hasattr(block.mlp_act, 's2_act')
+
+        num_nodes, num_edges = 30, 150
+        basis = WignerDBasis([in_repr, in_repr]).to(cuda_device)
+        src, dst = make_graph(num_nodes, num_edges, cuda_device)
         node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device=cuda_device)
         directions = torch.randn(num_edges, 3, device=cuda_device)
         directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
         distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
 
-        basis = WignerDBasis(model.get_basis_reprs()).to(cuda_device)
-        matrices = basis(directions)
+        P, Q = basis(directions)
+        output = block(P, Q, node_features, distances, src, dst, num_nodes)
 
-        output = model(matrices, node_features, distances, src, dst, num_nodes)
-        # Output should be out_repr shape
+        assert output.shape == (num_nodes, in_repr.mult, in_repr.dim())
+        assert torch.isfinite(output).all()
+
+    def test_transformer_with_s2_activation(self, cuda_device):
+        """Test full transformer with S² activation."""
+        in_repr = Repr(lvals=[0, 1], mult=8)
+        hidden_repr = Repr(lvals=[0, 1, 2], mult=16)
+        out_repr = Repr(lvals=[0], mult=4)
+
+        model = EquivariantTransformer(
+            in_repr, hidden_repr, out_repr,
+            num_layers=2, num_heads=2,
+            use_s2_activation=True, s2_precision=47
+        ).to(cuda_device)
+
+        # Check all layers have S² activation
+        for layer in model.layers:
+            assert layer.use_s2_activation
+
+        num_nodes, num_edges = 30, 150
+        src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        coordinates = torch.randn(num_nodes, 3, device=cuda_device)
+        node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim(), device=cuda_device)
+
+        output = model(coordinates, node_features, src, dst)
         assert output.shape == (num_nodes, out_repr.mult, out_repr.dim())
+        assert torch.isfinite(output).all()
+
+    def test_s2_activation_equivariance(self, cuda_device):
+        """Test SO(3) equivariance with S² activation."""
+        torch.manual_seed(42)
+
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_nodes, num_edges = 20, 100
+
+        block = EquivariantTransformerBlock(
+            repr, repr, num_heads=2, dropout=0.0,
+            use_s2_activation=True, s2_precision=47
+        ).to(cuda_device)
+        block.eval()
+
+        basis = WignerDBasis([repr, repr]).to(cuda_device)
+        wigner = WignerD(repr).to(cuda_device)
+
+        src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        node_features = torch.randn(num_nodes, repr.mult, repr.dim(), device=cuda_device)
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
+
+        axis, angle, R = random_rotation(cuda_device)
+        D = wigner.rot(axis, angle)
+
+        # Method 1: Forward then rotate
+        P, Q = basis(directions)
+        output1 = block(P, Q, node_features, distances, src, dst, num_nodes)
+        output1_rotated = torch.einsum('ij,ncj->nci', D, output1)
+
+        # Method 2: Rotate then forward
+        node_features_rotated = torch.einsum('ij,ncj->nci', D, node_features)
+        directions_rotated = torch.einsum('ij,ej->ei', R, directions)
+        P_rot, Q_rot = basis(directions_rotated)
+        output2 = block(P_rot, Q_rot, node_features_rotated, distances, src, dst, num_nodes)
+
+        # S² activation is approximately equivariant, allow some tolerance
+        check_equivariance(output1_rotated, output2, rtol=0.1,
+                          msg="Transformer block with S² activation equivariance")
+
+    def test_s2_activation_gradient_flow(self, cuda_device):
+        """Test gradient flow with S² activation."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        num_nodes, num_edges = 20, 100
+
+        block = EquivariantTransformerBlock(
+            repr, repr, num_heads=2,
+            use_s2_activation=True
+        ).to(cuda_device)
+
+        basis = WignerDBasis([repr, repr]).to(cuda_device)
+        src, dst = make_graph(num_nodes, num_edges, cuda_device)
+        node_features = torch.randn(
+            num_nodes, repr.mult, repr.dim(),
+            device=cuda_device, requires_grad=True
+        )
+        directions = torch.randn(num_edges, 3, device=cuda_device)
+        directions = directions / torch.linalg.norm(directions, dim=-1, keepdim=True)
+        distances = torch.rand(num_edges, device=cuda_device) * 5 + 0.5
+
+        P, Q = basis(directions)
+        output = block(P, Q, node_features, distances, src, dst, num_nodes)
+        loss = (output ** 2).sum()
+        loss.backward()
+
+        # Check input gradients
+        assert node_features.grad is not None
+        assert torch.isfinite(node_features.grad).all()
+
+        # Check S² activation parameters have gradients
+        for name, param in block.mlp_act.named_parameters():
+            assert param.grad is not None, f"No gradient for {name}"
+            assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
 
 
 if __name__ == '__main__':

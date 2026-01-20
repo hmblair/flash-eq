@@ -31,6 +31,7 @@ from .layers import (
     SeparableEquivariantLayerNorm,
     GraphPooling,
     S2Activation,
+    SeparableS2Activation,
     EquivariantTransformerBlock,
     EquivariantTransformer,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "GraphPooling",
     "EquivariantEdgeAttention",
     "S2Activation",
+    "SeparableS2Activation",
     # Transformer
     "EquivariantTransformerBlock",
     "EquivariantTransformer",

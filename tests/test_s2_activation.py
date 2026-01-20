@@ -12,7 +12,7 @@ Author: Hamish M. Blair <hmblair@stanford.edu>
 import torch
 import pytest
 
-from flash_eq import Repr, WignerD, S2Activation
+from flash_eq import Repr, WignerD, S2Activation, SeparableS2Activation
 
 from .helpers import random_rotation, check_equivariance
 
@@ -349,3 +349,162 @@ class TestS2ActivationProperties:
             x = torch.randn(8, 8, dim, device=device)
             y = act(x)
             assert y.shape == x.shape
+
+
+class TestSeparableS2ActivationShape:
+    """Tests for SeparableS2Activation output shapes."""
+
+    @pytest.mark.parametrize("lvals", [[0, 1], [0, 1, 2], [0, 2], [0, 1, 2, 3]])
+    @pytest.mark.parametrize("mult", [4, 8, 16])
+    def test_forward_shape(self, device, lvals, mult):
+        """Output shape should match input shape."""
+        repr = Repr(lvals=lvals, mult=mult)
+        dim = repr.dim()
+        batch_size = 32
+
+        act = SeparableS2Activation(repr).to(device)
+        x = torch.randn(batch_size, mult, dim, device=device)
+        y = act(x)
+
+        assert y.shape == x.shape, f"Expected {x.shape}, got {y.shape}"
+
+    def test_scalars_only(self, device):
+        """Test with only scalars (should skip S² path)."""
+        repr = Repr(lvals=[0], mult=8)
+        act = SeparableS2Activation(repr).to(device)
+
+        x = torch.randn(16, 8, 1, device=device)
+        y = act(x)
+
+        assert y.shape == x.shape
+        assert act.s2_act is None  # No S² activation for scalars only
+
+    def test_requires_scalars(self, device):
+        """SeparableS2Activation requires l=0."""
+        repr = Repr(lvals=[1, 2], mult=4)
+
+        with pytest.raises(ValueError, match="requires l=0"):
+            SeparableS2Activation(repr)
+
+    def test_multiple_batch_dims(self, device):
+        """Test with multiple batch dimensions."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr).to(device)
+
+        x = torch.randn(4, 8, 8, dim, device=device)
+        y = act(x)
+        assert y.shape == x.shape
+
+
+class TestSeparableS2ActivationEquivariance:
+    """Tests for approximate SO(3) equivariance."""
+
+    @pytest.mark.parametrize("lvals", [[0, 1], [0, 1, 2], [0, 2]])
+    def test_approximate_equivariance(self, device, lvals):
+        """SeparableS2Activation should be approximately equivariant."""
+        torch.manual_seed(42)
+
+        mult = 8
+        batch_size = 16
+        repr = Repr(lvals=lvals, mult=mult)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr, precision=47).to(device)
+        wigner = WignerD(repr).to(device)
+
+        x = torch.randn(batch_size, mult, dim, device=device)
+
+        axis, angle, _ = random_rotation(device)
+        D = wigner.rot(axis, angle)
+
+        # Method 1: forward then rotate
+        y1 = act(x)
+        y1_rot = torch.einsum('ij,bmj->bmi', D, y1)
+
+        # Method 2: rotate then forward
+        x_rot = torch.einsum('ij,bmj->bmi', D, x)
+        y2 = act(x_rot)
+
+        # Check approximate equivariance
+        rtol = 0.15
+        rel_diff = (y1_rot - y2).abs().max().item() / (y1_rot.abs().max().item() + 1e-8)
+        assert rel_diff < rtol, f"Equivariance error {rel_diff:.3f} > {rtol}"
+
+
+class TestSeparableS2ActivationGradient:
+    """Tests for gradient computation."""
+
+    def test_gradient_flow(self, device):
+        """Gradients should flow through both scalar and higher-degree paths."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr).to(device)
+        x = torch.randn(16, 8, dim, device=device, requires_grad=True)
+
+        y = act(x)
+        loss = y.sum()
+        loss.backward()
+
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+        assert not torch.isnan(x.grad).any()
+        assert x.grad.abs().sum() > 0
+
+    def test_parameter_gradients(self, device):
+        """All parameters should receive gradients."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr, use_gate=True).to(device)
+        x = torch.randn(16, 8, dim, device=device)
+
+        y = act(x)
+        loss = y.sum()
+        loss.backward()
+
+        for name, param in act.named_parameters():
+            assert param.grad is not None, f"No gradient for {name}"
+            assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+
+
+class TestSeparableS2ActivationGating:
+    """Tests for the optional gating mechanism."""
+
+    def test_with_gating(self, device):
+        """Test with gating enabled."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr, use_gate=True).to(device)
+        x = torch.randn(16, 8, dim, device=device)
+        y = act(x)
+
+        assert y.shape == x.shape
+        assert act.gate_linear is not None
+
+    def test_without_gating(self, device):
+        """Test with gating disabled."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr, use_gate=False).to(device)
+        x = torch.randn(16, 8, dim, device=device)
+        y = act(x)
+
+        assert y.shape == x.shape
+        assert act.gate_linear is None
+
+    def test_gating_output_range(self, device):
+        """Gating should produce bounded modifications."""
+        repr = Repr(lvals=[0, 1, 2], mult=8)
+        dim = repr.dim()
+
+        act = SeparableS2Activation(repr, use_gate=True).to(device)
+        x = torch.randn(16, 8, dim, device=device)
+        y = act(x)
+
+        # Output should be finite
+        assert torch.isfinite(y).all()

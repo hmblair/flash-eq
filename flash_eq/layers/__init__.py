@@ -35,7 +35,6 @@ from .gating import EquivariantGating
 from .s2_activation import S2Activation, SeparableS2Activation
 from .transformer import EquivariantTransformerBlock, EquivariantTransformer
 from .radial import RadialBasisFunctions, RadialMLP, BinnedModule, BinnedRadialBasis
-from .scaling import SolidHarmonicScaling
 
 __all__ = [
     # Linear
@@ -63,6 +62,4 @@ __all__ = [
     "RadialMLP",
     "BinnedModule",
     "BinnedRadialBasis",
-    # Scaling
-    "SolidHarmonicScaling",
 ]

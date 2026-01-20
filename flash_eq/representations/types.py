@@ -262,6 +262,20 @@ class Repr:
             result.extend([i] * irrep.dim())
         return result
 
+    def l_indices(self) -> torch.Tensor:
+        """Return l-value for each dimension.
+
+        Maps each dimension of the representation to its angular momentum
+        degree l. Useful for l-dependent scaling operations.
+
+        Example:
+            >>> Repr(lvals=[0, 1, 2]).l_indices()
+            tensor([0, 1, 1, 1, 2, 2, 2, 2, 2])
+            >>> Repr(lvals=[0, 2]).l_indices()  # skipping l=1
+            tensor([0, 2, 2, 2, 2, 2])
+        """
+        return self.lvals[self.indices()]
+
     def find_scalar(self) -> tuple[int, List[int]]:
         """Find l=0 (scalar) components in the representation.
 

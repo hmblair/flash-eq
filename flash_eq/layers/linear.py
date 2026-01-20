@@ -14,6 +14,7 @@ import torch.nn as nn
 from ..representations import Repr, ProductRepr
 from ..cuda.block_diagonal import block_diagonal_cuda
 from .radial import BinnedModule, BinnedRadialBasis
+from .scaling import SolidHarmonicScaling
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -45,6 +46,10 @@ class EquivariantEdgewiseLinear(nn.Module):
             Requires min_dist > 0.
         sigma: Gaussian smoothing kernel width in bin units (default 1.0).
             Only used when num_bases=None.
+        solid_harmonic_scale: Length scale for solid harmonic scaling. Output
+            features are scaled by (r / (r + scale))^l, following the solid
+            harmonic structure where higher-l components vanish at short range.
+            Default 0.1.
 
     Example:
         >>> from flash_eq import Repr, WignerDBasis, EquivariantEdgewiseLinear
@@ -76,12 +81,14 @@ class EquivariantEdgewiseLinear(nn.Module):
         max_dist: float = 10.0,
         log_bins: bool = False,
         sigma: float = 1.0,
+        solid_harmonic_scale: float = 0.1,
     ):
         super().__init__()
 
         self.in_repr = in_repr
         self.out_repr = out_repr
         self.num_bases = num_bases
+        self.solid_harmonic_scale = solid_harmonic_scale
 
         # Compute weight structure from representation product
         self.product_repr = ProductRepr(in_repr, out_repr)
@@ -112,6 +119,12 @@ class EquivariantEdgewiseLinear(nn.Module):
                 log=log_bins,
                 sigma=sigma,
             )
+
+        # Solid harmonic scaling for input and output features
+        # Input scaling: suppresses l>0 input at short distances
+        # Output scaling: suppresses l>0 created by tensor product at short distances
+        self.input_scaling = SolidHarmonicScaling(in_repr, scale=solid_harmonic_scale)
+        self.output_scaling = SolidHarmonicScaling(out_repr, scale=solid_harmonic_scale)
 
     def forward(
         self,
@@ -145,13 +158,19 @@ class EquivariantEdgewiseLinear(nn.Module):
         """
 
         # =====================================================================
-        # Step 1: Transform to m-first diagonal basis (PyTorch matmul)
+        # Step 1: Apply solid harmonic scaling to input
+        # Scale l>0 components by (r / (r + scale))^l
+        # =====================================================================
+        edge_features = self.input_scaling(edge_features, distances)
+
+        # =====================================================================
+        # Step 2: Transform to m-first diagonal basis (PyTorch matmul)
         # f_diag = P^T @ edge_features, equivalent to edge_features @ P
         # =====================================================================
         f_diag = torch.bmm(edge_features, P)
 
         # =====================================================================
-        # Step 2: Block-diagonal multiply with radial weights (CUDA kernel)
+        # Step 3: Block-diagonal multiply with radial weights (CUDA kernel)
         # out_diag = Λ(r) @ f_diag
         # =====================================================================
         bin_lo, interp_weight = self.radial_weights.bin_indices(distances)
@@ -164,10 +183,16 @@ class EquivariantEdgewiseLinear(nn.Module):
         )
 
         # =====================================================================
-        # Step 3: Transform back to standard SH basis (PyTorch matmul)
+        # Step 4: Transform back to standard SH basis (PyTorch matmul)
         # out = Q @ out_diag, equivalent to out_diag @ Q^T
         # =====================================================================
-        return torch.bmm(out_diag, Q.mT)
+        output = torch.bmm(out_diag, Q.mT)
+
+        # =====================================================================
+        # Step 5: Apply solid harmonic scaling to output
+        # Suppresses l>0 components created by tensor product at short distances
+        # =====================================================================
+        return self.output_scaling(output, distances)
 
     def extra_repr(self) -> str:
         rw = self.radial_weights

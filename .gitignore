@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 flash_eq/_version.py
+.coverage
 .eggs/
 dist/
 build/

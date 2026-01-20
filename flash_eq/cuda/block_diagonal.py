@@ -179,7 +179,7 @@ def _get_cuda_module():
             name="block_diagonal_cuda",
             sources=[str(kernel_path)],
             verbose=True,
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
         )
         logger.info("CUDA kernel compiled successfully")
     except Exception as e:

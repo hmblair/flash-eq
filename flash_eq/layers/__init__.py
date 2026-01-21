@@ -9,6 +9,7 @@ Linear layers:
 Attention:
     - EquivariantEdgeAttention: Attention mechanism for equivariant edge features
     - EquivariantAttention: Full attention layer (linear + attention + pooling)
+    - GeometricEquivariantAttention: Attention with distance-aware Q/K projections
 
 Normalization:
     - RepNorm: Compute rotation-invariant norms per irrep
@@ -28,7 +29,7 @@ Transformer:
 Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from .linear import EquivariantEdgewiseLinear, EquivariantLinear
-from .attention import EquivariantEdgeAttention, EquivariantAttention
+from .attention import EquivariantEdgeAttention, EquivariantAttention, GeometricEquivariantAttention
 from .norm import RepNorm, EquivariantLayerNorm, SeparableEquivariantLayerNorm
 from .pooling import GraphPooling
 from .gating import EquivariantGating
@@ -43,6 +44,7 @@ __all__ = [
     # Attention
     "EquivariantEdgeAttention",
     "EquivariantAttention",
+    "GeometricEquivariantAttention",
     # Normalization
     "RepNorm",
     "EquivariantLayerNorm",

@@ -174,14 +174,11 @@ class EquivariantAttention(nn.Module):
         out_repr: Output representation.
         num_heads: Number of attention heads. Must divide both in_repr.mult and out_repr.mult.
         num_bins: Number of distance bins for radial weight interpolation.
-        num_bases: Number of radial basis functions. If None, uses independent
-            weights per bin. If set (e.g., 16), uses radial basis functions
-            for parameter efficiency (recommended for high L).
+        rank: Number of channel mixing patterns for radial weights (default 4).
+        hidden_dim: Hidden dimension for radial MLP (default 64).
         min_dist: Minimum distance in Angstroms.
         max_dist: Maximum distance in Angstroms.
         log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
-        sigma: Gaussian smoothing kernel width for radial weights.
-            Only used when num_bases=None.
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
 
@@ -204,11 +201,11 @@ class EquivariantAttention(nn.Module):
         out_repr: Repr,
         num_heads: int = 1,
         num_bins: int = 100,
-        num_bases: int | None = None,
+        rank: int = 4,
+        hidden_dim: int = 64,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
-        sigma: float = 1.0,
         dropout: float = 0.0,
         reduce: str = 'sum',
     ):
@@ -243,11 +240,11 @@ class EquivariantAttention(nn.Module):
             in_repr=in_repr,
             out_repr=out_repr,
             num_bins=num_bins,
-            num_bases=num_bases,
+            rank=rank,
+            hidden_dim=hidden_dim,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
-            sigma=sigma,
         )
 
         # Aggregation
@@ -324,11 +321,11 @@ class GeometricEquivariantAttention(nn.Module):
         out_repr: Output representation.
         num_heads: Number of attention heads.
         num_bins: Number of distance bins for radial weights.
-        num_bases: Number of radial basis functions.
+        rank: Number of channel mixing patterns for radial weights (default 4).
+        hidden_dim: Hidden dimension for radial MLP (default 64).
         min_dist: Minimum distance for binning.
         max_dist: Maximum distance for binning.
         log_bins: Use logarithmic bin spacing.
-        sigma: Gaussian smoothing for radial weights.
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method.
 
@@ -350,11 +347,11 @@ class GeometricEquivariantAttention(nn.Module):
         out_repr: Repr,
         num_heads: int = 1,
         num_bins: int = 100,
-        num_bases: int | None = None,
+        rank: int = 4,
+        hidden_dim: int = 64,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
-        sigma: float = 1.0,
         dropout: float = 0.0,
         reduce: str = 'sum',
     ):
@@ -375,11 +372,11 @@ class GeometricEquivariantAttention(nn.Module):
             in_repr=in_repr,
             out_repr=in_repr,
             num_bins=num_bins,
-            num_bases=num_bases,
+            rank=rank,
+            hidden_dim=hidden_dim,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
-            sigma=sigma,
         )
 
         # K projection: in_repr -> in_repr (edgewise, from src nodes)
@@ -388,11 +385,11 @@ class GeometricEquivariantAttention(nn.Module):
             in_repr=in_repr,
             out_repr=in_repr,
             num_bins=num_bins,
-            num_bases=num_bases,
+            rank=rank,
+            hidden_dim=hidden_dim,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
-            sigma=sigma,
         )
 
         # V projection: in_repr -> out_repr (edgewise, from src nodes)
@@ -400,11 +397,11 @@ class GeometricEquivariantAttention(nn.Module):
             in_repr=in_repr,
             out_repr=out_repr,
             num_bins=num_bins,
-            num_bases=num_bases,
+            rank=rank,
+            hidden_dim=hidden_dim,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
-            sigma=sigma,
         )
 
         # Q/K dimension per head: (mult / H) * dim

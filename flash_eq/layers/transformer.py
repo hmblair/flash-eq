@@ -89,13 +89,11 @@ class EquivariantTransformerBlock(nn.Module):
         out_repr: Output representation.
         num_heads: Number of attention heads. Must divide out_repr.mult.
         num_bins: Number of distance bins for radial weights.
-        num_bases: Number of radial basis functions. If None, uses independent
-            weights per bin. If set (e.g., 16), uses radial basis functions
-            for parameter efficiency (recommended for high L).
+        rank: Number of channel mixing patterns for radial weights (default 4).
+        hidden_dim: Hidden dimension for radial MLP (default 64).
         min_dist: Minimum distance for binning.
         max_dist: Maximum distance for binning.
         log_bins: Use logarithmic bin spacing.
-        sigma: Gaussian smoothing for radial weights (only used when num_bases=None).
         mlp_ratio: Hidden dimension multiplier for MLP (default 2).
         dropout: Dropout rate for attention weights.
         use_gating: Use EquivariantGating in MLP (default True). Ignored if
@@ -114,11 +112,7 @@ class EquivariantTransformerBlock(nn.Module):
         >>>
         >>> in_repr = Repr(lvals=[0, 1], mult=32)
         >>> out_repr = Repr(lvals=[0, 1, 2], mult=64)
-        >>>
-        >>> # Parameter-efficient version with radial basis functions
-        >>> block = EquivariantTransformerBlock(
-        ...     in_repr, out_repr, num_heads=8, num_bases=16
-        ... ).cuda()
+        >>> block = EquivariantTransformerBlock(in_repr, out_repr, num_heads=8).cuda()
         >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>>
         >>> graph = Graph.random(num_nodes=100, num_edges=1000).to('cuda')
@@ -132,11 +126,11 @@ class EquivariantTransformerBlock(nn.Module):
         out_repr: Repr,
         num_heads: int = 1,
         num_bins: int = 100,
-        num_bases: int | None = None,
+        rank: int = 4,
+        hidden_dim: int = 64,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
-        sigma: float = 1.0,
         mlp_ratio: int = 2,
         dropout: float = 0.0,
         drop_path: float = 0.0,
@@ -172,11 +166,11 @@ class EquivariantTransformerBlock(nn.Module):
             out_repr=out_repr,
             num_heads=num_heads,
             num_bins=num_bins,
-            num_bases=num_bases,
+            rank=rank,
+            hidden_dim=hidden_dim,
             min_dist=min_dist,
             max_dist=max_dist,
             log_bins=log_bins,
-            sigma=sigma,
             dropout=dropout,
             reduce='sum',
         )
@@ -290,13 +284,11 @@ class EquivariantTransformer(nn.Module):
         num_layers: Number of transformer blocks.
         num_heads: Number of attention heads.
         num_bins: Number of distance bins for radial weights.
-        num_bases: Number of radial basis functions. If None, uses independent
-            weights per bin. If set (e.g., 16), uses radial basis functions
-            for parameter efficiency (recommended for high L).
+        rank: Number of channel mixing patterns for radial weights (default 4).
+        hidden_dim: Hidden dimension for radial MLP (default 64).
         min_dist: Minimum distance for binning.
         max_dist: Maximum distance for binning.
         log_bins: Use logarithmic bin spacing.
-        sigma: Gaussian smoothing for radial weights (only used when num_bases=None).
         mlp_ratio: Hidden dimension multiplier for MLP.
         dropout: Dropout rate for attention.
         use_s2_activation: Use SeparableS2Activation instead of gating (default False).
@@ -314,7 +306,7 @@ class EquivariantTransformer(nn.Module):
         >>>
         >>> model = EquivariantTransformer(
         ...     in_repr, hidden_repr, out_repr,
-        ...     num_layers=6, num_heads=8, num_bases=16
+        ...     num_layers=6, num_heads=8
         ... ).cuda()
         >>>
         >>> # Forward pass with coordinates - basis computed internally
@@ -330,11 +322,11 @@ class EquivariantTransformer(nn.Module):
         num_layers: int = 6,
         num_heads: int = 1,
         num_bins: int = 100,
-        num_bases: int | None = None,
+        rank: int = 4,
+        hidden_dim: int = 64,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
-        sigma: float = 1.0,
         mlp_ratio: int = 2,
         dropout: float = 0.0,
         drop_path: float = 0.0,
@@ -385,11 +377,11 @@ class EquivariantTransformer(nn.Module):
                     out_repr=layer_out,
                     num_heads=num_heads,
                     num_bins=num_bins,
-                    num_bases=num_bases,
+                    rank=rank,
+                    hidden_dim=hidden_dim,
                     min_dist=min_dist,
                     max_dist=max_dist,
                     log_bins=log_bins,
-                    sigma=sigma,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
                     drop_path=drop_path_rates[i],

@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from ..representations import Repr, ProductRepr
 from ..cuda.block_diagonal import block_diagonal_cuda
-from .radial import BinnedModule, BinnedRadialBasis
+from .radial import SeparableRadialNet
 
 
 class EquivariantEdgewiseLinear(nn.Module):
@@ -24,27 +24,21 @@ class EquivariantEdgewiseLinear(nn.Module):
     where P, Q are Wigner-D basis matrices (from WignerDBasis) and Λ(r) is
     a block-diagonal weight matrix depending on edge distance.
 
-    Supports two parameterizations for radial weights:
-    - BinnedModule (num_bases=None): Independent weights per bin with Gaussian
-      smoothing. Parameters: O(num_bins × out × in × weight_dim).
-    - BinnedRadialBasis (num_bases=K): K radial basis functions parameterize
-      the weights. Parameters: O(K × out × in × weight_dim). More efficient
-      for large weight_dim (high angular momentum).
+    Uses separable radial weights: W[o, i, w] = Σ_k C_k[o, i] × f_k(r, w)
+    where C_k are learnable channel mixing patterns and f_k(r, w) are radial
+    functions computed by an MLP from sinusoidal distance features.
 
     Args:
         in_repr: Input representation (Repr with lvals and mult).
         out_repr: Output representation.
         num_bins: Number of distance bins for weight interpolation (default 100).
-        num_bases: Number of radial basis functions. If None, uses BinnedModule
-            with independent weights per bin. If set (e.g., 16), uses
-            BinnedRadialBasis for parameter efficiency.
+        rank: Number of channel mixing patterns K (default 4).
+        hidden_dim: Hidden dimension for radial MLP (default 64).
         min_dist: Minimum distance in Angstroms (default 0.0).
         max_dist: Maximum distance in Angstroms (default 10.0).
         log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
             Useful for molecular data where short-range interactions vary more.
             Requires min_dist > 0.
-        sigma: Gaussian smoothing kernel width in bin units (default 1.0).
-            Only used when num_bases=None.
         solid_harmonic_scale: Length scale for solid harmonic scaling. Output
             features are scaled by (r / (r + scale))^l, following the solid
             harmonic structure where higher-l components vanish at short range.
@@ -55,12 +49,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         >>>
         >>> in_repr = Repr(lvals=[0, 1, 2], mult=32)
         >>> out_repr = Repr(lvals=[0, 1, 2], mult=32)
-        >>>
-        >>> # Standard binned weights
         >>> layer = EquivariantEdgewiseLinear(in_repr, out_repr).cuda()
-        >>>
-        >>> # Parameter-efficient radial basis (recommended for high L)
-        >>> layer = EquivariantEdgewiseLinear(in_repr, out_repr, num_bases=16).cuda()
         >>>
         >>> basis = WignerDBasis([in_repr, out_repr]).cuda()
         >>> P, Q = basis(directions)
@@ -68,25 +57,25 @@ class EquivariantEdgewiseLinear(nn.Module):
         >>> output = layer(P, Q, edge_features, distances)
     """
 
-    radial_weights: BinnedModule | BinnedRadialBasis
+    radial_weights: SeparableRadialNet
 
     def __init__(
         self,
         in_repr: Repr,
         out_repr: Repr,
         num_bins: int = 100,
-        num_bases: int | None = None,
+        rank: int = 4,
+        hidden_dim: int = 64,
         min_dist: float = 0.0,
         max_dist: float = 10.0,
         log_bins: bool = False,
-        sigma: float = 1.0,
         solid_harmonic_scale: float = 0.1,
     ):
         super().__init__()
 
         self.in_repr = in_repr
         self.out_repr = out_repr
-        self.num_bases = num_bases
+        self.rank = rank
         self.solid_harmonic_scale = solid_harmonic_scale
 
         # Compute weight structure from representation product
@@ -95,29 +84,18 @@ class EquivariantEdgewiseLinear(nn.Module):
         self.channels_in = in_repr.mult
         self.channels_out = out_repr.mult
 
-        # Learnable radial weights
-        weight_shape = (self.channels_out, self.channels_in, self.weight_dim)
-
-        if num_bases is not None:
-            # Radial basis function parameterization (parameter-efficient)
-            self.radial_weights = BinnedRadialBasis(
-                num_bins=num_bins,
-                shape=weight_shape,
-                num_bases=num_bases,
-                min_val=min_dist,
-                max_val=max_dist,
-                log=log_bins,
-            )
-        else:
-            # Independent weights per bin with Gaussian smoothing
-            self.radial_weights = BinnedModule(
-                num_bins=num_bins,
-                shape=weight_shape,
-                min_val=min_dist,
-                max_val=max_dist,
-                log=log_bins,
-                sigma=sigma,
-            )
+        # Separable radial weights: W[o,i,w] = Σ_k C_k[o,i] × f_k(r,w)
+        self.radial_weights = SeparableRadialNet(
+            num_bins=num_bins,
+            out_mult=self.channels_out,
+            in_mult=self.channels_in,
+            weight_dim=self.weight_dim,
+            rank=rank,
+            hidden_dim=hidden_dim,
+            min_val=min_dist,
+            max_val=max_dist,
+            log=log_bins,
+        )
 
     def forward(
         self,
@@ -184,15 +162,11 @@ class EquivariantEdgewiseLinear(nn.Module):
     def extra_repr(self) -> str:
         rw = self.radial_weights
         spacing = "log" if rw.log else "linear"
-        base = (
+        return (
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
             f"num_bins={rw.num_bins}, dist=[{rw.min_val}, {rw.max_val}], "
-            f"spacing={spacing}"
+            f"spacing={spacing}, rank={self.rank}"
         )
-        if self.num_bases is not None:
-            return f"{base}, num_bases={self.num_bases}"
-        else:
-            return f"{base}, sigma={rw.sigma}"
 
 
 class EquivariantLinear(nn.Module):

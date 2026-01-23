@@ -234,11 +234,12 @@ Create a minimal training script to verify the model can learn, using ciffy for 
   backward_features, and backward_table kernels
   - Could potentially fuse kernels or precompute
 
-  4. Code Duplication Between m=0 and m>0 Kernels
+  4. Code Duplication Between m=0 and m>0 Kernels - PARTIALLY ADDRESSED
 
   - 6 kernels (forward_m0/mpos, backward_features_m0/mpos, backward_table_m0/mpos)
-  - Significant shared structure with minor differences
-  - Fix: Template on m-type with constexpr branches, or macro-based generation
+  - Extracted shared helpers: EdgeState, setup_edge(), precompute_scales(), precompute_scales_with_l()
+  - Kernels remain separate due to fundamentally different inner loops (real vs complex)
+  - Full template unification would require if constexpr in 4-5 places with marginal benefit
 
   5. Parameter Bloat
 
@@ -270,8 +271,7 @@ Create a minimal training script to verify the model can learn, using ciffy for 
   - Current: loads full Cin × n_in features into shared memory
   - For large Cin, could use tiled approach with register blocking
 
-  10. Branch Divergence in if (l_total > 0)
+  10. Branch Divergence in if (l_total > 0) - FIXED
 
-  - Lines 407-409, 594-596: Conditional inside loop
-  - Usually l_total > 0 for most cases, so branch is predictable
-  - Minor: Could hoist check outside loop if all l_total > 0 for a block
+  - The conditional was redundant: ipowf(x, 0) returns 1.0f anyway
+  - Removed the check entirely, simplifying the code

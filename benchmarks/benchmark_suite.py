@@ -867,32 +867,128 @@ def print_summary(all_results: dict[str, dict[str, BenchmarkResult | None]]):
 
 
 # =============================================================================
+# Single Component Benchmarks
+# =============================================================================
+
+COMPONENT_BENCHMARKS = {
+    "wigner": ("WignerDBasis", benchmark_wigner_basis),
+    "linear": ("EquivariantEdgewiseLinear", benchmark_edgewise_linear),
+    "pooling": ("GraphPooling", benchmark_graph_pooling),
+    "attention": ("EquivariantEdgeAttention", benchmark_edge_attention),
+    "s2": ("S2Activation", benchmark_s2_activation),
+    "block": ("EquivariantTransformerBlock", benchmark_transformer_block),
+}
+
+
+def run_single_component(
+    component: str,
+    scenarios: list[Scenario],
+    dtype: torch.dtype = torch.float32,
+    use_amp: bool = False,
+):
+    """Run benchmark for a single component."""
+    if component not in COMPONENT_BENCHMARKS:
+        print(f"Unknown component: {component}")
+        print(f"Available: {', '.join(COMPONENT_BENCHMARKS.keys())}")
+        return
+
+    name, bench_fn = COMPONENT_BENCHMARKS[component]
+    precision = "AMP" if use_amp else ("FP16" if dtype == torch.float16 else "FP32")
+
+    print_header(f"{name} Benchmark ({precision})")
+    print(f"Device: {torch.cuda.get_device_name()}")
+    print()
+
+    scenario_w, time_w, mem_w, tput_w = 35, 12, 10, 18
+    print(f"{'Scenario':<{scenario_w}} {'Time':<{time_w}} {'Memory':<{mem_w}} {'Throughput':<{tput_w}}")
+    print("-" * (scenario_w + time_w + mem_w + tput_w))
+
+    for s in scenarios:
+        if component in ("linear", "attention", "s2", "block"):
+            r = bench_fn(s, dtype, use_amp)
+        else:
+            r = bench_fn(s, dtype)
+
+        if r:
+            unit = "nodes" if component == "s2" else "edges"
+            count = s.num_nodes if component == "s2" else s.num_edges
+            print(
+                f"{str(s):<{scenario_w}} {fmt_time(r.time_ms):<{time_w}} "
+                f"{fmt_mem(r.peak_mem_mb):<{mem_w}} {fmt_throughput(count, r.time_ms, unit):<{tput_w}}"
+            )
+        else:
+            print(f"{str(s):<{scenario_w}} OOM")
+        clear_memory()
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
 
 def main():
-    """Run the complete benchmark suite."""
+    """Run the benchmark suite."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Flash-eq Benchmark Suite")
+    parser.add_argument(
+        "--component", "-c",
+        choices=list(COMPONENT_BENCHMARKS.keys()) + ["all"],
+        default="all",
+        help="Component to benchmark (default: all)",
+    )
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Use automatic mixed precision",
+    )
+    parser.add_argument(
+        "--fp16", action="store_true",
+        help="Use FP16 precision (without AMP)",
+    )
+    parser.add_argument(
+        "--quick", "-q", action="store_true",
+        help="Use quick scenarios (medium graphs only)",
+    )
+    parser.add_argument(
+        "--transformer", "-t", action="store_true",
+        help="Run full transformer benchmarks",
+    )
+    parser.add_argument(
+        "--scaling", "-s", action="store_true",
+        help="Run scaling analysis",
+    )
+
+    args = parser.parse_args()
+
+    # Determine dtype and scenarios
+    dtype = torch.float16 if args.fp16 else torch.float32
+    scenarios = QUICK_SCENARIOS if args.quick else SCENARIOS
+
     print_header("Flash-eq Benchmark Suite", width=90)
     print(f"\nDevice: {torch.cuda.get_device_name()}")
     print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
 
-    # Run component benchmarks
-    results_fp32 = run_component_benchmarks(SCENARIOS, torch.float32, use_amp=False)
-    print_summary(results_fp32)
+    if args.component != "all":
+        # Single component benchmark
+        run_single_component(args.component, scenarios, dtype, args.amp)
+    elif args.transformer:
+        # Transformer benchmarks only
+        run_transformer_benchmarks(scenarios, dtype, args.amp)
+    elif args.scaling:
+        # Scaling analysis only
+        base_scenario = Scenario("base", 1000, 20_000, [0, 1, 2], 32)
+        run_scaling_analysis(base_scenario, dtype, args.amp)
+    else:
+        # Full suite
+        results = run_component_benchmarks(scenarios, dtype, args.amp)
+        print_summary(results)
 
-    results_amp = run_component_benchmarks(SCENARIOS, torch.float32, use_amp=True)
-    print_summary(results_amp)
-
-    # Full transformer benchmarks
-    run_transformer_benchmarks(QUICK_SCENARIOS, torch.float32, use_amp=False)
-    run_transformer_benchmarks(QUICK_SCENARIOS, torch.float32, use_amp=True)
-
-    # Scaling analysis
-    base_scenario = Scenario("base", 1000, 20_000, [0, 1, 2], 32)
-    run_scaling_analysis(base_scenario, torch.float32, use_amp=True)
+        if not args.quick:
+            run_transformer_benchmarks(QUICK_SCENARIOS, dtype, args.amp)
+            base_scenario = Scenario("base", 1000, 20_000, [0, 1, 2], 32)
+            run_scaling_analysis(base_scenario, dtype, args.amp)
 
 
 if __name__ == "__main__":

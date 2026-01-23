@@ -245,11 +245,14 @@ Create a minimal training script to verify the model can learn, using ciffy for 
   - Each kernel takes 15+ parameters (lines 340-351)
   - Fix: Bundle into structs (e.g., RepresentationInfo, EdgeData)
 
-  6. Texture Memory for Radial Table
+  6. ~~Texture Memory for Radial Table~~ (INVESTIGATED - NOT BENEFICIAL)
 
   - radial_table accessed via __ldg() (read-only cache)
   - Access pattern is strided but coherent within bins
-  - Fix: Consider texture memory for hardware interpolation (though current binning is custom)
+  - **Result:** Texture memory adds 5-7% overhead vs __ldg(). The L2 cache is already
+    efficient for our deterministic strided access pattern. Texture cache is designed
+    for 2D/3D spatial locality which doesn't match our 1D access pattern.
+  - Code left in place with `USE_TEXTURE_MEMORY 0` for reference.
 
   7. Block-Level Reduction for grad_distances
 

@@ -215,63 +215,56 @@ Create a minimal training script to verify the model can learn, using ciffy for 
 
 ## Kernel Optimization and Cleanup Opportunities
 
-  1. Redundant Block Parameter Computation
+  ### Completed
 
-  - compute_block_params() (lines 213-244) loops over all m' < m calling count_l_geq_m()
-   for each, which itself loops over all l-values
-  - Called in every kernel for every edge - O(mmax × num_lvals) per edge
-  - Fix: Precompute BlockParams array once on CPU and pass as constant memory
+  1. ~~Redundant Block Parameter Computation~~ - DONE
+     - Added `load_block_params()` that loads precomputed BlockParams from CPU
+     - BlockParams struct bundles m, n_in, n_out, in_off, out_off, w_off
 
-  2. Inefficient get_l_for_index() Loop
+  2. ~~Inefficient get_l_for_index() Loop~~ - DONE
+     - Added `get_l_for_index_fast()` using precomputed lookup table via `__ldg()`
 
-  - Lines 128-137: Linear scan through lvals array every time called
-  - Called inside the innermost loops (#pragma unroll 4)
-  - Fix: Precompute l-value lookup table per m-block, store in constant memory
+  5. ~~Parameter Bloat~~ - DONE
+     - Added `BlockParams` struct (line 113) and `DimInfo` struct (line 126)
 
-  3. Duplicate sh_weight Computation
+  8. ~~Redundant Scaling Computation~~ - DONE
+     - `scale_shared[]` precomputes ipowf(sh_weight, l_total) for all (i,o) pairs
+     - `precompute_scales()` and `precompute_scales_with_l()` helper functions
 
-  - sh_weight = dist / (dist + sh_scale) computed identically in forward,
-  backward_features, and backward_table kernels
-  - Could potentially fuse kernels or precompute
+  10. ~~Branch Divergence in if (l_total > 0)~~ - FIXED
+      - The conditional was redundant: ipowf(x, 0) returns 1.0f anyway
+      - Removed the check entirely, simplifying the code
+
+  ### Partially Addressed
 
   4. Code Duplication Between m=0 and m>0 Kernels - PARTIALLY ADDRESSED
+     - 6 kernels (forward_m0/mpos, backward_features_m0/mpos, backward_table_m0/mpos)
+     - Extracted shared helpers: EdgeState, setup_edge(), precompute_scales(), precompute_scales_with_l()
+     - Kernels remain separate due to fundamentally different inner loops (real vs complex)
+     - Full template unification would require if constexpr in 4-5 places with marginal benefit
 
-  - 6 kernels (forward_m0/mpos, backward_features_m0/mpos, backward_table_m0/mpos)
-  - Extracted shared helpers: EdgeState, setup_edge(), precompute_scales(), precompute_scales_with_l()
-  - Kernels remain separate due to fundamentally different inner loops (real vs complex)
-  - Full template unification would require if constexpr in 4-5 places with marginal benefit
+  ### Not Worth Fixing
 
-  5. Parameter Bloat
+  3. ~~Duplicate sh_weight Computation~~ - NOT WORTH FIXING
+     - sh_weight = dist / (dist + sh_scale) is 1 div + 1 add per edge
+     - This is completely hidden by memory latency (happens while waiting for global loads)
+     - Precomputing would add kernel launch overhead + memory bandwidth for store/load
+     - Recomputation is actually faster than memory access
 
-  - Each kernel takes 15+ parameters (lines 340-351)
-  - Fix: Bundle into structs (e.g., RepresentationInfo, EdgeData)
+  6. ~~Texture Memory for Radial Table~~ - INVESTIGATED, NOT BENEFICIAL
+     - **Result:** Texture memory adds 5-7% overhead vs __ldg()
+     - L2 cache is already efficient for our deterministic strided access pattern
+     - Texture cache designed for 2D/3D spatial locality doesn't match our 1D access
+     - Code left with `USE_TEXTURE_MEMORY 0` for reference
 
-  6. ~~Texture Memory for Radial Table~~ (INVESTIGATED - NOT BENEFICIAL)
-
-  - radial_table accessed via __ldg() (read-only cache)
-  - Access pattern is strided but coherent within bins
-  - **Result:** Texture memory adds 5-7% overhead vs __ldg(). The L2 cache is already
-    efficient for our deterministic strided access pattern. Texture cache is designed
-    for 2D/3D spatial locality which doesn't match our 1D access pattern.
-  - Code left in place with `USE_TEXTURE_MEMORY 0` for reference.
+  ### Remaining (Low Priority)
 
   7. Block-Level Reduction for grad_distances
-
-  - Currently: warp reduction + atomicAdd per warp (lines 798-802)
-  - Fix: Full block reduction could eliminate atomics entirely for this edge
-
-  8. Redundant Scaling Computation
-
-  - ipowf(sh_weight, l_total) computed separately for each weight in backward_table
-  - Same l_total values repeat across channels
-  - Fix: Precompute scale factors for each (l_in, l_out) pair in shared memory
+     - Currently: warp reduction + atomicAdd per warp
+     - Fix: Full block reduction could eliminate atomics entirely for this edge
+     - Impact: Low - atomics are fast on modern GPUs
 
   9. Shared Memory Optimization
-
-  - Current: loads full Cin × n_in features into shared memory
-  - For large Cin, could use tiled approach with register blocking
-
-  10. Branch Divergence in if (l_total > 0) - FIXED
-
-  - The conditional was redundant: ipowf(x, 0) returns 1.0f anyway
-  - Removed the check entirely, simplifying the code
+     - Current: loads full Cin × n_in features into shared memory
+     - For large Cin, could use tiled approach with register blocking
+     - Impact: Medium for very large models, but adds complexity

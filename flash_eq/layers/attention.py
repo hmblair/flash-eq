@@ -33,6 +33,9 @@ class EquivariantEdgeAttention(nn.Module):
         num_heads: Number of attention heads.
         qk_dim: Dimension of Q/K per head (for scaling).
         dropout: Dropout rate for attention weights.
+        distance_decay_scale: If provided, add distance decay bias to attention
+            logits: logits -= distance / scale. This encourages the model to
+            attend more to nearby neighbors. Typical values: 2.0-5.0 Angstroms.
 
     Example:
         >>> attn = EquivariantEdgeAttention(num_heads=4, qk_dim=36)
@@ -48,11 +51,13 @@ class EquivariantEdgeAttention(nn.Module):
         num_heads: int,
         qk_dim: int,
         dropout: float = 0.0,
+        distance_decay_scale: float | None = None,
     ):
         super().__init__()
 
         self.num_heads = num_heads
         self.qk_dim = qk_dim
+        self.distance_decay_scale = distance_decay_scale
 
         # Learnable temperature for attention (stored as log for numerical stability)
         init_scale = qk_dim ** -0.5
@@ -70,6 +75,7 @@ class EquivariantEdgeAttention(nn.Module):
         K: torch.Tensor,
         V: torch.Tensor,
         graph: Graph,
+        distances: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply attention to edge features.
 
@@ -78,12 +84,19 @@ class EquivariantEdgeAttention(nn.Module):
             K: (num_edges, num_heads, qk_dim) key features from src nodes.
             V: (num_edges, mult, dim) value features (edge features).
             graph: Graph containing edge indices and node count.
+            distances: Optional (num_edges,) edge distances for distance decay.
 
         Returns:
             Attention-weighted edge features, shape (num_edges, mult, dim).
         """
         # Scaled dot-product attention
         logits = (Q * K).sum(-1) * self.scale  # (E, H)
+
+        # Distance decay bias: logits -= distance / scale
+        # Equivalent to attention *= exp(-distance / scale)
+        if self.distance_decay_scale is not None and distances is not None:
+            decay_bias = distances.unsqueeze(-1) / self.distance_decay_scale  # (E, 1)
+            logits = logits - decay_bias
 
         # Softmax over neighbors (edges to same destination)
         attn_weights = self._neighbor_softmax(logits, graph.dst, graph.num_nodes)
@@ -181,6 +194,9 @@ class EquivariantAttention(nn.Module):
         log_bins: If True, use logarithmic bin spacing (density ~ 1/r).
         dropout: Dropout rate for attention weights.
         reduce: Pooling reduction method ('sum', 'mean', or 'max').
+        distance_decay_scale: If provided, add distance decay bias to attention
+            logits: logits -= distance / scale. Encourages attending to nearby
+            neighbors. Typical values: 2.0-5.0 Angstroms.
 
     Example:
         >>> from flash_eq import Repr, Graph, WignerDBasis, EquivariantAttention
@@ -208,6 +224,7 @@ class EquivariantAttention(nn.Module):
         log_bins: bool = False,
         dropout: float = 0.0,
         reduce: str = 'sum',
+        distance_decay_scale: float | None = None,
     ):
         super().__init__()
 
@@ -233,6 +250,7 @@ class EquivariantAttention(nn.Module):
             num_heads=num_heads,
             qk_dim=qk_dim,
             dropout=dropout,
+            distance_decay_scale=distance_decay_scale,
         )
 
         # V projection: in_repr -> out_repr (can change lvals via edgewise linear)
@@ -292,177 +310,11 @@ class EquivariantAttention(nn.Module):
         V = self.linear_v(P, Q_basis, gathered, distances)  # (E, mult_out, dim_out)
 
         # Apply attention and aggregate
-        weighted = self.attention(Q, K, V, graph)
+        weighted = self.attention(Q, K, V, graph, distances)
         return self.pool(weighted, graph)
 
     def extra_repr(self) -> str:
         return (
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
             f"num_heads={self.num_heads}, reduce='{self.pool.reduce}'"
-        )
-
-
-class GeometricEquivariantAttention(nn.Module):
-    """SO(3)-equivariant attention with distance-aware Q/K projections.
-
-    Unlike EquivariantAttention where Q/K are computed from node features only,
-    this variant uses EdgewiseLinear for Q, K, and V. This allows the attention
-    scores to depend on edge distances, enabling the model to learn to downweight
-    distant neighbors.
-
-    Pipeline:
-        Q = EdgewiseLinear(node_features[dst], distance)
-        K = EdgewiseLinear(node_features[src], distance)
-        V = EdgewiseLinear(node_features[src], distance)
-        output = GraphPooling(attention(Q, K, V))
-
-    Args:
-        in_repr: Input representation.
-        out_repr: Output representation.
-        num_heads: Number of attention heads.
-        num_bins: Number of distance bins for radial weights.
-        rank: Number of channel mixing patterns for radial weights (default 4).
-        hidden_dim: Hidden dimension for radial MLP (default 64).
-        min_dist: Minimum distance for binning.
-        max_dist: Maximum distance for binning.
-        log_bins: Use logarithmic bin spacing.
-        dropout: Dropout rate for attention weights.
-        reduce: Pooling reduction method.
-
-    Example:
-        >>> from flash_eq import Repr, Graph, WignerDBasis
-        >>> from flash_eq.layers import GeometricEquivariantAttention
-        >>>
-        >>> repr = Repr(lvals=[0, 1, 2], mult=32)
-        >>> layer = GeometricEquivariantAttention(repr, repr, num_heads=4).cuda()
-        >>> basis = WignerDBasis([repr, repr]).cuda()
-        >>>
-        >>> P, Q = basis(directions)
-        >>> output = layer(P, Q, node_features, distances, graph)
-    """
-
-    def __init__(
-        self,
-        in_repr: Repr,
-        out_repr: Repr,
-        num_heads: int = 1,
-        num_bins: int = 100,
-        rank: int = 4,
-        hidden_dim: int = 64,
-        min_dist: float = 0.0,
-        max_dist: float = 10.0,
-        log_bins: bool = False,
-        dropout: float = 0.0,
-        reduce: str = 'sum',
-    ):
-        super().__init__()
-
-        if in_repr.mult % num_heads != 0:
-            raise ValueError(f"num_heads ({num_heads}) must divide in_repr.mult ({in_repr.mult})")
-        if out_repr.mult % num_heads != 0:
-            raise ValueError(f"num_heads ({num_heads}) must divide out_repr.mult ({out_repr.mult})")
-
-        self.in_repr = in_repr
-        self.out_repr = out_repr
-        self.num_heads = num_heads
-
-        # Q projection: in_repr -> in_repr (edgewise, from dst nodes)
-        self.norm_q = EquivariantLayerNorm(in_repr)
-        self.linear_q = EquivariantEdgewiseLinear(
-            in_repr=in_repr,
-            out_repr=in_repr,
-            num_bins=num_bins,
-            rank=rank,
-            hidden_dim=hidden_dim,
-            min_dist=min_dist,
-            max_dist=max_dist,
-            log_bins=log_bins,
-        )
-
-        # K projection: in_repr -> in_repr (edgewise, from src nodes)
-        self.norm_k = EquivariantLayerNorm(in_repr)
-        self.linear_k = EquivariantEdgewiseLinear(
-            in_repr=in_repr,
-            out_repr=in_repr,
-            num_bins=num_bins,
-            rank=rank,
-            hidden_dim=hidden_dim,
-            min_dist=min_dist,
-            max_dist=max_dist,
-            log_bins=log_bins,
-        )
-
-        # V projection: in_repr -> out_repr (edgewise, from src nodes)
-        self.linear_v = EquivariantEdgewiseLinear(
-            in_repr=in_repr,
-            out_repr=out_repr,
-            num_bins=num_bins,
-            rank=rank,
-            hidden_dim=hidden_dim,
-            min_dist=min_dist,
-            max_dist=max_dist,
-            log_bins=log_bins,
-        )
-
-        # Q/K dimension per head: (mult / H) * dim
-        qk_dim = (in_repr.mult // num_heads) * in_repr.dim()
-
-        # Low-level attention mechanism
-        self.attention = EquivariantEdgeAttention(
-            num_heads=num_heads,
-            qk_dim=qk_dim,
-            dropout=dropout,
-        )
-
-        # Aggregation
-        self.pool = GraphPooling(reduce=reduce)
-
-    def forward(
-        self,
-        P: torch.Tensor,
-        Q_basis: torch.Tensor,
-        node_features: torch.Tensor,
-        distances: torch.Tensor,
-        graph: Graph,
-        edge_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Apply geometric equivariant attention layer.
-
-        Args:
-            P: (num_edges, dim_in, dim_in) input basis from WignerDBasis.
-            Q_basis: (num_edges, dim_out, dim_out) output basis from WignerDBasis.
-            node_features: (num_nodes, mult_in, dim_in) node features.
-            distances: (num_edges,) edge distances.
-            graph: Graph containing edge indices and node count.
-            edge_features: Optional edge features (unused, for API compatibility).
-
-        Returns:
-            output: (num_nodes, mult_out, dim_out) updated node features.
-        """
-        E = graph.num_edges
-
-        # Q from destination nodes (edgewise projection with distance)
-        q_input = self.norm_q(node_features)[graph.dst]  # (E, mult, dim)
-        Q = self.linear_q(P, P, q_input, distances)  # (E, mult, dim)
-
-        # K from source nodes (edgewise projection with distance)
-        k_input = self.norm_k(node_features)[graph.src]  # (E, mult, dim)
-        K = self.linear_k(P, P, k_input, distances)  # (E, mult, dim)
-
-        # V from source nodes (edgewise projection with distance)
-        v_input = node_features[graph.src]  # (E, mult, dim)
-        V = self.linear_v(P, Q_basis, v_input, distances)  # (E, mult_out, dim_out)
-
-        # Reshape Q, K for multi-head: (E, H, qk_dim)
-        Q = Q.view(E, self.num_heads, -1)
-        K = K.view(E, self.num_heads, -1)
-
-        # Apply attention and aggregate
-        weighted = self.attention(Q, K, V, graph)
-        return self.pool(weighted, graph)
-
-    def extra_repr(self) -> str:
-        return (
-            f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
-            f"num_heads={self.num_heads}, reduce='{self.pool.reduce}', geometric=True"
         )

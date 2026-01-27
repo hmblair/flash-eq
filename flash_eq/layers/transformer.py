@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from ..graph import Graph
 from ..representations import Repr, WignerDBasis
-from .attention import EquivariantAttention, GeometricEquivariantAttention
+from .attention import EquivariantAttention
 from .linear import EquivariantLinear
 from .norm import SeparableEquivariantLayerNorm
 from .gating import EquivariantGating
@@ -102,9 +102,9 @@ class EquivariantTransformerBlock(nn.Module):
             This applies S² nonlinearity to higher degrees and SiLU to scalars,
             following EquiformerV2. Requires l=0 in out_repr.
         s2_precision: Lebedev precision for S² grid (default 47, 770 points).
-        use_geometric_attention: Use GeometricEquivariantAttention with distance-aware
-            Q/K projections (default False). When True, Q and K are computed via
-            EdgewiseLinear, allowing attention to depend on edge distances.
+        distance_decay_scale: If provided, add distance decay bias to attention
+            logits: logits -= distance / scale. Encourages attending to nearby
+            neighbors. Typical values: 2.0-5.0 Angstroms.
 
     Example:
         >>> from flash_eq import Repr, Graph, WignerDBasis
@@ -138,14 +138,13 @@ class EquivariantTransformerBlock(nn.Module):
         use_gating: bool = True,
         use_s2_activation: bool = False,
         s2_precision: int = 47,
-        use_geometric_attention: bool = False,
+        distance_decay_scale: float | None = None,
     ) -> None:
         super().__init__()
 
         self.in_repr = in_repr
         self.out_repr = out_repr
         self.use_s2_activation = use_s2_activation
-        self.use_geometric_attention = use_geometric_attention
 
         # Check if we can use residual connections
         self._use_attn_residual = (
@@ -153,15 +152,11 @@ class EquivariantTransformerBlock(nn.Module):
             in_repr.mult == out_repr.mult
         )
 
-        # Pre-attention normalization (only used for standard attention)
-        if not use_geometric_attention:
-            self.norm1 = SeparableEquivariantLayerNorm(in_repr)
-        else:
-            self.norm1 = None  # GeometricEquivariantAttention has its own norms
+        # Pre-attention normalization
+        self.norm1 = SeparableEquivariantLayerNorm(in_repr)
 
         # Attention layer (transforms in_repr -> out_repr)
-        AttentionClass = GeometricEquivariantAttention if use_geometric_attention else EquivariantAttention
-        self.attn = AttentionClass(
+        self.attn = EquivariantAttention(
             in_repr=in_repr,
             out_repr=out_repr,
             num_heads=num_heads,
@@ -173,6 +168,7 @@ class EquivariantTransformerBlock(nn.Module):
             log_bins=log_bins,
             dropout=dropout,
             reduce='sum',
+            distance_decay_scale=distance_decay_scale,
         )
 
         # Pre-MLP normalization (operates on out_repr)
@@ -236,19 +232,11 @@ class EquivariantTransformerBlock(nn.Module):
             (num_nodes, mult_out, dim_out) transformed node features.
         """
         # Self-attention block
-        if self.norm1 is not None:
-            # Standard attention: normalize then attend
-            x_norm = self.norm1(node_features)
-            attn_out = self.attn(
-                P, Q, x_norm, distances, graph,
-                edge_features=edge_features,
-            )
-        else:
-            # Geometric attention: has its own internal norms
-            attn_out = self.attn(
-                P, Q, node_features, distances, graph,
-                edge_features=edge_features,
-            )
+        x_norm = self.norm1(node_features)
+        attn_out = self.attn(
+            P, Q, x_norm, distances, graph,
+            edge_features=edge_features,
+        )
 
         if self._use_attn_residual:
             x = node_features + self.drop_path(self.layer_scale_attn(attn_out))
@@ -265,8 +253,7 @@ class EquivariantTransformerBlock(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_repr={self.in_repr}, out_repr={self.out_repr}, "
-            f"attn_residual={self._use_attn_residual}, "
-            f"geometric_attn={self.use_geometric_attention}"
+            f"attn_residual={self._use_attn_residual}"
         )
 
 
@@ -293,8 +280,9 @@ class EquivariantTransformer(nn.Module):
         dropout: Dropout rate for attention.
         use_s2_activation: Use SeparableS2Activation instead of gating (default False).
         s2_precision: Lebedev precision for S² grid (default 47).
-        use_geometric_attention: Use GeometricEquivariantAttention with distance-aware
-            Q/K projections (default False). Enables attention to depend on distances.
+        distance_decay_scale: If provided, add distance decay bias to attention
+            logits: logits -= distance / scale. Encourages attending to nearby
+            neighbors. Typical values: 2.0-5.0 Angstroms.
 
     Example:
         >>> from flash_eq import Repr, Graph
@@ -333,7 +321,7 @@ class EquivariantTransformer(nn.Module):
         layer_scale_init: float | None = 1e-4,
         use_s2_activation: bool = False,
         s2_precision: int = 47,
-        use_geometric_attention: bool = False,
+        distance_decay_scale: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -341,7 +329,7 @@ class EquivariantTransformer(nn.Module):
         self.hidden_repr = hidden_repr
         self.out_repr = out_repr
         self.num_layers = num_layers
-        self.use_geometric_attention = use_geometric_attention
+        self.distance_decay_scale = distance_decay_scale
 
         # Wigner-D basis for computing rotation matrices
         self._basis_reprs = [in_repr, hidden_repr, out_repr]
@@ -388,7 +376,7 @@ class EquivariantTransformer(nn.Module):
                     layer_scale_init=layer_scale_init,
                     use_s2_activation=use_s2_activation,
                     s2_precision=s2_precision,
-                    use_geometric_attention=use_geometric_attention,
+                    distance_decay_scale=distance_decay_scale,
                 )
             )
 

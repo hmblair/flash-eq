@@ -1,248 +1,222 @@
 \documentclass[tikz,border=10pt]{standalone}
 \usepackage{amsmath,amssymb,mathtools}
-\usetikzlibrary{
-  arrows.meta, positioning, calc,
-  decorations.pathreplacing, fit, backgrounds,
-}
+\usetikzlibrary{arrows.meta, decorations.pathreplacing}
 
-% ── Color palette ─────────────────────────────────────────────────
-\definecolor{m0}{HTML}{5B9BD5}     % blue  (m=0)
-\definecolor{m1}{HTML}{ED7D31}     % orange (m=1)
-\definecolor{m2}{HTML}{70AD47}     % green  (m=2)
-\definecolor{m3}{HTML}{C55A5A}     % muted red (m=3)
-\definecolor{gry}{HTML}{B0B0B0}    % gray for ℓ-ordered features
-\definecolor{tbl}{HTML}{7B68AE}    % purple for radial table
+% ── Color palette (from cmuts/fig1/overview) ─────────────────────
+\definecolor{m0}{HTML}{A44694}     % purple (m=0)
+\definecolor{m1}{HTML}{F1A226}     % gold   (m=1)
+\definecolor{m2}{HTML}{6DDB5C}     % green  (m=2)
 \definecolor{txt}{HTML}{2C2C2C}    % near-black text
 
 % ── Dimensions ────────────────────────────────────────────────────
-\def\cs{0.48}   % cell size
-\def\tc{0.22}   % radial-table cell size
+\def\cs{0.58}   % cell size
 
 \begin{document}
 \begin{tikzpicture}[
   >=Stealth,
   every node/.style={font=\small},
-  step/.style={
-    rounded corners=3pt, draw=txt!40, fill=txt!6,
-    line width=0.4pt, inner sep=3pt 5pt,
-    font=\footnotesize\bfseries, text=txt,
-  },
   lbl/.style={font=\scriptsize, text=txt},
-  sublbl/.style={font=\tiny, text=txt!60},
-  arr/.style={->, thick, txt},
-  bigarr/.style={-{Stealth[length=5pt,width=4pt]}, line width=1.2pt, txt!70},
 ]
 
-% ── Computed lengths ──────────────────────────────────────────────
-\pgfmathsetmacro{\W}{7*\cs}       % total width of 7-cell row
-\pgfmathsetmacro{\C}{\W/2}        % center of row
+% L = {0,1,2}: p = 1+3+5 = 9
+% m-ordered: m=0 (3 entries), m=1 (4 entries), m=2 (2 entries)
+\def\N{9}  % matrix dimension
+\pgfmathsetmacro{\W}{\N*\cs}
+\pgfmathsetmacro{\C}{\W/2}
 
+\def\matX{0.15}
+\pgfmathsetmacro{\matR}{\matX+\W}
+\def\fvX{-0.95}
+\pgfmathsetmacro{\outX}{\matR+0.55}
 
-% ══════════════════════════════════════════════════════════════════
-%  STEP 1 — Rotate to m-basis
-% ══════════════════════════════════════════════════════════════════
+% Radial weight table dimensions
+\pgfmathsetmacro{\matCenter}{\matX+\C}
+\def\tblN{19}
+\pgfmathsetmacro{\tblW}{\tblN*\cs}
+\pgfmathsetmacro{\tblX}{\matCenter-\tblW/2}
+\pgfmathsetmacro{\tblY}{\cs+1.2}
 
-\node[step] at (-0.65, 0) {\strut 1};
-
-% Input features f (ℓ-ordered, gray)
-\begin{scope}[shift={(0, -0.25)}]
-  \foreach \j in {0,...,6}
-    {\fill[gry, opacity=0.25] (\j*\cs, 0) rectangle ++(\cs, \cs);}
-  \draw[gray!50, thin] (0,0) grid[step=\cs] (\W, \cs);
-  \draw[gray!70] (0,0) rectangle (\W, \cs);
-  \node[lbl, above=3pt] at (\C, \cs)
-    {$\mathbf{f}$ \;{\footnotesize($\ell$-ordered)}};
-\end{scope}
-
-% Arrow down
-\draw[bigarr] (\C, -0.40) -- (\C, -1.10)
-  node[midway, right=5pt, lbl] {$P(\hat{x})^{\!\top}$}
-  node[midway, left=5pt, sublbl, align=right] {block-diag\\[-1pt]Wigner-$D$};
-
-% Output features f̃ (m-ordered, colored)
-\begin{scope}[shift={(0, -1.25)}]
-  \fill[m0, opacity=0.50] (0,0) rectangle ++(\cs,\cs);
-  \foreach \j in {0,1}{\fill[m1, opacity=0.50] ({(1+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \foreach \j in {0,1}{\fill[m2, opacity=0.50] ({(3+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \foreach \j in {0,1}{\fill[m3, opacity=0.50] ({(5+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,0) grid[step=\cs] (\W,\cs);
-  \draw[gray!70] (0,0) rectangle (\W,\cs);
-  \node[lbl, anchor=west] at ({\W+0.12}, {0.5*\cs})
-    {$\tilde{\mathbf{f}}$ \;{\footnotesize($m$-ordered)}};
-\end{scope}
-
-
-% ══════════════════════════════════════════════════════════════════
-%  STEP 2 — Block-diagonal multiply (fused, streamed from memory)
-% ══════════════════════════════════════════════════════════════════
-
-\def\STwo{-2.70}
-
-\node[step] at (-0.65, {\STwo+0.15}) {\strut 2};
-
-% ── Input vector f̃ (vertical, left of matrix) ───────────────────
-\begin{scope}[shift={(-0.85, \STwo)}]
-  \fill[m0, opacity=0.50] (0,0) rectangle ++(\cs,\cs);
-  \foreach \i in {0,1}{\fill[m1, opacity=0.50] (0, {-(1+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \foreach \i in {0,1}{\fill[m3, opacity=0.50] (0, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-6*\cs});
-  \draw[gray!70] (0,\cs) rectangle (\cs, {-6*\cs});
-  \node[lbl, above=3pt] at (0.5*\cs, \cs) {$\tilde{\mathbf{f}}$};
-\end{scope}
-
-% × sign
-\node[font=\normalsize, text=txt] at (-0.15, {\STwo-2.5*\cs}) {$\times$};
-
-% ── Block-diagonal matrix Λ (only blocks drawn, no zero fill) ───
-\begin{scope}[shift={(0.15, \STwo)}]
-  % Faint dashed outline: the full matrix that is NEVER built
-  \draw[gray!25, dashed, thin]
-    (0, \cs) rectangle (\W, {-6*\cs});
-
-  % m=0: 1×1
-  \fill[m0, opacity=0.45] (0,0) rectangle ++(\cs,\cs);
-  \draw[m0!50!black, semithick] (0,0) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m0!55!black] at (0.5*\cs, 0.5*\cs) {$\lambda_0$};
-
-  % m=1: 2×2
-  \fill[m1, opacity=0.45] (\cs, -\cs) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m1!55!black] at (1.5*\cs, -0.5*\cs) {$a_1$};
-  \fill[m1, opacity=0.45] ({2*\cs}, -\cs) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m1!55!black] at (2.5*\cs, -0.5*\cs) {$b_1$};
-  \fill[m1, opacity=0.45] (\cs, {-2*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m1!55!black] at (1.5*\cs, -1.5*\cs) {$\text{-}b_1$};
-  \fill[m1, opacity=0.45] ({2*\cs}, {-2*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m1!55!black] at (2.5*\cs, -1.5*\cs) {$a_1$};
-  \draw[m1!50!black, semithick] (\cs, 0) rectangle ++({2*\cs}, {-2*\cs});
-  \draw[m1!35!black, thin] ({2*\cs}, 0) -- ({2*\cs}, {-2*\cs});
-  \draw[m1!35!black, thin] (\cs, {-\cs}) -- ({3*\cs}, {-\cs});
-
-  % m=2: 2×2
-  \fill[m2, opacity=0.45] ({3*\cs}, {-3*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (3.5*\cs, -2.5*\cs) {$a_2$};
-  \fill[m2, opacity=0.45] ({4*\cs}, {-3*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (4.5*\cs, -2.5*\cs) {$b_2$};
-  \fill[m2, opacity=0.45] ({3*\cs}, {-4*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (3.5*\cs, -3.5*\cs) {$\text{-}b_2$};
-  \fill[m2, opacity=0.45] ({4*\cs}, {-4*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (4.5*\cs, -3.5*\cs) {$a_2$};
-  \draw[m2!50!black, semithick] ({3*\cs}, {-2*\cs}) rectangle ++({2*\cs}, {-2*\cs});
-  \draw[m2!35!black, thin] ({4*\cs}, {-2*\cs}) -- ({4*\cs}, {-4*\cs});
-  \draw[m2!35!black, thin] ({3*\cs}, {-3*\cs}) -- ({5*\cs}, {-3*\cs});
-
-  % m=3: 2×2
-  \fill[m3, opacity=0.45] ({5*\cs}, {-5*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m3!55!black] at (5.5*\cs, -4.5*\cs) {$a_3$};
-  \fill[m3, opacity=0.45] ({6*\cs}, {-5*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m3!55!black] at (6.5*\cs, -4.5*\cs) {$b_3$};
-  \fill[m3, opacity=0.45] ({5*\cs}, {-6*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m3!55!black] at (5.5*\cs, -5.5*\cs) {$\text{-}b_3$};
-  \fill[m3, opacity=0.45] ({6*\cs}, {-6*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m3!55!black] at (6.5*\cs, -5.5*\cs) {$a_3$};
-  \draw[m3!50!black, semithick] ({5*\cs}, {-4*\cs}) rectangle ++({2*\cs}, {-2*\cs});
-  \draw[m3!35!black, thin] ({6*\cs}, {-4*\cs}) -- ({6*\cs}, {-6*\cs});
-  \draw[m3!35!black, thin] ({5*\cs}, {-5*\cs}) -- ({7*\cs}, {-5*\cs});
-
-  % Label
-  \node[lbl, above=3pt] at (\C, \cs) {$\Lambda(r)$};
-\end{scope}
-
-% = sign
-\pgfmathsetmacro{\eqX}{0.15+\W+0.30}
-\node[font=\normalsize, text=txt] at (\eqX, {\STwo-2.5*\cs}) {$=$};
-
-% ── Output vector Λf̃ (vertical, right of matrix) ────────────────
-\pgfmathsetmacro{\outX}{0.15+\W+0.55}
-\begin{scope}[shift={(\outX, \STwo)}]
-  \fill[m0, opacity=0.50] (0,0) rectangle ++(\cs,\cs);
-  \foreach \i in {0,1}{\fill[m1, opacity=0.50] (0, {-(1+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \foreach \i in {0,1}{\fill[m3, opacity=0.50] (0, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-6*\cs});
-  \draw[gray!70] (0,\cs) rectangle (\cs, {-6*\cs});
-  \node[lbl, above=3pt] at (0.5*\cs, \cs) {$\Lambda\tilde{\mathbf{f}}$};
-\end{scope}
-
-% ── Radial lookup table (right side) ─────────────────────────────
-\pgfmathsetmacro{\tblX}{\outX + \cs + 0.80}
-\pgfmathsetmacro{\tblY}{\STwo - 1.40}
+% ── Radial weight table (single row) ─────────────────────────────
 \begin{scope}[shift={(\tblX, \tblY)}]
-  % Title
-  \node[font=\scriptsize\bfseries, text=tbl!80!black, anchor=south west]
-    at (0, {0.5*\tc+0.12}) {Radial lookup table $T$};
-  % K bins × 7 entries
-  \foreach \i in {0,...,5}{
-    \foreach \j in {0,...,6}{
-      \pgfmathsetmacro{\op}{20+18*sin(\i*50+\j*55)}
-      \fill[tbl, opacity={\op/100}]
-        (\j*\tc, -\i*\tc) rectangle ++(\tc,\tc);
+  % m=0: 9 purple cells
+  \foreach \i in {0,...,8}{\fill[m0, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
+  % m=1: 8 gold cells
+  \foreach \i in {9,...,16}{\fill[m1, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
+  % m=2: 2 green cells
+  \foreach \i in {17,18}{\fill[m2, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
+  % Grid and border
+  \draw[gray!50, thin] (0,0) grid[step=\cs] ({\tblW}, \cs);
+  \draw[gray!70] (0,0) rectangle ({\tblW}, \cs);
+  % Group separators
+  \draw[gray!70, semithick] ({9*\cs}, 0) -- ({9*\cs}, \cs);
+  \draw[gray!70, semithick] ({17*\cs}, 0) -- ({17*\cs}, \cs);
+  % m=0 labels
+  \node[font=\tiny, m0!55!black] at (0.5*\cs, 0.5*\cs) {$\lambda_{00}$};
+  \node[font=\tiny, m0!55!black] at (1.5*\cs, 0.5*\cs) {$\lambda_{01}$};
+  \node[font=\tiny, m0!55!black] at (2.5*\cs, 0.5*\cs) {$\lambda_{02}$};
+  \node[font=\tiny, m0!55!black] at (3.5*\cs, 0.5*\cs) {$\lambda_{10}$};
+  \node[font=\tiny, m0!55!black] at (4.5*\cs, 0.5*\cs) {$\lambda_{11}$};
+  \node[font=\tiny, m0!55!black] at (5.5*\cs, 0.5*\cs) {$\lambda_{12}$};
+  \node[font=\tiny, m0!55!black] at (6.5*\cs, 0.5*\cs) {$\lambda_{20}$};
+  \node[font=\tiny, m0!55!black] at (7.5*\cs, 0.5*\cs) {$\lambda_{21}$};
+  \node[font=\tiny, m0!55!black] at (8.5*\cs, 0.5*\cs) {$\lambda_{22}$};
+  % m=1 labels (a's then b's)
+  \node[font=\tiny, m1!55!black] at (9.5*\cs, 0.5*\cs) {$a_{11}$};
+  \node[font=\tiny, m1!55!black] at (10.5*\cs, 0.5*\cs) {$a_{12}$};
+  \node[font=\tiny, m1!55!black] at (11.5*\cs, 0.5*\cs) {$a_{21}$};
+  \node[font=\tiny, m1!55!black] at (12.5*\cs, 0.5*\cs) {$a_{22}$};
+  \node[font=\tiny, m1!55!black] at (13.5*\cs, 0.5*\cs) {$b_{11}$};
+  \node[font=\tiny, m1!55!black] at (14.5*\cs, 0.5*\cs) {$b_{12}$};
+  \node[font=\tiny, m1!55!black] at (15.5*\cs, 0.5*\cs) {$b_{21}$};
+  \node[font=\tiny, m1!55!black] at (16.5*\cs, 0.5*\cs) {$b_{22}$};
+  % m=2 labels
+  \node[font=\tiny, m2!55!black] at (17.5*\cs, 0.5*\cs) {$a_{22}$};
+  \node[font=\tiny, m2!55!black] at (18.5*\cs, 0.5*\cs) {$b_{22}$};
+  % Label
+  \node[font=\normalsize, text=txt, above=3pt] at ({9.5*\cs}, \cs) {$\mathbf{w}(r)$};
+\end{scope}
+
+% Curved arrows from table groups to corresponding matrix blocks
+\draw[->, thick, m0!70!black]
+  ({\tblX + 4.5*\cs}, \tblY) to[out=-80, in=120, looseness=0.6]
+  ({\matX + 1.5*\cs}, \cs);
+\draw[->, thick, m1!70!black]
+  ({\tblX + 12.5*\cs}, \tblY) to[out=-80, in=90, looseness=0.6]
+  ({\matX + 5*\cs}, {-2*\cs});
+\draw[->, thick, m2!70!black]
+  ({\tblX + 17.5*\cs}, \tblY) to[out=-100, in=90, looseness=0.6]
+  ({\matX + 8*\cs}, {-6*\cs});
+
+% ── Vertical f̃ (left of matrix) ─────────────────────────────────
+\begin{scope}[shift={(\fvX, 0)}]
+  % m=0: 3 entries
+  \foreach \i in {0,1,2}{\fill[m0, opacity=0.50] (0, {-\i*\cs}) rectangle ++(\cs,\cs);}
+  % m=1: 4 entries
+  \foreach \i in {0,...,3}{\fill[m1, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
+  % m=2: 2 entries
+  \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(7+\i)*\cs}) rectangle ++(\cs,\cs);}
+  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
+  \draw[gray!70] (0,\cs) rectangle (\cs, {-8*\cs});
+  \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\tilde{\mathbf{f}}$};
+\end{scope}
+
+% × sign (centered between f̃ right edge and matrix left edge)
+\node[font=\Large, text=txt] at ({(\fvX+\cs+\matX)/2}, {-3.5*\cs}) {$\times$};
+
+% ── Block-diagonal matrix Λ ──────────────────────────────────────
+\begin{scope}[shift={(\matX, 0)}]
+  % Dashed ghost outline
+  \draw[gray!25, dashed, thin] (0, \cs) rectangle (\W, {-8*\cs});
+
+  % ── m=0 block: 3×3 real matrix (rows 0–2, cols 0–2) ──────────
+  % All entries are independent real scalars λ_{ℓ₂ℓ₁}
+  \foreach \i in {0,1,2}{
+    \foreach \j in {0,1,2}{
+      \fill[m0, opacity=0.45] ({\j*\cs}, {-\i*\cs}) rectangle ++(\cs,\cs);
     }
   }
-  % Highlight interpolated row pair
-  \draw[m1!80!black, semithick]
-    (0, {-2*\tc}) rectangle ({7*\tc}, {-4*\tc});
-  % Grid + border
-  \draw[gray!25, thin] (0, \tc) grid[step=\tc] ({7*\tc}, {-5*\tc});
-  \draw[gray!50] (0, \tc) rectangle ({7*\tc}, {-5*\tc});
-  % Axis labels
-  \node[font=\tiny, text=txt!65, rotate=90, anchor=south]
-    at (-0.18, {-2*\tc}) {$K$ bins};
-  % Distance pointer
-  \draw[txt!65, semithick, -{Stealth[length=2pt]}]
-    (-0.48, {-3*\tc}) -- (-0.14, {-3*\tc})
-    node[midway, above, font=\tiny, text=txt!75] {$r$};
-  % Interpolation annotation
-  \node[font=\tiny, text=m1!75!black, anchor=west]
-    at ({7*\tc+0.10}, {-3*\tc}) {interpolate};
+  \draw[m0!50!black, semithick] (0, \cs) rectangle ++({3*\cs}, {-3*\cs});
+  % Internal grid
+  \foreach \j in {1,2}{\draw[m0!35!black, thin] ({\j*\cs}, \cs) -- ({\j*\cs}, {-2*\cs});}
+  \foreach \i in {0,1}{\draw[m0!35!black, thin] (0, {-\i*\cs}) -- ({3*\cs}, {-\i*\cs});}
+  % All λ_{ℓ₂ℓ₁} entries (ℓ₁,ℓ₂ ∈ {0,1,2})
+  \node[font=\tiny, m0!55!black] at (0.5*\cs, 0.5*\cs) {$\lambda_{00}$};
+  \node[font=\tiny, m0!55!black] at (1.5*\cs, 0.5*\cs) {$\lambda_{01}$};
+  \node[font=\tiny, m0!55!black] at (2.5*\cs, 0.5*\cs) {$\lambda_{02}$};
+  \node[font=\tiny, m0!55!black] at (0.5*\cs, -0.5*\cs) {$\lambda_{10}$};
+  \node[font=\tiny, m0!55!black] at (1.5*\cs, -0.5*\cs) {$\lambda_{11}$};
+  \node[font=\tiny, m0!55!black] at (2.5*\cs, -0.5*\cs) {$\lambda_{12}$};
+  \node[font=\tiny, m0!55!black] at (0.5*\cs, -1.5*\cs) {$\lambda_{20}$};
+  \node[font=\tiny, m0!55!black] at (1.5*\cs, -1.5*\cs) {$\lambda_{21}$};
+  \node[font=\tiny, m0!55!black] at (2.5*\cs, -1.5*\cs) {$\lambda_{22}$};
+
+  % ── m=1 block: 4×4 with [[A,B],[-B,A]] structure ─────────────
+  % rows 3–6, cols 3–6
+  % A sub-block (top-left 2×2)
+  \foreach \i in {0,1}{
+    \foreach \j in {0,1}{
+      \fill[m1, opacity=0.45] ({(3+\j)*\cs}, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);
+    }
+  }
+  % B sub-block (top-right 2×2)
+  \foreach \i in {0,1}{
+    \foreach \j in {0,1}{
+      \fill[m1, opacity=0.30] ({(5+\j)*\cs}, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);
+    }
+  }
+  % -B sub-block (bottom-left 2×2)
+  \foreach \i in {0,1}{
+    \foreach \j in {0,1}{
+      \fill[m1, opacity=0.30] ({(3+\j)*\cs}, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);
+    }
+  }
+  % A sub-block (bottom-right 2×2)
+  \foreach \i in {0,1}{
+    \foreach \j in {0,1}{
+      \fill[m1, opacity=0.45] ({(5+\j)*\cs}, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);
+    }
+  }
+  % Outer border
+  \draw[m1!50!black, semithick] ({3*\cs}, {-2*\cs}) rectangle ++({4*\cs}, {-4*\cs});
+  % Internal grid
+  \foreach \j in {4,5,6}{\draw[m1!35!black, thin] ({\j*\cs}, {-2*\cs}) -- ({\j*\cs}, {-6*\cs});}
+  \foreach \i in {3,4,5}{\draw[m1!35!black, thin] ({3*\cs}, {-\i*\cs}) -- ({7*\cs}, {-\i*\cs});}
+  % Sub-block divider (heavier)
+  \draw[m1!50!black, thin, densely dashed]
+    ({5*\cs}, {-2*\cs}) -- ({5*\cs}, {-6*\cs});
+  \draw[m1!50!black, thin, densely dashed]
+    ({3*\cs}, {-4*\cs}) -- ({7*\cs}, {-4*\cs});
+  % Individual a_{ℓ₂ℓ₁}, b_{ℓ₂ℓ₁} labels (ℓ₁,ℓ₂ ∈ {1,2})
+  % A sub-block (top-left)
+  \node[font=\tiny, m1!55!black] at (3.5*\cs, -2.5*\cs) {$a_{11}$};
+  \node[font=\tiny, m1!55!black] at (4.5*\cs, -2.5*\cs) {$a_{12}$};
+  \node[font=\tiny, m1!55!black] at (3.5*\cs, -3.5*\cs) {$a_{21}$};
+  \node[font=\tiny, m1!55!black] at (4.5*\cs, -3.5*\cs) {$a_{22}$};
+  % B sub-block (top-right)
+  \node[font=\tiny, m1!55!black] at (5.5*\cs, -2.5*\cs) {$b_{11}$};
+  \node[font=\tiny, m1!55!black] at (6.5*\cs, -2.5*\cs) {$b_{12}$};
+  \node[font=\tiny, m1!55!black] at (5.5*\cs, -3.5*\cs) {$b_{21}$};
+  \node[font=\tiny, m1!55!black] at (6.5*\cs, -3.5*\cs) {$b_{22}$};
+  % -B sub-block (bottom-left)
+  \node[font=\tiny, m1!55!black] at (3.5*\cs, -4.5*\cs) {$\text{-}b_{11}$};
+  \node[font=\tiny, m1!55!black] at (4.5*\cs, -4.5*\cs) {$\text{-}b_{12}$};
+  \node[font=\tiny, m1!55!black] at (3.5*\cs, -5.5*\cs) {$\text{-}b_{21}$};
+  \node[font=\tiny, m1!55!black] at (4.5*\cs, -5.5*\cs) {$\text{-}b_{22}$};
+  % A sub-block (bottom-right)
+  \node[font=\tiny, m1!55!black] at (5.5*\cs, -4.5*\cs) {$a_{11}$};
+  \node[font=\tiny, m1!55!black] at (6.5*\cs, -4.5*\cs) {$a_{12}$};
+  \node[font=\tiny, m1!55!black] at (5.5*\cs, -5.5*\cs) {$a_{21}$};
+  \node[font=\tiny, m1!55!black] at (6.5*\cs, -5.5*\cs) {$a_{22}$};
+
+  % ── m=2 block: 2×2 rotation-scaling (rows 7–8, cols 7–8) ─────
+  \fill[m2, opacity=0.45] ({7*\cs}, {-7*\cs}) rectangle ++(\cs,\cs);
+  \node[font=\tiny, m2!55!black] at (7.5*\cs, -6.5*\cs) {$a_{22}$};
+  \fill[m2, opacity=0.45] ({8*\cs}, {-7*\cs}) rectangle ++(\cs,\cs);
+  \node[font=\tiny, m2!55!black] at (8.5*\cs, -6.5*\cs) {$b_{22}$};
+  \fill[m2, opacity=0.45] ({7*\cs}, {-8*\cs}) rectangle ++(\cs,\cs);
+  \node[font=\tiny, m2!55!black] at (7.5*\cs, -7.5*\cs) {$\text{-}b_{22}$};
+  \fill[m2, opacity=0.45] ({8*\cs}, {-8*\cs}) rectangle ++(\cs,\cs);
+  \node[font=\tiny, m2!55!black] at (8.5*\cs, -7.5*\cs) {$a_{22}$};
+  \draw[m2!50!black, semithick] ({7*\cs}, {-6*\cs}) rectangle ++({2*\cs}, {-2*\cs});
+  \draw[m2!35!black, thin] ({8*\cs}, {-6*\cs}) -- ({8*\cs}, {-8*\cs});
+  \draw[m2!35!black, thin] ({7*\cs}, {-7*\cs}) -- ({9*\cs}, {-7*\cs});
+
+  % Label
+  \node[font=\normalsize, text=txt, above=3pt] at (\C, \cs) {$\Lambda(r)$};
+
 \end{scope}
 
-% ── Arrow: radial table streams weights to blocks ────────────────
-% Route: from bottom of table, left to matrix right edge
-\pgfmathsetmacro{\matRight}{0.15 + \W}
-\pgfmathsetmacro{\tblBotY}{\tblY - 5*\tc}
-\pgfmathsetmacro{\streamY}{\tblBotY - 0.25}
+% = sign (centered between matrix right edge and Λf̃ left edge)
+\node[font=\Large, text=txt] at ({(\matR+\outX)/2}, {-3.5*\cs}) {$=$};
 
-\draw[arr, tbl!65, line width=0.9pt, rounded corners=3pt]
-  ({\tblX + 3.5*\tc}, \tblBotY)
-  -- ({\tblX + 3.5*\tc}, \streamY)
-  -- ({\matRight + 0.08}, \streamY)
-  node[midway, below=2pt, font=\tiny, text=tbl!80!black] {stream weights};
-
-
-% ══════════════════════════════════════════════════════════════════
-%  STEP 3 — Rotate back to standard basis
-% ══════════════════════════════════════════════════════════════════
-
-\pgfmathsetmacro{\SThree}{\STwo - 7*\cs - 0.55}
-
-\node[step] at (-0.65, {\SThree+0.25}) {\strut 3};
-
-% m-ordered result Λf̃ (colored, contiguous)
-\begin{scope}[shift={(0, \SThree)}]
-  \fill[m0, opacity=0.50] (0,0) rectangle ++(\cs,\cs);
-  \foreach \j in {0,1}{\fill[m1, opacity=0.50] ({(1+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \foreach \j in {0,1}{\fill[m2, opacity=0.50] ({(3+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \foreach \j in {0,1}{\fill[m3, opacity=0.50] ({(5+\j)*\cs},0) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,0) grid[step=\cs] (\W,\cs);
-  \draw[gray!70] (0,0) rectangle (\W,\cs);
-  \node[lbl, above=3pt] at (\C, \cs)
-    {$\Lambda\tilde{\mathbf{f}}$ \;{\footnotesize($m$-ordered)}};
-\end{scope}
-
-% Arrow down
-\draw[bigarr] (\C, {\SThree-0.15}) -- (\C, {\SThree-0.80})
-  node[midway, right=5pt, lbl] {$Q(\hat{x})$}
-  node[midway, left=5pt, sublbl, align=right] {block-diag\\[-1pt]Wigner-$D$};
-
-% Output features f̂ (gray, ℓ-ordered)
-\begin{scope}[shift={(0, {\SThree-0.95})}]
-  \foreach \j in {0,...,6}
-    {\fill[gry, opacity=0.25] (\j*\cs, 0) rectangle ++(\cs, \cs);}
-  \draw[gray!50, thin] (0,0) grid[step=\cs] (\W, \cs);
-  \draw[gray!70] (0,0) rectangle (\W, \cs);
-  \node[lbl, below=3pt] at (\C, 0)
-    {$\hat{\mathbf{f}}$ \;{\footnotesize($\ell$-ordered)}};
+% ── Vertical Λf̃ (right of matrix) ───────────────────────────────
+\begin{scope}[shift={(\outX, 0)}]
+  \foreach \i in {0,1,2}{\fill[m0, opacity=0.50] (0, {-\i*\cs}) rectangle ++(\cs,\cs);}
+  \foreach \i in {0,...,3}{\fill[m1, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
+  \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(7+\i)*\cs}) rectangle ++(\cs,\cs);}
+  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
+  \draw[gray!70] (0,\cs) rectangle (\cs, {-8*\cs});
+  \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\Lambda\tilde{\mathbf{f}}$};
 \end{scope}
 
 \end{tikzpicture}

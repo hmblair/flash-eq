@@ -131,15 +131,25 @@
 
 % ── Vertical f̃ (right of matrix) ────────────────────────────────
 \begin{scope}[shift={(\fvX, 0)}]
-  % m=0: 3 entries
+  % m=0: 3 entries (ℓ = 0,1,2)
   \foreach \i in {0,1,2}{\fill[m0, opacity=0.50] (0, {-\i*\cs}) rectangle ++(\cs,\cs);}
-  % m=1: 4 entries
+  % m=±1: 4 entries (ℓ = 1,2 × ±1)
   \foreach \i in {0,...,3}{\fill[m1, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
-  % m=2: 2 entries
+  % m=±2: 2 entries (ℓ = 2 × ±2)
   \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(7+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
-  \draw[gray!70] (0,\cs) rectangle (\cs, {-8*\cs});
+  \draw[black, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
+  \draw[black] (0,\cs) rectangle (\cs, {-8*\cs});
   \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\tilde{\mathbf{f}}$};
+  % Entry labels
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, 0.5*\cs)   {$\tilde{f}_{0}^{(0)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -0.5*\cs)  {$\tilde{f}_{0}^{(1)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -1.5*\cs)  {$\tilde{f}_{0}^{(2)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -2.5*\cs)  {$\tilde{f}_{1}^{(1)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -3.5*\cs)  {$\tilde{f}_{-1}^{(1)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -4.5*\cs)  {$\tilde{f}_{1}^{(2)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -5.5*\cs)  {$\tilde{f}_{-1}^{(2)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -6.5*\cs)  {$\tilde{f}_{2}^{(2)}$};
+  \node[font=\small, scale=0.55, text=black] at (0.5*\cs, -7.5*\cs)  {$\tilde{f}_{-2}^{(2)}$};
 \end{scope}
 
 % × sign (centered between matrix right edge and f̃ left edge)
@@ -157,91 +167,67 @@
       \fill[m0, opacity=0.45] ({\j*\cs}, {-\i*\cs}) rectangle ++(\cs,\cs);
     }
   }
-  \draw[m0!50!black, semithick] (0, \cs) rectangle ++({3*\cs}, {-3*\cs});
+  \draw[black, semithick] (0, \cs) rectangle ++({3*\cs}, {-3*\cs});
   % Internal grid
   \foreach \j in {1,2}{\draw[m0!35!black, thin] ({\j*\cs}, \cs) -- ({\j*\cs}, {-2*\cs});}
   \foreach \i in {0,1}{\draw[m0!35!black, thin] (0, {-\i*\cs}) -- ({3*\cs}, {-\i*\cs});}
-  % All λ_{ℓ₂ℓ₁} entries (ℓ₁,ℓ₂ ∈ {0,1,2})
-  \node[font=\tiny, m0!55!black] at (0.5*\cs, 0.5*\cs) {$\lambda_{00}$};
-  \node[font=\tiny, m0!55!black] at (1.5*\cs, 0.5*\cs) {$\lambda_{01}$};
-  \node[font=\tiny, m0!55!black] at (2.5*\cs, 0.5*\cs) {$\lambda_{02}$};
-  \node[font=\tiny, m0!55!black] at (0.5*\cs, -0.5*\cs) {$\lambda_{10}$};
-  \node[font=\tiny, m0!55!black] at (1.5*\cs, -0.5*\cs) {$\lambda_{11}$};
-  \node[font=\tiny, m0!55!black] at (2.5*\cs, -0.5*\cs) {$\lambda_{12}$};
-  \node[font=\tiny, m0!55!black] at (0.5*\cs, -1.5*\cs) {$\lambda_{20}$};
-  \node[font=\tiny, m0!55!black] at (1.5*\cs, -1.5*\cs) {$\lambda_{21}$};
-  \node[font=\tiny, m0!55!black] at (2.5*\cs, -1.5*\cs) {$\lambda_{22}$};
+  % All Λ_{ℓ_in ℓ_out}^{(0)} entries (ℓ_in,ℓ_out ∈ {0,1,2})
+  \node[font=\small, m0!55!black, scale=0.7] at (0.5*\cs, 0.5*\cs) {$\Lambda_{00}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (1.5*\cs, 0.5*\cs) {$\Lambda_{01}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (2.5*\cs, 0.5*\cs) {$\Lambda_{02}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (0.5*\cs, -0.5*\cs) {$\Lambda_{10}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (1.5*\cs, -0.5*\cs) {$\Lambda_{11}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (2.5*\cs, -0.5*\cs) {$\Lambda_{12}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (0.5*\cs, -1.5*\cs) {$\Lambda_{20}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (1.5*\cs, -1.5*\cs) {$\Lambda_{21}^{(0)}$};
+  \node[font=\small, m0!55!black, scale=0.7] at (2.5*\cs, -1.5*\cs) {$\Lambda_{22}^{(0)}$};
 
   % ── m=1 block: 4×4 with [[A,B],[-B,A]] structure ─────────────
   % rows 3–6, cols 3–6
-  % A sub-block (top-left 2×2)
-  \foreach \i in {0,1}{
-    \foreach \j in {0,1}{
-      \fill[m1, opacity=0.45] ({(3+\j)*\cs}, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);
-    }
-  }
-  % B sub-block (top-right 2×2)
-  \foreach \i in {0,1}{
-    \foreach \j in {0,1}{
-      \fill[m1, opacity=0.30] ({(5+\j)*\cs}, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);
-    }
-  }
-  % -B sub-block (bottom-left 2×2)
-  \foreach \i in {0,1}{
-    \foreach \j in {0,1}{
-      \fill[m1, opacity=0.30] ({(3+\j)*\cs}, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);
-    }
-  }
-  % A sub-block (bottom-right 2×2)
-  \foreach \i in {0,1}{
-    \foreach \j in {0,1}{
-      \fill[m1, opacity=0.45] ({(5+\j)*\cs}, {-(5+\i)*\cs}) rectangle ++(\cs,\cs);
-    }
-  }
+  % Fill four 2×2 sub-blocks (darker for A diagonal, lighter for B off-diagonal)
+  \fill[m1, opacity=0.45] ({3*\cs}, {-2*\cs}) rectangle ({5*\cs}, {-4*\cs});   % A (top-left)
+  \fill[m1, opacity=0.30] ({5*\cs}, {-2*\cs}) rectangle ({7*\cs}, {-4*\cs});   % B (top-right)
+  \fill[m1, opacity=0.30] ({3*\cs}, {-4*\cs}) rectangle ({5*\cs}, {-6*\cs});   % -B (bottom-left)
+  \fill[m1, opacity=0.45] ({5*\cs}, {-4*\cs}) rectangle ({7*\cs}, {-6*\cs});   % A (bottom-right)
   % Outer border
-  \draw[m1!50!black, semithick] ({3*\cs}, {-2*\cs}) rectangle ++({4*\cs}, {-4*\cs});
-  % Internal grid
-  \foreach \j in {4,5,6}{\draw[m1!35!black, thin] ({\j*\cs}, {-2*\cs}) -- ({\j*\cs}, {-6*\cs});}
-  \foreach \i in {3,4,5}{\draw[m1!35!black, thin] ({3*\cs}, {-\i*\cs}) -- ({7*\cs}, {-\i*\cs});}
-  % Sub-block divider (heavier)
+  \draw[black, semithick] ({3*\cs}, {-2*\cs}) rectangle ++({4*\cs}, {-4*\cs});
+  % Faint internal grid lines, skipping label centers
+  % Vertical lines at x = 4, 6 (skip ±0.40 around label centers)
+  \draw[m1!25!black, thin, opacity=0.4] ({4*\cs}, {-2*\cs}) -- ({4*\cs}, {-2.60*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({4*\cs}, {-3.40*\cs}) -- ({4*\cs}, {-4.60*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({4*\cs}, {-5.40*\cs}) -- ({4*\cs}, {-6*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({6*\cs}, {-2*\cs}) -- ({6*\cs}, {-2.60*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({6*\cs}, {-3.40*\cs}) -- ({6*\cs}, {-4.60*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({6*\cs}, {-5.40*\cs}) -- ({6*\cs}, {-6*\cs});
+  % Horizontal lines at y = -3, -4, -5 (skip around centers)
+  \draw[m1!25!black, thin, opacity=0.4] ({3*\cs}, {-3*\cs}) -- ({3.45*\cs}, {-3*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({4.55*\cs}, {-3*\cs}) -- ({5.45*\cs}, {-3*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({6.55*\cs}, {-3*\cs}) -- ({7*\cs}, {-3*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({3*\cs}, {-5*\cs}) -- ({3.45*\cs}, {-5*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({4.55*\cs}, {-5*\cs}) -- ({5.45*\cs}, {-5*\cs});
+  \draw[m1!25!black, thin, opacity=0.4] ({6.55*\cs}, {-5*\cs}) -- ({7*\cs}, {-5*\cs});
+  % Sub-block dividers (heavier dashed)
   \draw[m1!50!black, thin, densely dashed]
     ({5*\cs}, {-2*\cs}) -- ({5*\cs}, {-6*\cs});
   \draw[m1!50!black, thin, densely dashed]
     ({3*\cs}, {-4*\cs}) -- ({7*\cs}, {-4*\cs});
-  % Individual a_{ℓ₂ℓ₁}, b_{ℓ₂ℓ₁} labels (ℓ₁,ℓ₂ ∈ {1,2})
-  % A sub-block (top-left)
-  \node[font=\tiny, m1!55!black] at (3.5*\cs, -2.5*\cs) {$a_{11}$};
-  \node[font=\tiny, m1!55!black] at (4.5*\cs, -2.5*\cs) {$a_{12}$};
-  \node[font=\tiny, m1!55!black] at (3.5*\cs, -3.5*\cs) {$a_{21}$};
-  \node[font=\tiny, m1!55!black] at (4.5*\cs, -3.5*\cs) {$a_{22}$};
-  % B sub-block (top-right)
-  \node[font=\tiny, m1!55!black] at (5.5*\cs, -2.5*\cs) {$b_{11}$};
-  \node[font=\tiny, m1!55!black] at (6.5*\cs, -2.5*\cs) {$b_{12}$};
-  \node[font=\tiny, m1!55!black] at (5.5*\cs, -3.5*\cs) {$b_{21}$};
-  \node[font=\tiny, m1!55!black] at (6.5*\cs, -3.5*\cs) {$b_{22}$};
-  % -B sub-block (bottom-left)
-  \node[font=\tiny, m1!55!black] at (3.5*\cs, -4.5*\cs) {$\text{-}b_{11}$};
-  \node[font=\tiny, m1!55!black] at (4.5*\cs, -4.5*\cs) {$\text{-}b_{12}$};
-  \node[font=\tiny, m1!55!black] at (3.5*\cs, -5.5*\cs) {$\text{-}b_{21}$};
-  \node[font=\tiny, m1!55!black] at (4.5*\cs, -5.5*\cs) {$\text{-}b_{22}$};
-  % A sub-block (bottom-right)
-  \node[font=\tiny, m1!55!black] at (5.5*\cs, -4.5*\cs) {$a_{11}$};
-  \node[font=\tiny, m1!55!black] at (6.5*\cs, -4.5*\cs) {$a_{12}$};
-  \node[font=\tiny, m1!55!black] at (5.5*\cs, -5.5*\cs) {$a_{21}$};
-  \node[font=\tiny, m1!55!black] at (6.5*\cs, -5.5*\cs) {$a_{22}$};
+  % Centered sub-block labels
+  \node[font=\small, text=black, scale=0.85] at (4*\cs, -3*\cs) {$\Lambda_{11}^{(1)}$};
+  \node[font=\small, text=black, scale=0.85] at (6*\cs, -3*\cs) {$\Lambda_{12}^{(1)}$};
+  \node[font=\small, text=black, scale=0.85] at (4*\cs, -5*\cs) {$\Lambda_{21}^{(1)}$};
+  \node[font=\small, text=black, scale=0.85] at (6*\cs, -5*\cs) {$\Lambda_{22}^{(1)}$};
 
   % ── m=2 block: 2×2 rotation-scaling (rows 7–8, cols 7–8) ─────
-  \fill[m2, opacity=0.45] ({7*\cs}, {-7*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (7.5*\cs, -6.5*\cs) {$a_{22}$};
-  \fill[m2, opacity=0.45] ({8*\cs}, {-7*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (8.5*\cs, -6.5*\cs) {$b_{22}$};
-  \fill[m2, opacity=0.45] ({7*\cs}, {-8*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (7.5*\cs, -7.5*\cs) {$\text{-}b_{22}$};
-  \fill[m2, opacity=0.45] ({8*\cs}, {-8*\cs}) rectangle ++(\cs,\cs);
-  \node[font=\tiny, m2!55!black] at (8.5*\cs, -7.5*\cs) {$a_{22}$};
-  \draw[m2!50!black, semithick] ({7*\cs}, {-6*\cs}) rectangle ++({2*\cs}, {-2*\cs});
-  \draw[m2!35!black, thin] ({8*\cs}, {-6*\cs}) -- ({8*\cs}, {-8*\cs});
-  \draw[m2!35!black, thin] ({7*\cs}, {-7*\cs}) -- ({9*\cs}, {-7*\cs});
+  % Single filled block with centered label A₂₂ and faint grid (split around label)
+  \fill[m2, opacity=0.45] ({7*\cs}, {-6*\cs}) rectangle ++({2*\cs}, {-2*\cs});
+  \draw[black, semithick] ({7*\cs}, {-6*\cs}) rectangle ++({2*\cs}, {-2*\cs});
+  % Vertical grid line, skipping ±0.40 around center
+  \draw[m2!25!black, thin, opacity=0.4] ({8*\cs}, {-6*\cs}) -- ({8*\cs}, {-6.60*\cs});
+  \draw[m2!25!black, thin, opacity=0.4] ({8*\cs}, {-7.40*\cs}) -- ({8*\cs}, {-8*\cs});
+  % Horizontal grid line, skipping center
+  \draw[m2!25!black, thin, opacity=0.4] ({7*\cs}, {-7*\cs}) -- ({7.45*\cs}, {-7*\cs});
+  \draw[m2!25!black, thin, opacity=0.4] ({8.55*\cs}, {-7*\cs}) -- ({9*\cs}, {-7*\cs});
+  \node[font=\small, text=black, scale=0.85] at (8*\cs, -7*\cs) {$\Lambda_{22}^{(2)}$};
 
   % Label
   \node[font=\normalsize, text=txt, above=3pt] at (\C, \cs) {$\Lambda(r)$};
@@ -256,8 +242,8 @@
   \foreach \i in {0,1,2}{\fill[m0, opacity=0.50] (0, {-\i*\cs}) rectangle ++(\cs,\cs);}
   \foreach \i in {0,...,3}{\fill[m1, opacity=0.50] (0, {-(3+\i)*\cs}) rectangle ++(\cs,\cs);}
   \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(7+\i)*\cs}) rectangle ++(\cs,\cs);}
-  \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
-  \draw[gray!70] (0,\cs) rectangle (\cs, {-8*\cs});
+  \draw[black, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
+  \draw[black] (0,\cs) rectangle (\cs, {-8*\cs});
   \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\Lambda(r)\tilde{\mathbf{f}}$};
 \end{scope}
 

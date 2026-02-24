@@ -24,10 +24,10 @@
 \pgfmathsetmacro{\W}{\N*\cs}
 \pgfmathsetmacro{\C}{\W/2}
 
-\def\matX{0.15}
+\def\matX{-0.55}
 \pgfmathsetmacro{\matR}{\matX+\W}
-\def\fvX{-0.95}
-\pgfmathsetmacro{\outX}{\matR+0.55}
+\pgfmathsetmacro{\fvX}{\matR+0.55}
+\pgfmathsetmacro{\outX}{\fvX+\cs+0.55}
 
 % Radial weight table dimensions (3 summary blocks)
 \pgfmathsetmacro{\matCenter}{\matX+\C}
@@ -37,40 +37,99 @@
 \pgfmathsetmacro{\tblX}{\matCenter-\tblTotalW/2}
 \pgfmathsetmacro{\tblY}{\cs+1.2}
 
-% ── Radial weight table (3 summary blocks) ───────────────────────
-\begin{scope}[shift={(\tblX, \tblY)}]
-  % m=0 block
-  \fill[m0, opacity=0.50] (0, 0) rectangle (\bW, \cs);
-  \draw[m0!50!black, semithick] (0, 0) rectangle (\bW, \cs);
-  \node[font=\scriptsize, m0!55!black] at ({0.5*\bW}, 0.5*\cs) {$9\;\lambda$};
-  % m=1 block
-  \pgfmathsetmacro{\bOneX}{\bW+\tblGap}
-  \fill[m1, opacity=0.50] (\bOneX, 0) rectangle ({\bOneX+\bW}, \cs);
-  \draw[m1!50!black, semithick] (\bOneX, 0) rectangle ({\bOneX+\bW}, \cs);
-  \node[font=\scriptsize, m1!55!black] at ({\bOneX+0.5*\bW}, 0.5*\cs) {$4a,4b$};
-  % m=2 block
-  \pgfmathsetmacro{\bTwoX}{2*\bW+2*\tblGap}
-  \fill[m2, opacity=0.50] (\bTwoX, 0) rectangle ({\bTwoX+\bW}, \cs);
-  \draw[m2!50!black, semithick] (\bTwoX, 0) rectangle ({\bTwoX+\bW}, \cs);
-  \node[font=\scriptsize, m2!55!black] at ({\bTwoX+0.5*\bW}, 0.5*\cs) {$1a,1b$};
-  % Label
-  \node[font=\normalsize, text=txt, above=3pt] at ({0.5*\tblTotalW}, \cs) {$\mathbf{w}(r)$};
+
+% ── Horizontal distance axis with binned lookup ─────────────────
+% Shows r landing between two bins on a distance axis; the two
+% neighboring bins are highlighted and arrows fan down to Λ(r).
+\def\binW{0.55}    % bin rectangle width
+\def\binH{0.55}    % bin rectangle height
+\def\nBins{8}      % number of visible bins
+\pgfmathsetmacro{\axisW}{\nBins*\binW}
+\pgfmathsetmacro{\axisY}{\cs+1.4}          % y of bin bottoms
+\pgfmathsetmacro{\axisX}{\matCenter-\axisW/2}  % left edge of axis
+
+\begin{scope}[shift={(\axisX, \axisY)}]
+  % Left ellipsis
+  \node[font=\scriptsize, text=gray!60] at (-0.35, {0.5*\binH}) {$\cdots$};
+  % Right ellipsis
+  \node[font=\scriptsize, text=gray!60] at ({\axisW+0.35}, {0.5*\binH}) {$\cdots$};
+
+  % Draw bins — highlight bins 3 and 4 (the two around r)
+  \foreach \b in {0,...,7} {
+    \pgfmathsetmacro{\bx}{\b*\binW}
+    % Highlight bins k and k+1
+    \ifnum\b=3
+      \fill[gray!20] (\bx, 0) rectangle ++({\binW}, {\binH});
+    \fi
+    \ifnum\b=4
+      \fill[gray!20] (\bx, 0) rectangle ++({\binW}, {\binH});
+    \fi
+    \draw[gray!50, thin] (\bx, 0) rectangle ++({\binW}, {\binH});
+  }
+
+  % Heavier outline on the two highlighted bins
+  \pgfmathsetmacro{\hL}{3*\binW}
+  \pgfmathsetmacro{\hR}{5*\binW}
+  \draw[txt, semithick] (\hL, 0) rectangle (\hR, \binH);
+
+  % Measurement line just above the bins
+  \pgfmathsetmacro{\rPos}{3.7*\binW}  % slightly left of bin boundary
+  \pgfmathsetmacro{\mY}{\binH+0.12}   % y of measurement line
+  \pgfmathsetmacro{\sLen}{0.08}       % serif half-height
+  \pgfmathsetmacro{\lblY}{\mY+0.12}   % fixed y for labels
+  % Left segment: bin k left edge → r  (α)
+  \draw[txt, thin] ({3*\binW}, {\mY-\sLen}) -- ({3*\binW}, {\mY+\sLen});
+  \draw[txt, thin] ({3*\binW}, \mY) -- (\rPos, \mY);
+  \draw[txt, thin] (\rPos, {\mY-\sLen}) -- (\rPos, {\mY+\sLen});
+  \node[font=\tiny, text=txt, anchor=base] at ({(3*\binW+\rPos)/2}, \lblY) {$\alpha$};
+  % Right segment: r → bin k+1 right edge  (1-α)
+  \draw[txt, thin] ({5*\binW}, {\mY-\sLen}) -- ({5*\binW}, {\mY+\sLen});
+  \draw[txt, thin] (\rPos, \mY) -- ({5*\binW}, \mY);
+  \node[font=\tiny, text=txt, anchor=base] at ({(\rPos+5*\binW)/2}, \lblY) {$1\!-\!\alpha$};
+
+  % r marker — triangle above the measurement line, pointing down
+  \pgfmathsetmacro{\triBot}{\mY+0.22}
+  \pgfmathsetmacro{\triTop}{\triBot+0.15}
+  \fill[txt] (\rPos, \triBot) -- ({(\rPos)-0.07}, \triTop) -- ({(\rPos)+0.07}, \triTop) -- cycle;
+  \node[font=\scriptsize, text=txt, above=1pt] at (\rPos, \triTop) {$r$};
+
+  % Bin labels k and k+1 (below the bins)
+  \node[font=\tiny, text=gray!60, below=2pt] at ({3.5*\binW}, 0) {$k$};
+  \node[font=\tiny, text=gray!60, below=2pt] at ({4.5*\binW}, 0) {$k\!+\!1$};
+
+  % Color-coded stripes inside highlighted bins to show weight types
+  \pgfmathsetmacro{\sH}{\binH/3}
+  % Bin k stripes
+  \fill[m0, opacity=0.35] (\hL, 0) rectangle ++(\binW, \sH);
+  \fill[m1, opacity=0.35] (\hL, \sH) rectangle ++(\binW, \sH);
+  \fill[m2, opacity=0.35] (\hL, {2*\sH}) rectangle ++(\binW, \sH);
+  % Bin k+1 stripes
+  \pgfmathsetmacro{\hM}{4*\binW}
+  \fill[m0, opacity=0.35] (\hM, 0) rectangle ++(\binW, \sH);
+  \fill[m1, opacity=0.35] (\hM, \sH) rectangle ++(\binW, \sH);
+  \fill[m2, opacity=0.35] (\hM, {2*\sH}) rectangle ++(\binW, \sH);
+
+  % Table label (above-left of axis, avoiding r marker)
+  \node[font=\normalsize, text=txt] at ({1.2*\binW}, {\binH+0.55}) {$\mathbf{T}$};
 \end{scope}
 
-% Curved arrows from table blocks to corresponding matrix blocks
+% Arrows from highlighted bins down to matrix blocks
+% Fan out from different x positions along the two-bin span
+\pgfmathsetmacro{\arrY}{\axisY - 0.05}
+\pgfmathsetmacro{\binLmid}{\axisX + 3.3*\binW}  % left third of span
+\pgfmathsetmacro{\binCmid}{\axisX + 4.0*\binW}  % center of span
+\pgfmathsetmacro{\binRmid}{\axisX + 4.7*\binW}  % right third of span
 \draw[->, thick, m0!70!black]
-  ({\tblX + 0.5*\bW}, \tblY) to[out=-80, in=120, looseness=0.6]
+  (\binLmid, \arrY) to[out=-80, in=120, looseness=0.6]
   ({\matX + 1.5*\cs}, \cs);
-\pgfmathsetmacro{\bOneMid}{\tblX+\bW+\tblGap+0.5*\bW}
 \draw[->, thick, m1!70!black]
-  (\bOneMid, \tblY) to[out=-80, in=90, looseness=0.6]
+  (\binCmid, \arrY) to[out=-75, in=90, looseness=0.5]
   ({\matX + 5*\cs}, {-2*\cs});
-\pgfmathsetmacro{\bTwoMid}{\tblX+2*\bW+2*\tblGap+0.5*\bW}
 \draw[->, thick, m2!70!black]
-  (\bTwoMid, \tblY) to[out=-80, in=90, looseness=0.6]
+  (\binRmid, \arrY) to[out=-60, in=90, looseness=0.5]
   ({\matX + 8*\cs}, {-6*\cs});
 
-% ── Vertical f̃ (left of matrix) ─────────────────────────────────
+% ── Vertical f̃ (right of matrix) ────────────────────────────────
 \begin{scope}[shift={(\fvX, 0)}]
   % m=0: 3 entries
   \foreach \i in {0,1,2}{\fill[m0, opacity=0.50] (0, {-\i*\cs}) rectangle ++(\cs,\cs);}
@@ -83,8 +142,8 @@
   \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\tilde{\mathbf{f}}$};
 \end{scope}
 
-% × sign (centered between f̃ right edge and matrix left edge)
-\node[font=\Large, text=txt] at ({(\fvX+\cs+\matX)/2}, {-3.5*\cs}) {$\times$};
+% × sign (centered between matrix right edge and f̃ left edge)
+\node[font=\Large, text=txt] at ({(\matR+\fvX)/2}, {-3.5*\cs}) {$\times$};
 
 % ── Block-diagonal matrix Λ ──────────────────────────────────────
 \begin{scope}[shift={(\matX, 0)}]
@@ -189,8 +248,8 @@
 
 \end{scope}
 
-% = sign (centered between matrix right edge and Λf̃ left edge)
-\node[font=\Large, text=txt] at ({(\matR+\outX)/2}, {-3.5*\cs}) {$=$};
+% = sign (centered between f̃ right edge and Λf̃ left edge)
+\node[font=\Large, text=txt] at ({(\fvX+\cs+\outX)/2}, {-3.5*\cs}) {$=$};
 
 % ── Vertical Λf̃ (right of matrix) ───────────────────────────────
 \begin{scope}[shift={(\outX, 0)}]
@@ -199,7 +258,7 @@
   \foreach \i in {0,1}{\fill[m2, opacity=0.50] (0, {-(7+\i)*\cs}) rectangle ++(\cs,\cs);}
   \draw[gray!50, thin] (0,\cs) grid[step=\cs] (\cs, {-8*\cs});
   \draw[gray!70] (0,\cs) rectangle (\cs, {-8*\cs});
-  \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\Lambda\tilde{\mathbf{f}}$};
+  \node[font=\normalsize, text=txt, above=3pt] at (0.5*\cs, \cs) {$\Lambda(r)\tilde{\mathbf{f}}$};
 \end{scope}
 
 \end{tikzpicture}

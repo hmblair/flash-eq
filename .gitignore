@@ -24,6 +24,7 @@ debug_sizes*.py
 *.fdb_latexmk
 *.fls
 *.synctex.gz
+*.png
 .rex.toml
 scratch/
 figures/

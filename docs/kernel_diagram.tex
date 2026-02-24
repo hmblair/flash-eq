@@ -29,62 +29,45 @@
 \def\fvX{-0.95}
 \pgfmathsetmacro{\outX}{\matR+0.55}
 
-% Radial weight table dimensions
+% Radial weight table dimensions (3 summary blocks)
 \pgfmathsetmacro{\matCenter}{\matX+\C}
-\def\tblN{19}
-\pgfmathsetmacro{\tblW}{\tblN*\cs}
-\pgfmathsetmacro{\tblX}{\matCenter-\tblW/2}
+\def\tblGap{0.15}  % gap between blocks
+\def\bW{1.2}       % block width
+\pgfmathsetmacro{\tblTotalW}{3*\bW+2*\tblGap}
+\pgfmathsetmacro{\tblX}{\matCenter-\tblTotalW/2}
 \pgfmathsetmacro{\tblY}{\cs+1.2}
 
-% ── Radial weight table (single row) ─────────────────────────────
+% ── Radial weight table (3 summary blocks) ───────────────────────
 \begin{scope}[shift={(\tblX, \tblY)}]
-  % m=0: 9 purple cells
-  \foreach \i in {0,...,8}{\fill[m0, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
-  % m=1: 8 gold cells
-  \foreach \i in {9,...,16}{\fill[m1, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
-  % m=2: 2 green cells
-  \foreach \i in {17,18}{\fill[m2, opacity=0.50] ({\i*\cs}, 0) rectangle ++(\cs, \cs);}
-  % Grid and border
-  \draw[gray!50, thin] (0,0) grid[step=\cs] ({\tblW}, \cs);
-  \draw[gray!70] (0,0) rectangle ({\tblW}, \cs);
-  % Group separators
-  \draw[gray!70, semithick] ({9*\cs}, 0) -- ({9*\cs}, \cs);
-  \draw[gray!70, semithick] ({17*\cs}, 0) -- ({17*\cs}, \cs);
-  % m=0 labels
-  \node[font=\tiny, m0!55!black] at (0.5*\cs, 0.5*\cs) {$\lambda_{00}$};
-  \node[font=\tiny, m0!55!black] at (1.5*\cs, 0.5*\cs) {$\lambda_{01}$};
-  \node[font=\tiny, m0!55!black] at (2.5*\cs, 0.5*\cs) {$\lambda_{02}$};
-  \node[font=\tiny, m0!55!black] at (3.5*\cs, 0.5*\cs) {$\lambda_{10}$};
-  \node[font=\tiny, m0!55!black] at (4.5*\cs, 0.5*\cs) {$\lambda_{11}$};
-  \node[font=\tiny, m0!55!black] at (5.5*\cs, 0.5*\cs) {$\lambda_{12}$};
-  \node[font=\tiny, m0!55!black] at (6.5*\cs, 0.5*\cs) {$\lambda_{20}$};
-  \node[font=\tiny, m0!55!black] at (7.5*\cs, 0.5*\cs) {$\lambda_{21}$};
-  \node[font=\tiny, m0!55!black] at (8.5*\cs, 0.5*\cs) {$\lambda_{22}$};
-  % m=1 labels (a's then b's)
-  \node[font=\tiny, m1!55!black] at (9.5*\cs, 0.5*\cs) {$a_{11}$};
-  \node[font=\tiny, m1!55!black] at (10.5*\cs, 0.5*\cs) {$a_{12}$};
-  \node[font=\tiny, m1!55!black] at (11.5*\cs, 0.5*\cs) {$a_{21}$};
-  \node[font=\tiny, m1!55!black] at (12.5*\cs, 0.5*\cs) {$a_{22}$};
-  \node[font=\tiny, m1!55!black] at (13.5*\cs, 0.5*\cs) {$b_{11}$};
-  \node[font=\tiny, m1!55!black] at (14.5*\cs, 0.5*\cs) {$b_{12}$};
-  \node[font=\tiny, m1!55!black] at (15.5*\cs, 0.5*\cs) {$b_{21}$};
-  \node[font=\tiny, m1!55!black] at (16.5*\cs, 0.5*\cs) {$b_{22}$};
-  % m=2 labels
-  \node[font=\tiny, m2!55!black] at (17.5*\cs, 0.5*\cs) {$a_{22}$};
-  \node[font=\tiny, m2!55!black] at (18.5*\cs, 0.5*\cs) {$b_{22}$};
+  % m=0 block
+  \fill[m0, opacity=0.50] (0, 0) rectangle (\bW, \cs);
+  \draw[m0!50!black, semithick] (0, 0) rectangle (\bW, \cs);
+  \node[font=\scriptsize, m0!55!black] at ({0.5*\bW}, 0.5*\cs) {$9\;\lambda$};
+  % m=1 block
+  \pgfmathsetmacro{\bOneX}{\bW+\tblGap}
+  \fill[m1, opacity=0.50] (\bOneX, 0) rectangle ({\bOneX+\bW}, \cs);
+  \draw[m1!50!black, semithick] (\bOneX, 0) rectangle ({\bOneX+\bW}, \cs);
+  \node[font=\scriptsize, m1!55!black] at ({\bOneX+0.5*\bW}, 0.5*\cs) {$4a,4b$};
+  % m=2 block
+  \pgfmathsetmacro{\bTwoX}{2*\bW+2*\tblGap}
+  \fill[m2, opacity=0.50] (\bTwoX, 0) rectangle ({\bTwoX+\bW}, \cs);
+  \draw[m2!50!black, semithick] (\bTwoX, 0) rectangle ({\bTwoX+\bW}, \cs);
+  \node[font=\scriptsize, m2!55!black] at ({\bTwoX+0.5*\bW}, 0.5*\cs) {$1a,1b$};
   % Label
-  \node[font=\normalsize, text=txt, above=3pt] at ({9.5*\cs}, \cs) {$\mathbf{w}(r)$};
+  \node[font=\normalsize, text=txt, above=3pt] at ({0.5*\tblTotalW}, \cs) {$\mathbf{w}(r)$};
 \end{scope}
 
-% Curved arrows from table groups to corresponding matrix blocks
+% Curved arrows from table blocks to corresponding matrix blocks
 \draw[->, thick, m0!70!black]
-  ({\tblX + 4.5*\cs}, \tblY) to[out=-80, in=120, looseness=0.6]
+  ({\tblX + 0.5*\bW}, \tblY) to[out=-80, in=120, looseness=0.6]
   ({\matX + 1.5*\cs}, \cs);
+\pgfmathsetmacro{\bOneMid}{\tblX+\bW+\tblGap+0.5*\bW}
 \draw[->, thick, m1!70!black]
-  ({\tblX + 12.5*\cs}, \tblY) to[out=-80, in=90, looseness=0.6]
+  (\bOneMid, \tblY) to[out=-80, in=90, looseness=0.6]
   ({\matX + 5*\cs}, {-2*\cs});
+\pgfmathsetmacro{\bTwoMid}{\tblX+2*\bW+2*\tblGap+0.5*\bW}
 \draw[->, thick, m2!70!black]
-  ({\tblX + 17.5*\cs}, \tblY) to[out=-100, in=90, looseness=0.6]
+  (\bTwoMid, \tblY) to[out=-80, in=90, looseness=0.6]
   ({\matX + 8*\cs}, {-6*\cs});
 
 % ── Vertical f̃ (left of matrix) ─────────────────────────────────

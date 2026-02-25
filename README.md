@@ -353,6 +353,21 @@ instead of calling the original `get_basis()` / `update_basis_with_fused()`.
 
 Self-interaction and pooling are preserved from the original `ConvSE3`.
 
+### Patch benchmark
+
+Single `ConvSE3` layer (FULL fuse, C=32, 500 bins) on NVIDIA H100. Max interpolation error < 7e-4 across all configs.
+
+| Config | SE(3)-T Memory | Patched Memory | Savings | SE(3)-T Time | Patched Time | Speedup |
+|--------|---------------|----------------|---------|-------------|-------------|---------|
+| L=2, 4K edges | 485 MB | 169 MB | 2.9x | 0.71 ms | 1.03 ms | 0.69x |
+| L=2, 16K edges | 1.8 GB | 459 MB | 4.0x | 2.20 ms | 2.41 ms | 0.91x |
+| L=2, 65K edges | 7.1 GB | 1.6 GB | 4.5x | 8.87 ms | 7.70 ms | 1.15x |
+| L=3, 4K edges | 1.4 GB | 476 MB | 2.9x | 1.48 ms | 1.42 ms | 1.04x |
+| L=3, 16K edges | 5.3 GB | 1.5 GB | 3.6x | 5.42 ms | 3.86 ms | 1.40x |
+| L=3, 65K edges | 21.0 GB | 5.6 GB | 3.8x | 21.80 ms | 13.39 ms | 1.63x |
+
+Memory savings grow with edge count and angular momentum. Runtime improves at larger scales where the custom kernel's O(L^2) complexity outweighs cuBLAS overhead.
+
 ## Theory
 
 See [`docs/theory.tex`](docs/theory.tex) for the mathematical details.

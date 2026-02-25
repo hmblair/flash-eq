@@ -293,6 +293,66 @@ Comparison with SE3-Transformer on NVIDIA H100 (80GB). Forward + backward pass w
 
 Note: Flash-eq is optimized for high angular momentum (L≥4) and large edge counts. At low L with FP16, SE3-Transformer's Tensor Core utilization gives it an advantage. Improving FP16 performance at low L is an active area of development.
 
+## Patching NVIDIA SE(3)-Transformers
+
+Already have a trained NVIDIA SE(3)-Transformer? `flash_eq.patch` converts it
+in-place for memory-efficient inference — no retraining required.
+
+```python
+from flash_eq import patch
+
+model = load_trained_nvidia_model()  # any nn.Module containing ConvSE3 layers
+model = patch(model, num_bins=500, max_dist=10.0)
+
+# Use exactly as before — same inputs, same outputs
+output = model(graph, node_feats)
+```
+
+### What it does
+
+`patch()` walks the module tree, finds all `ConvSE3` layers, and replaces each
+with a `PatchedConvSE3` that uses flash-eq's block-diagonal CUDA kernel. The
+per-edge Clebsch-Gordan basis tensors (the dominant memory cost) are replaced
+with compact Wigner-D matrices, reducing memory from O(E * L^4) to O(E * L^2).
+
+The conversion is exact up to distance-binning interpolation error (~1e-4 with
+500 bins in float64). The patched model produces numerically identical outputs
+to the original.
+
+If an `SE3Transformer` or `SE3TransformerPooled` module is found, its `forward`
+method is also patched to compute Wigner-D matrices from `graph.edata['rel_pos']`
+instead of calling the original `get_basis()` / `update_basis_with_fused()`.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_bins` | 500 | Distance bins for radial weight tables. More bins = higher accuracy. |
+| `min_dist` | 0.0 | Minimum distance for binning. |
+| `max_dist` | 10.0 | Maximum distance. Edges beyond this use the last bin (extrapolation). |
+| `dtype` | `torch.float64` | Precision for weight conversion. Tables are stored in the model's original dtype. |
+
+### Requirements
+
+- The model must contain `ConvSE3` layers from NVIDIA's SE(3)-Transformer
+- Radial MLPs must be distance-only (`edge_dim=1`); additional invariant edge
+  features are not supported
+- All degrees within a fiber must have the same channel count
+- DGL is still required for attention and pooling operations
+- **Inference only** — patched layers do not support training. For training,
+  use flash-eq's native layers directly.
+
+### Supported configurations
+
+| Fuse level | Supported |
+|-----------|-----------|
+| `NONE` | Yes |
+| `PARTIAL` (by output degree) | Yes |
+| `FULL` | Yes |
+| `PARTIAL` (by input degree) | No |
+
+Self-interaction and pooling are preserved from the original `ConvSE3`.
+
 ## Theory
 
 See [`docs/theory.tex`](docs/theory.tex) for the mathematical details.

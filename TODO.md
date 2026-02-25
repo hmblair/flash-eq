@@ -30,10 +30,6 @@ cuBLAS GEMMs with AMP use Tensor Cores efficiently, giving SE3-Transformer a sig
 
 **Note:** Flash-eq still provides 5-40x memory savings across all configurations, enabling larger batch sizes and models that would otherwise OOM.
 
-## FP16 Numerical Stability in Wigner-D Computation
-
-**RESOLVED:** FP16 inputs are now promoted to FP32 for `matrix_exp`, then cast back. The `_apply` override keeps generators in FP32 when `.half()` is called, while FP64 inputs use FP64 generators for full precision. See commit `2ce4693`.
-
 ## Integrate Separable S² Activation into Transformer Block
 
 The current `EquivariantTransformerBlock` uses `EquivariantGating` for nonlinearity, but EquiformerV2 demonstrates that **Separable S² activation** improves force MAE by ~5% on OC20 S2EF.
@@ -179,6 +175,36 @@ This suggests Flash-EQ's block-diagonal structure cannot represent the same func
 
 5. **Sparse conversion matrix** - Investigate whether a sparse/structured transformation exists between the two weight spaces that we missed.
 
+## Patch Support for RFdiffusion (edge_dim > 1)
+
+### Status: Blocked
+
+`flash_eq.patch` cannot currently be applied to [RFdiffusion](https://github.com/RosettaCommons/RFdiffusion) because its ConvSE3 layers use `edge_dim=33` (32 embedded pair features + 1 distance norm). The patch requires `edge_dim=1` (distance only) since it precomputes radial weights at fixed distance bins — you can't bin a 33-dimensional input.
+
+### RFdiffusion SE3 configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Fuse level | PARTIAL |
+| Hidden fiber | degrees [0,1,2], 32 channels each |
+| Input fiber | {0: 32, 1: 3} |
+| Output fiber | {0: 16, 1: 2} |
+| Edge fiber | {0: 32} |
+| Edge dim | 33 (pair features + distance) |
+| Self-interaction | Yes (final layer) |
+| Graph | k-NN (k=64) or full, `edata['rel_pos']` only |
+| Custom modifications | Parameter initialization only, no architectural changes |
+
+Everything except `edge_dim` is compatible with the current patch.
+
+### Options
+
+1. **Hybrid patch**: Replace CG basis with Wigner-D but keep the radial MLP live at inference time. This saves the CG basis memory (the O(E × L^4) term) but not the radial weight tensor (the O(E × C² × freq) term from FULL/PARTIAL fuse). For RFdiffusion at lmax=2, C=32, the CG basis is modest so savings would be limited.
+
+2. **Factor the edge features**: If the 32-dim pair features cluster into a small discrete set, build separate tables per cluster. Unlikely to work well — pair features are continuous embeddings from MSA coevolution.
+
+3. **Distill to distance-only**: Fine-tune a distance-only radial MLP to match the original's outputs, then patch. Loses information from pair features but may be acceptable for some applications.
+
 ## Training Validation
 
 ### Denoising Training Script
@@ -215,26 +241,6 @@ Create a minimal training script to verify the model can learn, using ciffy for 
 
 ## Kernel Optimization and Cleanup Opportunities
 
-  ### Completed
-
-  1. ~~Redundant Block Parameter Computation~~ - DONE
-     - Added `load_block_params()` that loads precomputed BlockParams from CPU
-     - BlockParams struct bundles m, n_in, n_out, in_off, out_off, w_off
-
-  2. ~~Inefficient get_l_for_index() Loop~~ - DONE
-     - Added `get_l_for_index_fast()` using precomputed lookup table via `__ldg()`
-
-  5. ~~Parameter Bloat~~ - DONE
-     - Added `BlockParams` struct (line 113) and `DimInfo` struct (line 126)
-
-  8. ~~Redundant Scaling Computation~~ - DONE
-     - `scale_shared[]` precomputes ipowf(sh_weight, l_total) for all (i,o) pairs
-     - `precompute_scales()` and `precompute_scales_with_l()` helper functions
-
-  10. ~~Branch Divergence in if (l_total > 0)~~ - FIXED
-      - The conditional was redundant: ipowf(x, 0) returns 1.0f anyway
-      - Removed the check entirely, simplifying the code
-
   ### Partially Addressed
 
   4. Code Duplication Between m=0 and m>0 Kernels - PARTIALLY ADDRESSED
@@ -242,20 +248,6 @@ Create a minimal training script to verify the model can learn, using ciffy for 
      - Extracted shared helpers: EdgeState, setup_edge(), precompute_scales(), precompute_scales_with_l()
      - Kernels remain separate due to fundamentally different inner loops (real vs complex)
      - Full template unification would require if constexpr in 4-5 places with marginal benefit
-
-  ### Not Worth Fixing
-
-  3. ~~Duplicate sh_weight Computation~~ - NOT WORTH FIXING
-     - sh_weight = dist / (dist + sh_scale) is 1 div + 1 add per edge
-     - This is completely hidden by memory latency (happens while waiting for global loads)
-     - Precomputing would add kernel launch overhead + memory bandwidth for store/load
-     - Recomputation is actually faster than memory access
-
-  6. ~~Texture Memory for Radial Table~~ - INVESTIGATED, NOT BENEFICIAL
-     - **Result:** Texture memory adds 5-7% overhead vs __ldg()
-     - L2 cache is already efficient for our deterministic strided access pattern
-     - Texture cache designed for 2D/3D spatial locality doesn't match our 1D access
-     - Code left with `USE_TEXTURE_MEMORY 0` for reference
 
   ### Remaining (Low Priority)
 

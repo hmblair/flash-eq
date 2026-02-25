@@ -172,12 +172,18 @@ def _get_cuda_module():
             "This may indicate a corrupted installation."
         )
 
+    # Use a stable build directory next to the source so compiled kernels
+    # persist across SLURM jobs (default /tmp is per-node and ephemeral).
+    build_dir = csrc_dir / "build"
+    build_dir.mkdir(exist_ok=True)
+
     logger.info(f"JIT compiling CUDA kernel from {kernel_path}")
 
     try:
         _cuda_module = load(
             name="block_diagonal_cuda",
             sources=[str(kernel_path)],
+            build_directory=str(build_dir),
             verbose=True,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
         )

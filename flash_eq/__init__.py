@@ -34,6 +34,7 @@ from .layers import (
 )
 from .spherical import S2Grid, real_spherical_harmonics, lebedev_grid
 from .cuda import CUDANotAvailableError
+from .patch import patch
 
 __all__ = [
     # Representations
@@ -72,6 +73,8 @@ __all__ = [
     "lebedev_grid",
     # Exceptions
     "CUDANotAvailableError",
+    # Patching
+    "patch",
 ]
 
 try:

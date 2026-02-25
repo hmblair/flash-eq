@@ -25,6 +25,9 @@ Transformer:
     - EquivariantTransformerBlock: Single transformer block
     - EquivariantTransformer: Full transformer stack
 
+Encoding:
+    - SequencePositionEncoding: Relative sequence distance encoding for edges
+
 Author: Hamish M. Blair <hmblair@stanford.edu>
 """
 from .linear import EquivariantEdgewiseLinear, EquivariantLinear
@@ -35,6 +38,7 @@ from .gating import EquivariantGating
 from .s2_activation import S2Activation, SeparableS2Activation
 from .transformer import EquivariantTransformerBlock, EquivariantTransformer
 from .radial import RadialBasisFunctions, RadialMLP, SeparableRadialNet
+from .sequence_encoding import SequencePositionEncoding
 
 __all__ = [
     # Linear
@@ -61,4 +65,6 @@ __all__ = [
     "RadialBasisFunctions",
     "RadialMLP",
     "SeparableRadialNet",
+    # Sequence encoding
+    "SequencePositionEncoding",
 ]

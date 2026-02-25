@@ -31,6 +31,7 @@ from .layers import (
     SeparableS2Activation,
     EquivariantTransformerBlock,
     EquivariantTransformer,
+    SequencePositionEncoding,
 )
 from .spherical import S2Grid, real_spherical_harmonics, lebedev_grid
 from .cuda import CUDANotAvailableError
@@ -67,6 +68,8 @@ __all__ = [
     "RadialBasisFunctions",
     "RadialMLP",
     "SeparableRadialNet",
+    # Encoding
+    "SequencePositionEncoding",
     # Spherical utilities
     "S2Grid",
     "real_spherical_harmonics",

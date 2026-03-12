@@ -1,9 +1,9 @@
 """
-Benchmark: NVIDIA ConvSE3 vs flash-eq PatchedConvSE3.
+Benchmark: NVIDIA SE(3)-Transformer vs flash-eq patched SE(3)-Transformer.
 
-Runs the NVIDIA layer, patches it, re-runs, then compares outputs,
-timing, and peak GPU memory. Demonstrates that the patch produces
-identical outputs while reducing memory.
+Builds a full SE(3)-Transformer (attention blocks + convolutions + norms),
+patches it with flash-eq, and compares the full forward pass in terms of
+timing and peak GPU memory.
 
 Usage:
     python benchmarks/benchmark_patch.py
@@ -40,11 +40,50 @@ def _mock_copy_e_sum(graph, edge_features):
     return out
 
 
+def _mock_e_dot_v(graph, edge_features, node_features):
+    """Mock dgl.ops.e_dot_v: dot product of edge features with dst node features."""
+    _, dst = graph.edges()
+    dst_feats = node_features[dst]
+    return (edge_features * dst_feats).sum(dim=-1, keepdim=True)
+
+
+def _mock_edge_softmax(graph, edge_scores):
+    """Mock dgl.ops.edge_softmax: per-destination-node softmax over incoming edges."""
+    _, dst = graph.edges()
+    num_nodes = graph.num_nodes()
+    # Compute max per destination for numerical stability
+    max_scores = torch.full(
+        (num_nodes, *edge_scores.shape[1:]),
+        float("-inf"), device=edge_scores.device, dtype=edge_scores.dtype,
+    )
+    max_scores.scatter_reduce_(0, dst.view(-1, *([1] * (edge_scores.dim() - 1))).expand_as(edge_scores),
+                                edge_scores, reduce="amax", include_self=False)
+    shifted = edge_scores - max_scores[dst]
+    exp_scores = shifted.exp()
+    sum_exp = torch.zeros(
+        num_nodes, *edge_scores.shape[1:],
+        device=edge_scores.device, dtype=edge_scores.dtype,
+    )
+    sum_exp.index_add_(0, dst, exp_scores)
+    return exp_scores / sum_exp[dst].clamp(min=1e-12)
+
+
 _dgl_ops.copy_e_sum = _mock_copy_e_sum
+_dgl_ops.e_dot_v = _mock_e_dot_v
+_dgl_ops.edge_softmax = _mock_edge_softmax
 _dgl_mock.ops = _dgl_ops
 _dgl_mock.graph = lambda src_dst: None
 sys.modules["dgl"] = _dgl_mock
 sys.modules["dgl.ops"] = _dgl_ops
+
+# Mock dgl.nn.pytorch for pooling imports
+_dgl_nn = types.ModuleType("dgl.nn")
+_dgl_nn_pytorch = types.ModuleType("dgl.nn.pytorch")
+_dgl_nn_pytorch.AvgPooling = type("AvgPooling", (), {})
+_dgl_nn_pytorch.MaxPooling = type("MaxPooling", (), {})
+_dgl_mock.nn = _dgl_nn
+sys.modules["dgl.nn"] = _dgl_nn
+sys.modules["dgl.nn.pytorch"] = _dgl_nn_pytorch
 
 
 class MockGraph:
@@ -99,117 +138,43 @@ _conv_mod = _load_module(
     "se3_transformer.model.layers.convolution",
     _se3t / "model" / "layers" / "convolution.py",
 )
+_linear_mod = _load_module(
+    "se3_transformer.model.layers.linear",
+    _se3t / "model" / "layers" / "linear.py",
+)
+_norm_mod = _load_module(
+    "se3_transformer.model.layers.norm",
+    _se3t / "model" / "layers" / "norm.py",
+)
+_attention_mod = _load_module(
+    "se3_transformer.model.layers.attention",
+    _se3t / "model" / "layers" / "attention.py",
+)
+_pooling_mod = _load_module(
+    "se3_transformer.model.layers.pooling",
+    _se3t / "model" / "layers" / "pooling.py",
+)
+_transformer_mod = _load_module(
+    "se3_transformer.model.transformer",
+    _se3t / "model" / "transformer.py",
+)
 
-ConvSE3 = _conv_mod.ConvSE3
-ConvSE3FuseLevel = _conv_mod.ConvSE3FuseLevel
+SE3Transformer = _transformer_mod.SE3Transformer
 Fiber = _fiber_mod.Fiber
-degree_to_dim = _runtime_utils.degree_to_dim
+ConvSE3FuseLevel = _conv_mod.ConvSE3FuseLevel
 
 import copy
 
-from flash_eq import Repr, WignerDBasis
 from flash_eq.patch import patch
 from flash_eq.patch._convention import apply_convention_patches
+
+# Apply convention patches once
+apply_convention_patches(_conv_mod.ConvSE3)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def compute_nvidia_basis(directions, max_degree, dtype, fully_fused=True):
-    """Compute NVIDIA CG basis with optional full fusing."""
-    basis = _basis_mod.get_basis(
-        directions.float(), max_degree=max_degree,
-        use_pad_trick=False, amp=False,
-    )
-    basis = {k: v.to(dtype) for k, v in basis.items()}
-
-    if not fully_fused:
-        return basis
-
-    # Fuse basis for FULL fuse level (replicate update_basis_with_fused)
-    num_edges = basis["0,0"].shape[0]
-    device = basis["0,0"].device
-    sum_dim = sum(degree_to_dim(d) for d in range(max_degree + 1))
-
-    # Per-output-degree fused basis (needed as intermediate)
-    for d_out in range(max_degree + 1):
-        sum_freq = sum(degree_to_dim(min(d, d_out)) for d in range(max_degree + 1))
-        basis_fused = torch.zeros(
-            num_edges, sum_dim, sum_freq, degree_to_dim(d_out),
-            device=device, dtype=dtype,
-        )
-        acc_d, acc_f = 0, 0
-        for d_in in range(max_degree + 1):
-            dim_in = degree_to_dim(d_in)
-            dim_out = degree_to_dim(d_out)
-            dim_freq = degree_to_dim(min(d_out, d_in))
-            basis_fused[
-                :, acc_d:acc_d + dim_in, acc_f:acc_f + dim_freq, :dim_out
-            ] = basis[f"{d_in},{d_out}"][:, :, :, :dim_out]
-            acc_d += dim_in
-            acc_f += dim_freq
-        basis[f"out{d_out}_fused"] = basis_fused
-
-    # Fully fused basis
-    sum_freq = sum(
-        sum(degree_to_dim(min(d_in, d_out)) for d_in in range(max_degree + 1))
-        for d_out in range(max_degree + 1)
-    )
-    basis_fused = torch.zeros(
-        num_edges, sum_dim, sum_freq, sum_dim, device=device, dtype=dtype,
-    )
-    acc_d, acc_f = 0, 0
-    for d_out in range(max_degree + 1):
-        b = basis[f"out{d_out}_fused"]
-        dim_out = degree_to_dim(d_out)
-        basis_fused[
-            :, :, acc_f:acc_f + b.shape[2], acc_d:acc_d + dim_out
-        ] = b[:, :, :, :dim_out]
-        acc_f += b.shape[2]
-        acc_d += dim_out
-    basis["fully_fused"] = basis_fused
-
-    # Clean up intermediate keys
-    del basis["0,0"]
-
-    return basis
-
-
-unfuse_features = _runtime_utils.unfuse_features
-
-
-def nvidia_forward(conv, features_dict, distances, basis, lvals,
-                   node_feats=None, dst=None):
-    """NVIDIA ConvSE3 forward (FULL or NONE fuse, no DGL), including self-interaction."""
-    edge_feats = distances.unsqueeze(-1)
-
-    if conv.used_fuse_level == ConvSE3FuseLevel.FULL:
-        # FULL fuse: single fused conv
-        in_fused = torch.cat([features_dict[str(d)] for d in lvals], dim=-1)
-        out_fused = conv.conv(in_fused, edge_feats, basis["fully_fused"])
-        out = unfuse_features(out_fused, lvals)
-    else:
-        # NONE fuse: per-pair loop
-        out = {}
-        for d_out in lvals:
-            acc = 0
-            for d_in in conv.fiber_in.degrees:
-                key = f"{d_in},{d_out}"
-                basis_used = basis.get(key)
-                result = conv.conv[key](features_dict[str(d_in)], edge_feats, basis_used)
-                if basis_used is not None:
-                    result = result[..., :degree_to_dim(d_out)]
-                acc = acc + result
-            out[str(d_out)] = acc
-
-    if conv.self_interaction and hasattr(conv, "to_kernel_self"):
-        for d in lvals:
-            if str(d) in conv.to_kernel_self:
-                out[str(d)] = out[str(d)] + conv.to_kernel_self[str(d)] @ node_feats[str(d)][dst]
-
-    return out
-
 
 def gpu_timer(fn, warmup=3, repeats=10):
     """Time a GPU function with CUDA events."""
@@ -230,7 +195,6 @@ def gpu_timer(fn, warmup=3, repeats=10):
 
 def peak_memory_mb(fn, repeats=3):
     """Measure peak GPU memory of a function (MB)."""
-    # Warmup
     fn()
     torch.cuda.synchronize()
     peaks = []
@@ -247,22 +211,28 @@ def peak_memory_mb(fn, repeats=3):
 # Benchmark
 # ---------------------------------------------------------------------------
 
-def benchmark_config(lmax, C, num_edges, num_nodes, num_bins=500, max_dist=10.0):
-    """Run one benchmark configuration."""
+def benchmark_config(lmax, C, num_edges, num_nodes, num_layers=1,
+                     num_heads=4, channels_div=2, num_bins=500, max_dist=10.0):
+    """Run one benchmark configuration with a full SE(3)-Transformer."""
     device = torch.device("cuda")
     dtype = torch.float32
 
-    lvals = list(range(lmax + 1))
-    dim = sum(2 * l + 1 for l in lvals)
-
-    apply_convention_patches(ConvSE3)
     torch.manual_seed(42)
 
     fiber = Fiber.create(lmax + 1, C)
-    conv = ConvSE3(
-        fiber_in=fiber, fiber_out=fiber, fiber_edge=Fiber({}),
-        pool=False, self_interaction=True, max_degree=lmax,
-        fuse_level=ConvSE3FuseLevel.FULL,
+
+    # Build full SE(3)-Transformer
+    model = SE3Transformer(
+        num_layers=num_layers,
+        fiber_in=fiber,
+        fiber_hidden=fiber,
+        fiber_out=fiber,
+        fiber_edge=Fiber({}),
+        num_heads=num_heads,
+        channels_div=channels_div,
+        norm=True,
+        use_layer_norm=False,
+        tensor_cores=True,  # FULL fuse level
     ).to(device).to(dtype)
 
     # Data
@@ -279,64 +249,44 @@ def benchmark_config(lmax, C, num_edges, num_nodes, num_bins=500, max_dist=10.0)
             num_nodes, c, 2 * d + 1, device=device, dtype=dtype
         )
 
-    features_dict = {str(d): node_feats[str(d)][src] for d in lvals}
+    g = MockGraph(src, dst, num_nodes, rel_pos)
 
     # ---- NVIDIA forward ----
-    basis = compute_nvidia_basis(directions, lmax, dtype, fully_fused=True)
-
     def run_nvidia():
         with torch.no_grad():
-            return nvidia_forward(conv, features_dict, distances, basis, lvals,
-                                  node_feats, dst)
+            return model(g, node_feats)
 
     # Capture output
     with torch.no_grad():
-        nvidia_out = nvidia_forward(conv, features_dict, distances, basis, lvals,
-                                    node_feats, dst)
-    nvidia_cat = torch.cat([nvidia_out[str(d)] for d in lvals], dim=-1)
+        nvidia_out = model(g, node_feats)
 
-    # Measure NVIDIA
     nvidia_times = gpu_timer(run_nvidia)
-
-    # Memory: include basis storage
-    basis_mem = sum(v.numel() * v.element_size() for v in basis.values()) / 1024**2
     nvidia_peak = peak_memory_mb(run_nvidia)
 
-    # ---- Patch ----
-    wrapper = nn.Module()
-    wrapper.conv = copy.deepcopy(conv)
-    patch(wrapper, num_bins=num_bins, max_dist=max_dist)
-    patched = wrapper.conv
-
-    # Basis for patched forward
-    repr_obj = Repr(lvals=lvals, mult=1)
-    wigner = WignerDBasis([repr_obj]).to(device)
-    (M,) = wigner(directions)
-
-    g = MockGraph(src, dst, num_nodes, rel_pos)
-    patched_basis = {"_P": M, "_Q": M, "_distances": distances}
-    edge_feats = {"0": distances.unsqueeze(-1)[..., None]}
+    # ---- Patched forward ----
+    patched_model = copy.deepcopy(model)
+    patch(patched_model, num_bins=num_bins, max_dist=max_dist)
 
     def run_patched():
         with torch.no_grad():
-            return patched(node_feats, edge_feats, g, patched_basis)
+            return patched_model(g, node_feats)
 
     # Capture output
     with torch.no_grad():
-        patched_out = patched(node_feats, edge_feats, g, patched_basis)
-    patched_cat = torch.cat([patched_out[str(d)] for d in lvals], dim=-1)
+        patched_out = patched_model(g, node_feats)
 
-    # Measure patched
     patched_times = gpu_timer(run_patched)
-    wigner_mem = M.numel() * M.element_size() / 1024**2
     patched_peak = peak_memory_mb(run_patched)
 
-    # ---- Compare ----
+    # ---- Compare outputs ----
+    lvals = list(range(lmax + 1))
+    nvidia_cat = torch.cat([nvidia_out[str(d)] for d in lvals], dim=-1)
+    patched_cat = torch.cat([patched_out[str(d)] for d in lvals], dim=-1)
+
     max_err = (nvidia_cat - patched_cat).abs().max().item()
     mean_err = (nvidia_cat - patched_cat).abs().mean().item()
-    rel_err = max_err / nvidia_cat.abs().max().item()
+    rel_err = max_err / nvidia_cat.abs().max().item() if nvidia_cat.abs().max().item() > 0 else 0.0
 
-    # Per-degree errors
     degree_errors = {}
     for d in lvals:
         e = (nvidia_out[str(d)] - patched_out[str(d)]).abs().max().item()
@@ -346,12 +296,10 @@ def benchmark_config(lmax, C, num_edges, num_nodes, num_bins=500, max_dist=10.0)
         "lmax": lmax,
         "C": C,
         "num_edges": num_edges,
-        "dim": dim,
+        "num_layers": num_layers,
         "nvidia_time_ms": nvidia_times.median().item(),
         "patched_time_ms": patched_times.median().item(),
         "speedup": nvidia_times.median().item() / patched_times.median().item(),
-        "basis_mem_mb": basis_mem,
-        "wigner_mem_mb": wigner_mem,
         "nvidia_peak_mb": nvidia_peak,
         "patched_peak_mb": patched_peak,
         "mem_ratio": nvidia_peak / patched_peak if patched_peak > 0 else float("inf"),
@@ -402,10 +350,6 @@ def main():
         print(f"    Speedup: {r['speedup']:.2f}x")
 
         # Memory
-        print(f"\n  Basis memory:")
-        print(f"    NVIDIA CG basis:     {r['basis_mem_mb']:8.2f} MB")
-        print(f"    Flash-eq Wigner-D:   {r['wigner_mem_mb']:8.2f} MB")
-        print(f"    Ratio:               {r['basis_mem_mb'] / r['wigner_mem_mb']:.1f}x")
         print(f"\n  Peak GPU memory (forward pass):")
         print(f"    NVIDIA:  {r['nvidia_peak_mb']:8.1f} MB")
         print(f"    Patched: {r['patched_peak_mb']:8.1f} MB")

@@ -35,12 +35,14 @@ try:
                     compiled_archs.append(f"{major}.{minor}")
         else:
             nvcc_args.extend([
-                "-gencode=arch=compute_80,code=sm_80",  # A100
-                "-gencode=arch=compute_89,code=sm_89",  # L40S, RTX 4090
-                "-gencode=arch=compute_90,code=sm_90",  # H100
-                "-gencode=arch=compute_90,code=compute_90",  # PTX for future GPUs
+                "-gencode=arch=compute_80,code=sm_80",   # A100
+                "-gencode=arch=compute_89,code=sm_89",   # L40S, RTX 4090
+                "-gencode=arch=compute_90,code=sm_90",   # H100
+                "-gencode=arch=compute_100,code=sm_100", # B100, B200
+                "-gencode=arch=compute_120,code=sm_120", # RTX 5090
+                "-gencode=arch=compute_120,code=compute_120",  # PTX for future GPUs
             ])
-            compiled_archs = ["8.0", "8.9", "9.0+PTX"]
+            compiled_archs = ["8.0", "8.9", "9.0", "10.0", "12.0+PTX"]
 
         write_build_info(compiled_archs)
 

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv venv && uv pip install ruff
+      - run: uv run ruff check flash_eq/ tests/
+
+  test-cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v4
+      - name: Install (CPU-only, no CUDA extension)
+        run: |
+          uv venv -p ${{ matrix.python-version }}
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -e ".[dev]"
+      - name: Run non-CUDA tests
+        run: uv run pytest tests/ -v -k "not cuda" --ignore=tests/test_patch.py
+
+  # GPU tests require a GitHub Team/Enterprise plan with larger runners,
+  # or a self-hosted runner with a CUDA GPU.
+  # To enable: create a GPU runner in your org settings, then update runs-on below.
+  #
+  # test-gpu:
+  #   runs-on: [self-hosted, gpu]  # or your org's GPU runner label
+  #   container:
+  #     image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+  #   strategy:
+  #     matrix:
+  #       python-version: ["3.10", "3.12"]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #     - name: Install
+  #       run: |
+  #         pip install uv
+  #         uv venv -p ${{ matrix.python-version }}
+  #         uv pip install -e ".[dev]"
+  #     - name: Run full test suite
+  #       run: uv run pytest tests/ -v

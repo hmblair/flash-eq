@@ -40,9 +40,8 @@ try:
                 "-gencode=arch=compute_90,code=sm_90",   # H100
                 "-gencode=arch=compute_100,code=sm_100", # B100, B200
                 "-gencode=arch=compute_120,code=sm_120", # RTX 5090
-                "-gencode=arch=compute_120,code=compute_120",  # PTX for future GPUs
             ])
-            compiled_archs = ["8.0", "8.9", "9.0", "10.0", "12.0+PTX"]
+            compiled_archs = ["8.0", "8.9", "9.0", "10.0", "12.0"]
 
         write_build_info(compiled_archs)
 
@@ -57,8 +56,9 @@ try:
             )
         )
         cmdclass["build_ext"] = BuildExtension
-except (ImportError, OSError):
-    pass
+except Exception as e:
+    import sys
+    print(f"WARNING: CUDA extension will not be built: {e}", file=sys.stderr)
 
 setup(
     name="flash-eq",

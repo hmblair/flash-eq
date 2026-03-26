@@ -44,7 +44,7 @@ jobs:
           for pyver in 3.10 3.11 3.12; do
             echo "::group::Building wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
-            python -m build --wheel --no-isolation
+            python setup.py bdist_wheel
             deactivate
             echo "::endgroup::"
           done

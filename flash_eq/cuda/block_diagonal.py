@@ -20,21 +20,15 @@ Optimizations:
 Supports FP32, FP64, and FP16.
 """
 
-import os
-import logging
 import torch
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..representations import ProductRepr
 
-logger = logging.getLogger(__name__)
-
 _cuda_module = None
-_cuda_available = None
 
 
 class CUDANotAvailableError(RuntimeError):
@@ -42,163 +36,36 @@ class CUDANotAvailableError(RuntimeError):
     pass
 
 
-def _check_cuda_available() -> None:
-    """Check if CUDA is available and raise a clear error if not."""
-    global _cuda_available
-
-    if _cuda_available is not None:
-        if not _cuda_available:
-            raise CUDANotAvailableError(
-                "flash-eq requires a CUDA-capable GPU. No CUDA device was detected.\n\n"
-                "To use flash-eq, you need:\n"
-                "  1. An NVIDIA GPU with CUDA support\n"
-                "  2. CUDA toolkit installed (set CUDA_HOME environment variable)\n"
-                "  3. PyTorch with CUDA support (torch.cuda.is_available() == True)\n\n"
-                "If you have a GPU but see this error, check:\n"
-                "  - CUDA_HOME is set correctly (current: {cuda_home})\n"
-                "  - nvidia-smi shows your GPU\n"
-                "  - PyTorch was installed with CUDA support".format(
-                    cuda_home=os.environ.get("CUDA_HOME", "not set")
-                )
-            )
-        return
-
-    if not torch.cuda.is_available():
-        _cuda_available = False
-        raise CUDANotAvailableError(
-            "flash-eq requires a CUDA-capable GPU. No CUDA device was detected.\n\n"
-            "To use flash-eq, you need:\n"
-            "  1. An NVIDIA GPU with CUDA support\n"
-            "  2. CUDA toolkit installed (set CUDA_HOME environment variable)\n"
-            "  3. PyTorch with CUDA support (torch.cuda.is_available() == True)\n\n"
-            "If you have a GPU but see this error, check:\n"
-            "  - CUDA_HOME is set correctly (current: {cuda_home})\n"
-            "  - nvidia-smi shows your GPU\n"
-            "  - PyTorch was installed with CUDA support".format(
-                cuda_home=os.environ.get("CUDA_HOME", "not set")
-            )
-        )
-
-    _cuda_available = True
-
-
-def _get_gpu_arch() -> str:
-    """Get the compute capability of the current GPU."""
-    major, minor = torch.cuda.get_device_capability()
-    return f"{major}.{minor}"
-
-
-def _arch_supported(gpu_arch: str, compiled_archs: list[str]) -> bool:
-    """Check if GPU architecture is supported by compiled binary."""
-    if gpu_arch in compiled_archs:
-        return True
-    # Check PTX forward compatibility (e.g., "9.0+PTX" supports 9.0+)
-    for arch in compiled_archs:
-        if arch.endswith("+PTX"):
-            base = arch.replace("+PTX", "")
-            if gpu_arch >= base:
-                return True
-    return False
-
-
 def _get_cuda_module():
-    """Load the CUDA extension (pre-built or JIT compiled)."""
+    """Load the pre-built CUDA extension."""
     global _cuda_module
-
-    _check_cuda_available()
 
     if _cuda_module is not None:
         return _cuda_module
 
-    # Check if pre-built extension supports this GPU
-    gpu_arch = _get_gpu_arch()
-    try:
-        from .._build_info import COMPILED_ARCHS
-        use_prebuilt = _arch_supported(gpu_arch, COMPILED_ARCHS)
-        if not use_prebuilt:
-            logger.info(
-                f"GPU arch {gpu_arch} not in pre-built archs {COMPILED_ARCHS}, "
-                "falling back to JIT compilation"
-            )
-    except ImportError:
-        # No build info = no pre-built extension
-        use_prebuilt = False
-
-    # Try to import pre-built extension if supported
-    if use_prebuilt:
-        try:
-            from .. import _block_diagonal_cuda
-            _cuda_module = _block_diagonal_cuda
-            logger.debug(f"Loaded pre-built CUDA extension for arch {gpu_arch}")
-            return _cuda_module
-        except ImportError:
-            logger.debug("Pre-built CUDA extension not found, falling back to JIT compilation")
-
-    # Fall back to JIT compilation
-    from torch.utils.cpp_extension import load
-
-    # Check CUDA_HOME
-    cuda_home = os.environ.get("CUDA_HOME")
-    if cuda_home is None:
-        # Try common CUDA installation paths
-        common_paths = [
-            "/usr/local/cuda",
-            "/usr/local/cuda-12",
-            "/usr/local/cuda-12.6",
-            "/usr/local/cuda-12.4",
-            "/usr/local/cuda-11",
-        ]
-        for path in common_paths:
-            if os.path.exists(path):
-                cuda_home = path
-                os.environ["CUDA_HOME"] = cuda_home
-                logger.info(f"CUDA_HOME not set, using detected path: {cuda_home}")
-                break
-
-    if cuda_home is None:
+    if not torch.cuda.is_available():
         raise CUDANotAvailableError(
-            "CUDA_HOME environment variable is not set and no CUDA installation "
-            "was found in common locations.\n\n"
-            "Please set CUDA_HOME to your CUDA toolkit installation, e.g.:\n"
-            "  export CUDA_HOME=/usr/local/cuda"
+            "flash-eq requires a CUDA-capable GPU. No CUDA device was detected.\n\n"
+            "To use flash-eq, you need:\n"
+            "  1. An NVIDIA GPU with CUDA support\n"
+            "  2. PyTorch with CUDA support (torch.cuda.is_available() == True)\n\n"
+            "If you have a GPU but see this error, check:\n"
+            "  - nvidia-smi shows your GPU\n"
+            "  - PyTorch was installed with CUDA support"
         )
-
-    csrc_dir = Path(__file__).parent / "csrc"
-    kernel_path = csrc_dir / "block_diagonal.cu"
-
-    if not kernel_path.exists():
-        raise FileNotFoundError(
-            f"CUDA kernel source not found at {kernel_path}. "
-            "This may indicate a corrupted installation."
-        )
-
-    # Use a stable build directory next to the source so compiled kernels
-    # persist across SLURM jobs (default /tmp is per-node and ephemeral).
-    build_dir = csrc_dir / "build"
-    build_dir.mkdir(exist_ok=True)
-
-    logger.info(f"JIT compiling CUDA kernel from {kernel_path}")
 
     try:
-        _cuda_module = load(
-            name="block_diagonal_cuda",
-            sources=[str(kernel_path)],
-            build_directory=str(build_dir),
-            verbose=True,
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
-        )
-        logger.info("CUDA kernel compiled successfully")
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to compile CUDA kernel.\n\n"
-            f"CUDA_HOME: {cuda_home}\n"
-            f"Kernel source: {kernel_path}\n\n"
-            f"Compilation error:\n{e}\n\n"
-            "Common fixes:\n"
-            "  - Ensure CUDA toolkit version matches PyTorch CUDA version\n"
-            "  - Check that nvcc is in your PATH\n"
-            "  - Verify you have write permissions to the torch extensions cache"
-        ) from e
+        from .. import _block_diagonal_cuda
+        _cuda_module = _block_diagonal_cuda
+    except ImportError:
+        raise ImportError(
+            "flash-eq CUDA extension is not installed.\n\n"
+            "Install from a pre-built wheel:\n"
+            "  pip install flash-eq --find-links "
+            "https://github.com/hmblair/flash-eq/releases/latest/download/\n\n"
+            "Or build from source (requires CUDA toolkit):\n"
+            "  CUDA_HOME=/usr/local/cuda pip install flash-eq"
+        ) from None
 
     return _cuda_module
 

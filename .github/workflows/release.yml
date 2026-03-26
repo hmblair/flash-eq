@@ -42,8 +42,8 @@ jobs:
           apt-get update && apt-get install -y python${{ matrix.python-version }} python${{ matrix.python-version }}-venv python${{ matrix.python-version }}-dev
           python${{ matrix.python-version }} -m venv /opt/venv
           . /opt/venv/bin/activate
-          pip install torch --index-url https://download.pytorch.org/whl/cu129
-          pip install build setuptools-scm wheel
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir build setuptools-scm wheel
       - name: Build wheel
         env:
           TORCH_CUDA_ARCH_LIST: "8.0;8.9;9.0;10.0;12.0+PTX"

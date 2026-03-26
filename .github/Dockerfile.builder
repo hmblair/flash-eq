@@ -17,5 +17,5 @@ RUN for pyver in 3.10 3.11 3.12; do \
     /opt/venv-$pyver/bin/pip install --no-cache-dir \
         torch --index-url https://download.pytorch.org/whl/cpu && \
     /opt/venv-$pyver/bin/pip install --no-cache-dir \
-        "setuptools>=61.0" build setuptools-scm wheel; \
+        "setuptools>=61.0,<82" build setuptools-scm wheel; \
     done

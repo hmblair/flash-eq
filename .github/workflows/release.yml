@@ -42,26 +42,13 @@ jobs:
           CUDA_HOME: /usr/local/cuda
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Verify CUDA extension will be built
-          . /opt/venv-3.12/bin/activate
-          python -c "
-          import setup  # import setup.py as module
-          " 2>&1 || true
-          python -c "
-          import os, torch
-          print('CUDA_HOME:', os.environ.get('CUDA_HOME'))
-          print('torch.cuda.is_available():', torch.cuda.is_available())
-          print('Has CUDAExtension:', hasattr(torch.utils.cpp_extension, 'CUDAExtension'))
-          "
-          deactivate
-
           for pyver in 3.10 3.11 3.12; do
             echo "::group::Building wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
-            python setup.py build_ext bdist_wheel
-            # Verify the wheel contains the .so
+            python setup.py bdist_wheel
+            # Verify the wheel contains the compiled .so
             whl=$(ls -t dist/*.whl | head -1)
-            python -c "import zipfile; z=zipfile.ZipFile('$whl'); sos=[f for f in z.namelist() if f.endswith('.so')]; print('Extensions in wheel:', sos); assert sos, 'No .so found in wheel!'"
+            python -c "import zipfile; z=zipfile.ZipFile('$whl'); sos=[f for f in z.namelist() if f.endswith('.so')]; print('Extensions:', sos); assert sos, 'No .so in wheel — CUDA extension was not compiled'"
             deactivate
             echo "::endgroup::"
           done

@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y \
     python3.12 python3.12-venv python3.12-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Pre-install torch CPU and build tools for each Python version
+# Pre-install torch (CUDA-enabled) and build tools for each Python version
 RUN for pyver in 3.10 3.11 3.12; do \
     python$pyver -m venv /opt/venv-$pyver && \
     /opt/venv-$pyver/bin/pip install --no-cache-dir \
-        torch --index-url https://download.pytorch.org/whl/cpu && \
+        torch --index-url https://download.pytorch.org/whl/cu129 && \
     /opt/venv-$pyver/bin/pip install --no-cache-dir \
         "setuptools>=61.0" setuptools-scm wheel; \
     done

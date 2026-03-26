@@ -1,5 +1,4 @@
 """Build script for flash-eq with CUDA extension."""
-import os
 import sys
 from setuptools import setup, find_packages
 
@@ -7,21 +6,19 @@ ext_modules = []
 cmdclass = {}
 
 try:
-    import torch
-    if torch.cuda.is_available() or os.environ.get("CUDA_HOME"):
-        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-        ext_modules.append(
-            CUDAExtension(
-                name="flash_eq._block_diagonal_cuda",
-                sources=["flash_eq/cuda/csrc/block_diagonal.cu"],
-                extra_compile_args={
-                    "cxx": ["-O3"],
-                    "nvcc": ["-O3", "--use_fast_math"],
-                },
-            )
+    ext_modules.append(
+        CUDAExtension(
+            name="flash_eq._block_diagonal_cuda",
+            sources=["flash_eq/cuda/csrc/block_diagonal.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math"],
+            },
         )
-        cmdclass["build_ext"] = BuildExtension
+    )
+    cmdclass["build_ext"] = BuildExtension
 except Exception as e:
     print(f"WARNING: CUDA extension will not be built: {e}", file=sys.stderr)
 

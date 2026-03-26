@@ -48,6 +48,7 @@ jobs:
         env:
           TORCH_CUDA_ARCH_LIST: "8.0;8.9;9.0;10.0;12.0+PTX"
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           . /opt/venv/bin/activate
           python -m build --wheel --no-isolation
       - uses: actions/upload-artifact@v4

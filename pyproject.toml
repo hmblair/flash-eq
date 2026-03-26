@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Fast, memory-efficient SO(3)-equivariant linear layers"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     { name = "Hamish M. Blair", email = "hmblair@stanford.edu" }
 ]

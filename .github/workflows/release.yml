@@ -50,7 +50,8 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           . /opt/venv/bin/activate
-          python -m build --wheel --no-isolation
+          VERSION=$(python -c "from setuptools_scm import get_version; print(get_version())")
+          SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" python -m build --wheel --no-isolation
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-py${{ matrix.python-version }}

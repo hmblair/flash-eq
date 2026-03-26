@@ -16,8 +16,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v4
-      - run: uv venv && uv pip install build
-      - run: uv run python -m build --sdist
+      - run: uv build --sdist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
@@ -29,18 +28,28 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     container:
-      image: pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel
+      image: nvidia/cuda:12.9.0-devel-ubuntu22.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Install Python and build deps
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update && apt-get install -y software-properties-common git
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update && apt-get install -y python${{ matrix.python-version }} python${{ matrix.python-version }}-venv python${{ matrix.python-version }}-dev
+          python${{ matrix.python-version }} -m venv /opt/venv
+          . /opt/venv/bin/activate
+          pip install torch --index-url https://download.pytorch.org/whl/cu129
+          pip install build setuptools-scm wheel
       - name: Build wheel
         env:
-          # Ampere, Ada Lovelace, Hopper, Blackwell datacenter, Blackwell consumer + PTX
           TORCH_CUDA_ARCH_LIST: "8.0;8.9;9.0;10.0;12.0+PTX"
         run: |
-          pip install build setuptools-scm wheel
-          python -m build --wheel
+          . /opt/venv/bin/activate
+          python -m build --wheel --no-isolation
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-py${{ matrix.python-version }}

@@ -1,0 +1,27 @@
+name: Builder Image
+
+on:
+  push:
+    paths:
+      - .github/Dockerfile.builder
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .github
+          file: .github/Dockerfile.builder
+          push: true
+          tags: ghcr.io/hmblair/flash-eq-builder:latest

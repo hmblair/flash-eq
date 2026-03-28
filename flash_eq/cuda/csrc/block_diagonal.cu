@@ -105,7 +105,10 @@ template <bool LOG_BINS, typename T>
         state.t = (clamped_dist - edge_lo) / (edge_hi - edge_lo);
         state.t = state.t < static_cast<T>(1) ? state.t : static_cast<T>(1);
     } else {
-        state.t = static_cast<T>(normalized) - static_cast<T>(state.idx_lo);
+        // Compute t in full precision: t = (dist - edge_lo) / bin_width
+        T bin_width = static_cast<T>(1) / static_cast<T>(params.param2);
+        T edge_lo = static_cast<T>(params.param1) + static_cast<T>(state.idx_lo) * bin_width;
+        state.t = (dist - edge_lo) / bin_width;
     }
     state.one_minus_t = static_cast<T>(1) - state.t;
     return state;

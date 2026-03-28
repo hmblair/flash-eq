@@ -197,11 +197,14 @@ class EquivariantTransformerBlock(nn.Module):
         self.mlp_down = EquivariantLinear(mlp_hidden_repr, out_repr, bias=True)
 
         # LayerScale for training stability (scales sublayer outputs before residual)
-        if layer_scale_init is not None:
+        if layer_scale_init is not None and self._use_attn_residual:
             self.layer_scale_attn = LayerScale(layer_scale_init)
-            self.layer_scale_mlp = LayerScale(layer_scale_init)
         else:
             self.layer_scale_attn = nn.Identity()
+
+        if layer_scale_init is not None:
+            self.layer_scale_mlp = LayerScale(layer_scale_init)
+        else:
             self.layer_scale_mlp = nn.Identity()
 
         # DropPath for regularization (stochastic depth)

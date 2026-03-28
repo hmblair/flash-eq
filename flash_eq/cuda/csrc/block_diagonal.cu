@@ -19,6 +19,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_texture_types.h>
 
+#include <ATen/cuda/Atomic.cuh>
+
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
@@ -39,18 +41,20 @@ constexpr int THREADS = 256;
  * Complex number stored as real/imaginary pair.
  * Used for m>0 spherical harmonic components.
  */
+template <typename T>
 struct Complex {
-    float re, im;
+    T re, im;
 };
 
 /**
  * Interpolation state for binned radial weights.
  */
+template <typename T>
 struct InterpState {
     int idx_lo;
     int idx_hi;
-    float t;
-    float one_minus_t;
+    T t;
+    T one_minus_t;
 };
 
 /**
@@ -75,25 +79,35 @@ struct BinningParams {
  * Compute binning from distance value.
  * Template parameter LOG_BINS selects linear (false) or logarithmic (true) spacing.
  */
-template <bool LOG_BINS>
-[[nodiscard]] __device__ __forceinline__ InterpState compute_binning(float dist, BinningParams params) {
+template <bool LOG_BINS, typename T>
+[[nodiscard]] __device__ __forceinline__ InterpState<T> compute_binning(T dist, BinningParams params) {
+    // Use float to find bin index (integer result, float precision sufficient)
     float normalized;
     if constexpr (LOG_BINS) {
-        // Log spacing: normalized = (log(dist) - log_min) * inv_log_range * num_bins
-        normalized = (logf(fmaxf(dist, expf(params.param1))) - params.param1)
+        normalized = (logf(fmaxf(static_cast<float>(dist), expf(params.param1))) - params.param1)
                      * params.param2 * params.num_bins;
     } else {
-        // Linear spacing: normalized = (dist - min_val) * inv_bin_width
-        normalized = (dist - params.param1) * params.param2;
+        normalized = (static_cast<float>(dist) - params.param1) * params.param2;
     }
-
     normalized = fminf(fmaxf(normalized, 0.0f), static_cast<float>(params.num_bins));
 
-    InterpState state;
+    InterpState<T> state;
     state.idx_lo = min(static_cast<int>(floorf(normalized)), params.num_bins - 1);
     state.idx_hi = min(state.idx_lo + 1, params.num_bins);
-    state.t = normalized - static_cast<float>(state.idx_lo);
-    state.one_minus_t = 1.0f - state.t;
+
+    if constexpr (LOG_BINS) {
+        // Interpolate linearly in dist-space between bin edges (full precision)
+        T inv_log_bin_width = static_cast<T>(params.param2 * params.num_bins);
+        T log_edge_lo = static_cast<T>(params.param1) + static_cast<T>(state.idx_lo) / inv_log_bin_width;
+        T edge_lo = exp(static_cast<double>(log_edge_lo));
+        T edge_hi = exp(static_cast<double>(log_edge_lo + static_cast<T>(1) / inv_log_bin_width));
+        T clamped_dist = dist > edge_lo ? dist : edge_lo;
+        state.t = (clamped_dist - edge_lo) / (edge_hi - edge_lo);
+        state.t = state.t < static_cast<T>(1) ? state.t : static_cast<T>(1);
+    } else {
+        state.t = static_cast<T>(normalized) - static_cast<T>(state.idx_lo);
+    }
+    state.one_minus_t = static_cast<T>(1) - state.t;
     return state;
 }
 
@@ -101,14 +115,22 @@ template <bool LOG_BINS>
  * Compute derivative of interpolation weight w.r.t. distance.
  * Used in backward pass to convert grad_interp_weight to grad_distance.
  */
-template <bool LOG_BINS>
-[[nodiscard]] __device__ __forceinline__ float binning_derivative(float dist, BinningParams params) {
+template <bool LOG_BINS, typename T>
+[[nodiscard]] __device__ __forceinline__ T binning_derivative(T dist, BinningParams params) {
     if constexpr (LOG_BINS) {
-        // d(normalized)/d(dist) = inv_log_range * num_bins / dist
-        return params.param2 * params.num_bins / fmaxf(dist, expf(params.param1));
+        // dt/d(dist) = 1 / (edge_hi - edge_lo)
+        float inv_log_bin_width = params.param2 * params.num_bins;
+        float log_normalized = (logf(fmaxf(static_cast<float>(dist), expf(params.param1))) - params.param1)
+                               * inv_log_bin_width;
+        log_normalized = fminf(fmaxf(log_normalized, 0.0f), static_cast<float>(params.num_bins));
+        int idx_lo = min(static_cast<int>(floorf(log_normalized)), params.num_bins - 1);
+        T t_inv_lbw = static_cast<T>(inv_log_bin_width);
+        T log_edge_lo = static_cast<T>(params.param1) + static_cast<T>(idx_lo) / t_inv_lbw;
+        T edge_lo = exp(static_cast<double>(log_edge_lo));
+        T edge_hi = exp(static_cast<double>(log_edge_lo + static_cast<T>(1) / t_inv_lbw));
+        return static_cast<T>(1) / (edge_hi - edge_lo);
     } else {
-        // d(normalized)/d(dist) = inv_bin_width
-        return params.param2;
+        return static_cast<T>(params.param2);
     }
 }
 
@@ -173,8 +195,9 @@ constexpr int BLOCK_PARAMS_STRIDE = 6;
 /**
  * Integer power via repeated multiplication. Much faster than powf for small l.
  */
-[[nodiscard]] __device__ __forceinline__ float ipowf(float base, int exp) {
-    float result = 1.0f;
+template <typename T>
+[[nodiscard]] __device__ __forceinline__ T ipow(T base, int exp) {
+    T result = static_cast<T>(1);
     while (exp > 0) {
         if (exp & 1) result *= base;
         base *= base;
@@ -190,7 +213,7 @@ constexpr int BLOCK_PARAMS_STRIDE = 6;
 [[nodiscard]] __device__ __forceinline__ float solid_harmonic_scale(float distance, float scale, int l) {
     if (l == 0) return 1.0f;
     float weight = distance / (distance + scale);
-    return ipowf(weight, l);
+    return ipow(weight, l);
 }
 
 /**
@@ -201,7 +224,7 @@ constexpr int BLOCK_PARAMS_STRIDE = 6;
 [[nodiscard]] __device__ __forceinline__ float solid_harmonic_scale_derivative(float distance, float scale, int l) {
     if (l == 0) return 0.0f;
     float r_plus_s = distance + scale;
-    float sh_scale = ipowf(distance / r_plus_s, l);
+    float sh_scale = ipow(distance / r_plus_s, l);
     return sh_scale * l * scale / (distance * r_plus_s);
 }
 
@@ -209,17 +232,18 @@ constexpr int BLOCK_PARAMS_STRIDE = 6;
  * Load a complex number from interleaved storage.
  * Storage format: [re_0, im_0, re_1, im_1, ...]
  */
-[[nodiscard]] __device__ __forceinline__ Complex load_complex(const float* ptr, int idx) {
+template <typename T>
+[[nodiscard]] __device__ __forceinline__ Complex<T> load_complex(const T* ptr, int idx) {
     return {ptr[2 * idx], ptr[2 * idx + 1]};
 }
 
 /**
  * Store a complex number to interleaved storage.
  */
-template <typename scalar_t>
-__device__ __forceinline__ void store_complex(scalar_t* ptr, int idx, Complex c) {
-    ptr[2 * idx] = static_cast<scalar_t>(c.re);
-    ptr[2 * idx + 1] = static_cast<scalar_t>(c.im);
+template <typename T>
+__device__ __forceinline__ void store_complex(T* ptr, int idx, Complex<T> c) {
+    ptr[2 * idx] = c.re;
+    ptr[2 * idx + 1] = c.im;
 }
 
 /**
@@ -247,16 +271,16 @@ __device__ __forceinline__ void store_complex(scalar_t* ptr, int idx, Complex c)
 /**
  * Linearly interpolate a weight from the radial table using __ldg (L2 cache).
  */
-template <typename scalar_t>
-[[nodiscard]] __device__ __forceinline__ float lerp_weight(
-    const scalar_t* __restrict__ table,
+template <typename T>
+[[nodiscard]] __device__ __forceinline__ T lerp_weight(
+    const T* __restrict__ table,
     int idx_lo,
     int idx_hi,
-    float t,
-    float one_minus_t
+    T t,
+    T one_minus_t
 ) {
-    return one_minus_t * static_cast<float>(__ldg(&table[idx_lo]))
-         + t * static_cast<float>(__ldg(&table[idx_hi]));
+    return one_minus_t * static_cast<T>(__ldg(&table[idx_lo]))
+         + t * static_cast<T>(__ldg(&table[idx_hi]));
 }
 
 // ============================================================================
@@ -266,37 +290,39 @@ template <typename scalar_t>
 /**
  * Bundled edge state: distance, solid harmonic weight, and interpolation indices.
  */
+template <typename T>
 struct EdgeState {
-    float dist;
-    float sh_weight;
-    InterpState interp;
+    T dist;
+    T sh_weight;
+    InterpState<T> interp;
 };
 
 /**
  * Setup edge state from raw distance value.
  * Computes solid harmonic weight and binning indices.
  */
-template <bool LOG_BINS, typename scalar_t>
-[[nodiscard]] __device__ __forceinline__ EdgeState setup_edge(
-    const scalar_t* __restrict__ distances,
+template <bool LOG_BINS, typename T>
+[[nodiscard]] __device__ __forceinline__ EdgeState<T> setup_edge(
+    const T* __restrict__ distances,
     int64_t edge,
     float sh_scale,
     BinningParams bin_params
 ) {
-    EdgeState s;
-    s.dist = static_cast<float>(distances[edge]);
-    s.sh_weight = s.dist / (s.dist + sh_scale);
+    EdgeState<T> s;
+    s.dist = distances[edge];
+    s.sh_weight = s.dist / (s.dist + static_cast<T>(sh_scale));
     s.interp = compute_binning<LOG_BINS>(s.dist, bin_params);
     return s;
 }
 
 /**
  * Precompute scale factors for all (i, o) pairs into shared memory.
- * Scale = ipowf(sh_weight, l_in + l_out) for solid harmonic suppression.
+ * Scale = ipow(sh_weight, l_in + l_out) for solid harmonic suppression.
  */
+template <typename T>
 __device__ __forceinline__ void precompute_scales(
-    float* scale_shared,
-    float sh_weight,
+    T* scale_shared,
+    T sh_weight,
     const int* __restrict__ l_lookup_in,
     const int* __restrict__ l_lookup_out,
     int m,
@@ -310,7 +336,7 @@ __device__ __forceinline__ void precompute_scales(
         const int o = idx / n_in;
         const int l_in = get_l_for_index_fast(l_lookup_in, m, i);
         const int l_out = get_l_for_index_fast(l_lookup_out, m, o);
-        scale_shared[idx] = ipowf(sh_weight, l_in + l_out);
+        scale_shared[idx] = ipow(sh_weight, l_in + l_out);
     }
 }
 
@@ -318,10 +344,11 @@ __device__ __forceinline__ void precompute_scales(
  * Precompute scale factors AND l_totals for backward_table kernels.
  * Stores both scale factors and l_total values (needed for gradient computation).
  */
+template <typename T>
 __device__ __forceinline__ void precompute_scales_with_l(
-    float* scale_shared,
+    T* scale_shared,
     int* l_total_shared,
-    float sh_weight,
+    T sh_weight,
     const int* __restrict__ l_lookup_in,
     const int* __restrict__ l_lookup_out,
     int m,
@@ -336,7 +363,7 @@ __device__ __forceinline__ void precompute_scales_with_l(
         const int l_in = get_l_for_index_fast(l_lookup_in, m, i);
         const int l_out = get_l_for_index_fast(l_lookup_out, m, o);
         const int l_total = l_in + l_out;
-        scale_shared[idx] = ipowf(sh_weight, l_total);
+        scale_shared[idx] = ipow(sh_weight, l_total);
         l_total_shared[idx] = l_total;
     }
 }
@@ -345,7 +372,7 @@ __device__ __forceinline__ void precompute_scales_with_l(
  * Compute weight table base indices for interpolation.
  */
 __device__ __forceinline__ void compute_weight_bases(
-    const InterpState& interp,
+    const InterpState<float>& interp,
     int table_stride,
     int co,
     int Cin,
@@ -449,7 +476,8 @@ inline void destroy_texture_object(cudaTextureObject_t tex) {
  *   [a  b] [f.re]   [a*f.re + b*f.im]
  *   [-b a] [f.im] = [a*f.im - b*f.re]
  */
-__device__ __forceinline__ void complex_mul_add(float a, float b, Complex f, Complex& acc) {
+template <typename T>
+__device__ __forceinline__ void complex_mul_add(T a, T b, Complex<T> f, Complex<T>& acc) {
     acc.re += a * f.re + b * f.im;
     acc.im += a * f.im - b * f.re;
 }
@@ -465,7 +493,8 @@ __device__ __forceinline__ void complex_mul_add(float a, float b, Complex f, Com
  * So: grad_f.re += a * go.re - b * go.im
  *     grad_f.im += b * go.re + a * go.im
  */
-__device__ __forceinline__ void complex_mul_add_transpose(float a, float b, Complex go, Complex& grad) {
+template <typename T>
+__device__ __forceinline__ void complex_mul_add_transpose(T a, T b, Complex<T> go, Complex<T>& grad) {
     grad.re += a * go.re - b * go.im;
     grad.im += b * go.re + a * go.im;
 }
@@ -478,7 +507,8 @@ __device__ __forceinline__ void complex_mul_add_transpose(float a, float b, Comp
  * grad_a = f.re * go.re + f.im * go.im  (derivative of both diagonal terms)
  * grad_b = f.im * go.re - f.re * go.im  (derivative of both off-diagonal terms)
  */
-__device__ __forceinline__ void compute_weight_gradient(Complex f, Complex go, float& grad_a, float& grad_b) {
+template <typename T>
+__device__ __forceinline__ void compute_weight_gradient(Complex<T> f, Complex<T> go, T& grad_a, T& grad_b) {
     grad_a = f.re * go.re + f.im * go.im;
     grad_b = f.im * go.re - f.re * go.im;
 }
@@ -490,6 +520,19 @@ __device__ __forceinline__ void compute_weight_gradient(Complex f, Complex go, f
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+[[nodiscard]] __device__ __forceinline__ double warp_reduce_sum(double val) {
+    // Split double into two 32-bit ints for shuffle
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        int lo = __double2loint(val);
+        int hi = __double2hiint(val);
+        lo = __shfl_down_sync(0xffffffff, lo, offset);
+        hi = __shfl_down_sync(0xffffffff, hi, offset);
+        val += __hiloint2double(hi, lo);
     }
     return val;
 }
@@ -533,12 +576,12 @@ __global__ void forward_m0_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     // Shared memory layout: [features | scale_factors]
-    extern __shared__ float shared_mem[];
-    float* feat_shared = shared_mem;
-    float* scale_shared = shared_mem + dims.Cin * bp.n_in;
+    extern __shared__ char shared_raw[];
+    scalar_t* feat_shared = reinterpret_cast<scalar_t*>(shared_raw);
+    scalar_t* scale_shared = feat_shared + dims.Cin * bp.n_in;
 
     // Precompute scale factors for all (i, o) pairs
     precompute_scales(scale_shared, es.sh_weight, l_lookup_in, l_lookup_out,
@@ -549,7 +592,7 @@ __global__ void forward_m0_kernel(
     for (int i = tid; i < dims.Cin * bp.n_in; i += THREADS) {
         const int ci = i / bp.n_in;
         const int local_idx = i % bp.n_in;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * dims.Din + bp.in_off + local_idx]);
+        feat_shared[i] = features[feat_base + ci * dims.Din + bp.in_off + local_idx];
     }
     __syncthreads();
 
@@ -560,25 +603,19 @@ __global__ void forward_m0_kernel(
         const int co = out_idx / bp.n_out;
         const int o = out_idx % bp.n_out;
 
-        float acc = 0.0f;
+        scalar_t acc = 0;
         const int w_base_lo = es.interp.idx_lo * table_stride + co * dims.Cin * dims.Wdim + bp.w_off;
         const int w_base_hi = es.interp.idx_hi * table_stride + co * dims.Cin * dims.Wdim + bp.w_off;
 
         for (int ci = 0; ci < dims.Cin; ci++) {
-            const float* f_ptr = feat_shared + ci * bp.n_in;
+            const scalar_t* f_ptr = feat_shared + ci * bp.n_in;
             const int w_ci_off = ci * dims.Wdim;
 
             #pragma unroll 4
             for (int i = 0; i < bp.n_in; i++) {
                 const int w_idx = w_ci_off + o * bp.n_in + i;
-#if USE_TEXTURE_MEMORY
-                float w = lerp_weight_unified<scalar_t, USE_TEX>(
-                    radial_table, radial_tex, w_base_lo + w_idx, w_base_hi + w_idx,
-                    es.interp.t, es.interp.one_minus_t);
-#else
-                float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                scalar_t w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                       es.interp.t, es.interp.one_minus_t);
-#endif
 
                 // Apply precomputed solid harmonic scaling
                 w *= scale_shared[o * bp.n_in + i];
@@ -630,14 +667,14 @@ __global__ void forward_mpos_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     const int in_size = 2 * bp.n_in;  // Complex pairs
 
     // Shared memory layout: [features | scale_factors]
-    extern __shared__ float shared_mem[];
-    float* feat_shared = shared_mem;
-    float* scale_shared = shared_mem + dims.Cin * in_size;
+    extern __shared__ char shared_raw2[];
+    scalar_t* feat_shared = reinterpret_cast<scalar_t*>(shared_raw2);
+    scalar_t* scale_shared = feat_shared + dims.Cin * in_size;
 
     // Precompute scale factors for all (i, o) pairs
     precompute_scales(scale_shared, es.sh_weight, l_lookup_in, l_lookup_out,
@@ -648,7 +685,7 @@ __global__ void forward_mpos_kernel(
     for (int i = tid; i < dims.Cin * in_size; i += THREADS) {
         const int ci = i / in_size;
         const int local_idx = i % in_size;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * dims.Din + local_idx]);
+        feat_shared[i] = features[feat_base + ci * dims.Din + local_idx];
     }
     __syncthreads();
 
@@ -659,35 +696,26 @@ __global__ void forward_mpos_kernel(
         const int co = out_idx / bp.n_out;
         const int o = out_idx % bp.n_out;
 
-        Complex acc = {0.0f, 0.0f};
+        Complex<scalar_t> acc = {0, 0};
         const int w_base_lo = es.interp.idx_lo * table_stride + co * dims.Cin * dims.Wdim + bp.w_off;
         const int w_base_hi = es.interp.idx_hi * table_stride + co * dims.Cin * dims.Wdim + bp.w_off;
 
         for (int ci = 0; ci < dims.Cin; ci++) {
-            const float* f_ptr = feat_shared + ci * in_size;
+            const scalar_t* f_ptr = feat_shared + ci * in_size;
             const int w_ci_off = ci * dims.Wdim;
 
             #pragma unroll 4
             for (int i = 0; i < bp.n_in; i++) {
-                const Complex f = load_complex(f_ptr, i);
+                const auto f = load_complex(f_ptr, i);
                 const int w_idx = w_ci_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
-#if USE_TEXTURE_MEMORY
-                float a = lerp_weight_unified<scalar_t, USE_TEX>(
-                    radial_table, radial_tex, w_base_lo + w_idx, w_base_hi + w_idx,
-                    es.interp.t, es.interp.one_minus_t);
-                float b = lerp_weight_unified<scalar_t, USE_TEX>(
-                    radial_table, radial_tex, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
-                    es.interp.t, es.interp.one_minus_t);
-#else
-                float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                scalar_t a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                       es.interp.t, es.interp.one_minus_t);
-                float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                scalar_t b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
                                       es.interp.t, es.interp.one_minus_t);
-#endif
 
                 // Apply precomputed solid harmonic scaling
-                const float scale_factor = scale_shared[o * bp.n_in + i];
+                const scalar_t scale_factor = scale_shared[o * bp.n_in + i];
                 a *= scale_factor;
                 b *= scale_factor;
 
@@ -736,12 +764,12 @@ __global__ void backward_features_m0_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     // Shared memory layout: [grad_output | scale_factors]
-    extern __shared__ float shared_mem[];
-    float* grad_shared = shared_mem;
-    float* scale_shared = shared_mem + dims.Cout * bp.n_out;
+    extern __shared__ char shared_raw3[];
+    scalar_t* grad_shared = reinterpret_cast<scalar_t*>(shared_raw3);
+    scalar_t* scale_shared = grad_shared + dims.Cout * bp.n_out;
 
     // Precompute scale factors for all (i, o) pairs
     precompute_scales(scale_shared, es.sh_weight, l_lookup_in, l_lookup_out,
@@ -752,7 +780,7 @@ __global__ void backward_features_m0_kernel(
     for (int i = tid; i < dims.Cout * bp.n_out; i += THREADS) {
         const int co = i / bp.n_out;
         const int local_idx = i % bp.n_out;
-        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * dims.Dout + bp.out_off + local_idx]);
+        grad_shared[i] = grad_output[grad_base + co * dims.Dout + bp.out_off + local_idx];
     }
     __syncthreads();
 
@@ -763,18 +791,18 @@ __global__ void backward_features_m0_kernel(
         const int ci = in_idx / bp.n_in;
         const int i = in_idx % bp.n_in;
 
-        float grad = 0.0f;
+        scalar_t grad = 0;
         const int w_base_lo = es.interp.idx_lo * table_stride + ci * dims.Wdim + bp.w_off;
         const int w_base_hi = es.interp.idx_hi * table_stride + ci * dims.Wdim + bp.w_off;
 
         for (int co = 0; co < dims.Cout; co++) {
-            const float* go_ptr = grad_shared + co * bp.n_out;
+            const scalar_t* go_ptr = grad_shared + co * bp.n_out;
             const int w_co_off = co * dims.Cin * dims.Wdim;
 
             #pragma unroll 4
             for (int o = 0; o < bp.n_out; o++) {
                 const int w_idx = w_co_off + o * bp.n_in + i;
-                float w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                scalar_t w = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                       es.interp.t, es.interp.one_minus_t);
 
                 // Apply precomputed solid harmonic scaling
@@ -784,7 +812,7 @@ __global__ void backward_features_m0_kernel(
             }
         }
 
-        grad_features[edge * dims.Cin * dims.Din + ci * dims.Din + bp.in_off + i] = static_cast<scalar_t>(grad);
+        grad_features[edge * dims.Cin * dims.Din + ci * dims.Din + bp.in_off + i] = grad;
     }
 }
 
@@ -823,14 +851,14 @@ __global__ void backward_features_mpos_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     const int out_size = 2 * bp.n_out;
 
     // Shared memory layout: [grad_output | scale_factors]
-    extern __shared__ float shared_mem[];
-    float* grad_shared = shared_mem;
-    float* scale_shared = shared_mem + dims.Cout * out_size;
+    extern __shared__ char shared_raw4[];
+    scalar_t* grad_shared = reinterpret_cast<scalar_t*>(shared_raw4);
+    scalar_t* scale_shared = grad_shared + dims.Cout * out_size;
 
     // Precompute scale factors for all (i, o) pairs
     precompute_scales(scale_shared, es.sh_weight, l_lookup_in, l_lookup_out,
@@ -841,7 +869,7 @@ __global__ void backward_features_mpos_kernel(
     for (int i = tid; i < dims.Cout * out_size; i += THREADS) {
         const int co = i / out_size;
         const int local_idx = i % out_size;
-        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * dims.Dout + local_idx]);
+        grad_shared[i] = grad_output[grad_base + co * dims.Dout + local_idx];
     }
     __syncthreads();
 
@@ -852,26 +880,26 @@ __global__ void backward_features_mpos_kernel(
         const int ci = in_idx / bp.n_in;
         const int i = in_idx % bp.n_in;
 
-        Complex grad_f = {0.0f, 0.0f};
+        Complex<scalar_t> grad_f = {0, 0};
         const int w_base_lo = es.interp.idx_lo * table_stride + ci * dims.Wdim + bp.w_off;
         const int w_base_hi = es.interp.idx_hi * table_stride + ci * dims.Wdim + bp.w_off;
 
         for (int co = 0; co < dims.Cout; co++) {
-            const float* go_ptr = grad_shared + co * out_size;
+            const scalar_t* go_ptr = grad_shared + co * out_size;
             const int w_co_off = co * dims.Cin * dims.Wdim;
 
             #pragma unroll 4
             for (int o = 0; o < bp.n_out; o++) {
-                const Complex go = load_complex(go_ptr, o);
+                const auto go = load_complex(go_ptr, o);
                 const int w_idx = w_co_off + weight_idx_2x2(o, i, bp.n_in, 0);
 
-                float a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
+                scalar_t a = lerp_weight(radial_table, w_base_lo + w_idx, w_base_hi + w_idx,
                                       es.interp.t, es.interp.one_minus_t);
-                float b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
+                scalar_t b = lerp_weight(radial_table, w_base_lo + w_idx + 1, w_base_hi + w_idx + 1,
                                       es.interp.t, es.interp.one_minus_t);
 
                 // Apply precomputed solid harmonic scaling
-                const float scale_factor = scale_shared[o * bp.n_in + i];
+                const scalar_t scale_factor = scale_shared[o * bp.n_in + i];
                 a *= scale_factor;
                 b *= scale_factor;
 
@@ -905,8 +933,8 @@ __global__ void backward_table_m0_kernel(
     const scalar_t* __restrict__ distances,
     float sh_scale,
     BinningParams bin_params,
-    float* __restrict__ grad_radial_table,
-    float* __restrict__ grad_distances,
+    scalar_t* __restrict__ grad_radial_table,
+    scalar_t* __restrict__ grad_distances,
     const int* __restrict__ block_params_flat,
     const int* __restrict__ l_lookup_in,
     const int* __restrict__ l_lookup_out,
@@ -922,17 +950,17 @@ __global__ void backward_table_m0_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     const int table_stride = dims.Cout * dims.Cin * dims.Wdim;
     const int w_block_size = bp.n_out * bp.n_in;
     const int scale_size = bp.n_in * bp.n_out;
 
     // Shared memory layout: [features | grad_output | scale_factors | l_totals]
-    extern __shared__ float shared[];
-    float* feat_shared = shared;
-    float* grad_shared = shared + dims.Cin * bp.n_in;
-    float* scale_shared = grad_shared + dims.Cout * bp.n_out;
+    extern __shared__ char shared_raw5[];
+    scalar_t* feat_shared = reinterpret_cast<scalar_t*>(shared_raw5);
+    scalar_t* grad_shared = feat_shared + dims.Cin * bp.n_in;
+    scalar_t* scale_shared = grad_shared + dims.Cout * bp.n_out;
     int* l_total_shared = reinterpret_cast<int*>(scale_shared + scale_size);
 
     // Precompute scale factors and l_totals for all (i, o) pairs
@@ -944,7 +972,7 @@ __global__ void backward_table_m0_kernel(
     for (int i = tid; i < dims.Cin * bp.n_in; i += THREADS) {
         const int ci = i / bp.n_in;
         const int local_idx = i % bp.n_in;
-        feat_shared[i] = static_cast<float>(features[feat_base + ci * dims.Din + bp.in_off + local_idx]);
+        feat_shared[i] = features[feat_base + ci * dims.Din + bp.in_off + local_idx];
     }
 
     // Load grad_output
@@ -952,17 +980,15 @@ __global__ void backward_table_m0_kernel(
     for (int i = tid; i < dims.Cout * bp.n_out; i += THREADS) {
         const int co = i / bp.n_out;
         const int local_idx = i % bp.n_out;
-        grad_shared[i] = static_cast<float>(grad_output[grad_base + co * dims.Dout + bp.out_off + local_idx]);
+        grad_shared[i] = grad_output[grad_base + co * dims.Dout + bp.out_off + local_idx];
     }
     __syncthreads();
 
     // Precompute derivative factor: sh_scale / (dist * (dist + sh_scale))
-    // d/dr[(r/(r+s))^l] = (r/(r+s))^l * l * s / (r * (r+s))
-    // = scale_factor * l_total * deriv_factor
-    const float deriv_factor = sh_scale / (es.dist * (es.dist + sh_scale));
+    const scalar_t deriv_factor = static_cast<scalar_t>(sh_scale) / (es.dist * (es.dist + static_cast<scalar_t>(sh_scale)));
 
-    float local_grad_t = 0.0f;
-    float local_grad_sh = 0.0f;  // Gradient through solid harmonic scaling
+    scalar_t local_grad_t = 0;
+    scalar_t local_grad_sh = 0;
 
     // Compute weight gradients
     for (int w_idx = tid; w_idx < dims.Cout * dims.Cin * w_block_size; w_idx += THREADS) {
@@ -972,44 +998,38 @@ __global__ void backward_table_m0_kernel(
         const int o = w_local / bp.n_in;
         const int i = w_local % bp.n_in;
 
-        // Use precomputed scale factor and l_total
         const int scale_idx = o * bp.n_in + i;
-        const float scale_factor = scale_shared[scale_idx];
+        const scalar_t scale_factor = scale_shared[scale_idx];
         const int l_total = l_total_shared[scale_idx];
 
-        const float f = feat_shared[ci * bp.n_in + i];
-        const float go = grad_shared[co * bp.n_out + o];
-        // grad_w includes the scale factor since output = w * scale_factor * f
-        const float grad_w = scale_factor * f * go;
+        const scalar_t f = feat_shared[ci * bp.n_in + i];
+        const scalar_t go = grad_shared[co * bp.n_out + o];
+        const scalar_t grad_w = scale_factor * f * go;
 
         const int table_idx = co * dims.Cin * dims.Wdim + ci * dims.Wdim + bp.w_off + w_local;
         const int addr_lo = es.interp.idx_lo * table_stride + table_idx;
         const int addr_hi = es.interp.idx_hi * table_stride + table_idx;
 
-        atomicAdd(&grad_radial_table[addr_lo], es.interp.one_minus_t * grad_w);
-        atomicAdd(&grad_radial_table[addr_hi], es.interp.t * grad_w);
+        gpuAtomicAdd(&grad_radial_table[addr_lo], es.interp.one_minus_t * grad_w);
+        gpuAtomicAdd(&grad_radial_table[addr_hi], es.interp.t * grad_w);
 
-        const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
-        const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
-        const float interp_weight = es.interp.one_minus_t * w_lo + es.interp.t * w_hi;
+        const scalar_t w_lo = static_cast<scalar_t>(__ldg(&radial_table[addr_lo]));
+        const scalar_t w_hi = static_cast<scalar_t>(__ldg(&radial_table[addr_hi]));
+        const scalar_t interp_weight = es.interp.one_minus_t * w_lo + es.interp.t * w_hi;
 
-        // Gradient through interpolation: d(output)/d(t) * d(t)/d(dist)
         local_grad_t += (w_hi - w_lo) * grad_w;
 
-        // Gradient through solid harmonic scaling using precomputed values
-        // d(scale)/d(dist) = scale_factor * l_total * deriv_factor
         if (l_total > 0) {
-            local_grad_sh += interp_weight * f * go * scale_factor * l_total * deriv_factor;
+            local_grad_sh += interp_weight * f * go * scale_factor * static_cast<scalar_t>(l_total) * deriv_factor;
         }
     }
 
     // Warp reduction and atomic add for grad_distance
-    // Chain rule: grad_dist = grad_t * d(t)/d(dist) + grad_sh
     local_grad_t = warp_reduce_sum(local_grad_t);
     local_grad_sh = warp_reduce_sum(local_grad_sh);
     if ((tid % 32) == 0) {
-        const float grad_dist = local_grad_t * binning_derivative<LOG_BINS>(es.dist, bin_params) + local_grad_sh;
-        atomicAdd(&grad_distances[edge], grad_dist);
+        const scalar_t grad_dist = local_grad_t * binning_derivative<LOG_BINS>(es.dist, bin_params) + local_grad_sh;
+        gpuAtomicAdd(&grad_distances[edge], grad_dist);
     }
 }
 
@@ -1030,8 +1050,8 @@ __global__ void backward_table_mpos_kernel(
     const scalar_t* __restrict__ distances,
     float sh_scale,
     BinningParams bin_params,
-    float* __restrict__ grad_radial_table,
-    float* __restrict__ grad_distances,
+    scalar_t* __restrict__ grad_radial_table,
+    scalar_t* __restrict__ grad_distances,
     const int* __restrict__ block_params_flat,
     const int* __restrict__ l_lookup_in,
     const int* __restrict__ l_lookup_out,
@@ -1050,20 +1070,20 @@ __global__ void backward_table_mpos_kernel(
     if (bp.n_in == 0 || bp.n_out == 0) return;
 
     // Setup edge state: distance, solid harmonic weight, interpolation
-    const EdgeState es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
+    const auto es = setup_edge<LOG_BINS>(distances, edge, sh_scale, bin_params);
 
     const int in_size = 2 * bp.n_in;
     const int out_size = 2 * bp.n_out;
-    const int weights_per_pair = 2;  // 'a' and 'b' for each (o, i) pair
+    const int weights_per_pair = 2;
     const int num_weights = weights_per_pair * bp.n_out * bp.n_in;
     const int table_stride = dims.Cout * dims.Cin * dims.Wdim;
     const int scale_size = bp.n_in * bp.n_out;
 
     // Shared memory layout: [features | grad_output | scale_factors | l_totals]
-    extern __shared__ float shared[];
-    float* feat_shared = shared;
-    float* grad_shared = shared + dims.Cin * in_size;
-    float* scale_shared = grad_shared + dims.Cout * out_size;
+    extern __shared__ char shared_raw6[];
+    scalar_t* feat_shared = reinterpret_cast<scalar_t*>(shared_raw6);
+    scalar_t* grad_shared = feat_shared + dims.Cin * in_size;
+    scalar_t* scale_shared = grad_shared + dims.Cout * out_size;
     int* l_total_shared = reinterpret_cast<int*>(scale_shared + scale_size);
 
     // Precompute scale factors and l_totals for all (i, o) pairs
@@ -1075,7 +1095,7 @@ __global__ void backward_table_mpos_kernel(
     for (int idx = tid; idx < dims.Cin * in_size; idx += THREADS) {
         const int ci = idx / in_size;
         const int local_idx = idx % in_size;
-        feat_shared[idx] = static_cast<float>(features[feat_base + ci * dims.Din + local_idx]);
+        feat_shared[idx] = features[feat_base + ci * dims.Din + local_idx];
     }
 
     // Load grad_output
@@ -1083,75 +1103,57 @@ __global__ void backward_table_mpos_kernel(
     for (int idx = tid; idx < dims.Cout * out_size; idx += THREADS) {
         const int co = idx / out_size;
         const int local_idx = idx % out_size;
-        grad_shared[idx] = static_cast<float>(grad_output[grad_base + co * dims.Dout + local_idx]);
+        grad_shared[idx] = grad_output[grad_base + co * dims.Dout + local_idx];
     }
     __syncthreads();
 
-    // Precompute derivative factor: sh_scale / (dist * (dist + sh_scale))
-    // d/dr[(r/(r+s))^l] = (r/(r+s))^l * l * s / (r * (r+s))
-    // = scale_factor * l_total * deriv_factor
-    const float deriv_factor = sh_scale / (es.dist * (es.dist + sh_scale));
+    const scalar_t deriv_factor = static_cast<scalar_t>(sh_scale) / (es.dist * (es.dist + static_cast<scalar_t>(sh_scale)));
 
-    float local_grad_t = 0.0f;
-    float local_grad_sh = 0.0f;  // Gradient through solid harmonic scaling
+    scalar_t local_grad_t = 0;
+    scalar_t local_grad_sh = 0;
 
-    // Iterate over all weight elements: (co, ci, o, i, component)
-    // Each weight pair (a, b) corresponds to one (output, input) connection
     for (int w_idx = tid; w_idx < dims.Cout * dims.Cin * num_weights; w_idx += THREADS) {
-        // Decode flat index into (co, ci, o, i, is_b)
         const int co = w_idx / (dims.Cin * num_weights);
         const int ci = (w_idx / num_weights) % dims.Cin;
         const int w_local = w_idx % num_weights;
         const int pair_idx = w_local / 2;
-        const int is_b = w_local % 2;  // 0 = 'a' (diagonal), 1 = 'b' (off-diagonal)
+        const int is_b = w_local % 2;
         const int o = pair_idx / bp.n_in;
         const int i = pair_idx % bp.n_in;
 
-        // Use precomputed scale factor and l_total
         const int scale_idx = o * bp.n_in + i;
-        const float scale_factor = scale_shared[scale_idx];
+        const scalar_t scale_factor = scale_shared[scale_idx];
         const int l_total = l_total_shared[scale_idx];
 
-        // Load feature and gradient
-        const Complex f = load_complex(feat_shared + ci * in_size, i);
-        const Complex go = load_complex(grad_shared + co * out_size, o);
+        const auto f = load_complex(feat_shared + ci * in_size, i);
+        const auto go = load_complex(grad_shared + co * out_size, o);
 
-        // Compute gradient for this weight component
-        float grad_a, grad_b;
+        scalar_t grad_a, grad_b;
         compute_weight_gradient(f, go, grad_a, grad_b);
-        // grad_w includes the scale factor since output = w * scale_factor * f
-        const float grad_w = scale_factor * ((is_b == 0) ? grad_a : grad_b);
-        const float unscaled_grad_w = (is_b == 0) ? grad_a : grad_b;
+        const scalar_t grad_w = scale_factor * ((is_b == 0) ? grad_a : grad_b);
+        const scalar_t unscaled_grad_w = (is_b == 0) ? grad_a : grad_b;
 
-        // Accumulate to table gradient with interpolation
         const int table_idx = co * dims.Cin * dims.Wdim + ci * dims.Wdim + bp.w_off + w_local;
         const int addr_lo = es.interp.idx_lo * table_stride + table_idx;
         const int addr_hi = es.interp.idx_hi * table_stride + table_idx;
 
-        atomicAdd(&grad_radial_table[addr_lo], es.interp.one_minus_t * grad_w);
-        atomicAdd(&grad_radial_table[addr_hi], es.interp.t * grad_w);
+        gpuAtomicAdd(&grad_radial_table[addr_lo], es.interp.one_minus_t * grad_w);
+        gpuAtomicAdd(&grad_radial_table[addr_hi], es.interp.t * grad_w);
 
-        // Gradient w.r.t. interpolation weight (also scaled)
-        const float w_lo = static_cast<float>(__ldg(&radial_table[addr_lo]));
-        const float w_hi = static_cast<float>(__ldg(&radial_table[addr_hi]));
-        const float interp_weight = es.interp.one_minus_t * w_lo + es.interp.t * w_hi;
+        const scalar_t w_lo = static_cast<scalar_t>(__ldg(&radial_table[addr_lo]));
+        const scalar_t w_hi = static_cast<scalar_t>(__ldg(&radial_table[addr_hi]));
+        const scalar_t interp_weight = es.interp.one_minus_t * w_lo + es.interp.t * w_hi;
 
-        // Gradient through interpolation: d(output)/d(t) * d(t)/d(dist)
         local_grad_t += (w_hi - w_lo) * grad_w;
 
-        // Gradient through solid harmonic scaling using precomputed values
-        // d(scale)/d(dist) = scale_factor * l_total * deriv_factor
-        // Note: l_total >= 2 for m>0 (since l >= m >= 1 for both in and out)
-        local_grad_sh += interp_weight * unscaled_grad_w * scale_factor * l_total * deriv_factor;
+        local_grad_sh += interp_weight * unscaled_grad_w * scale_factor * static_cast<scalar_t>(l_total) * deriv_factor;
     }
 
-    // Warp reduction and atomic add for grad_distance
-    // Chain rule: grad_dist = grad_t * d(t)/d(dist) + grad_sh
     local_grad_t = warp_reduce_sum(local_grad_t);
     local_grad_sh = warp_reduce_sum(local_grad_sh);
     if ((tid % 32) == 0) {
-        const float grad_dist = local_grad_t * binning_derivative<LOG_BINS>(es.dist, bin_params) + local_grad_sh;
-        atomicAdd(&grad_distances[edge], grad_dist);
+        const scalar_t grad_dist = local_grad_t * binning_derivative<LOG_BINS>(es.dist, bin_params) + local_grad_sh;
+        gpuAtomicAdd(&grad_distances[edge], grad_dist);
     }
 }
 
@@ -1306,8 +1308,9 @@ std::vector<torch::Tensor> block_diagonal_forward_cuda(
     // Shared memory size: features + scale_factors
     // Scale factors size: max n_in * n_out = num_lvals_in * num_lvals_out
     const size_t max_scale_size = num_lvals_in * num_lvals_out;
-    const size_t shared_size_m0 = (Cin * num_lvals_in + max_scale_size) * sizeof(float);
-    const size_t shared_size_mpos = (Cin * max_in_size + max_scale_size) * sizeof(float);
+    const size_t fwd_elem_size = features.element_size();
+    const size_t shared_size_m0 = (Cin * num_lvals_in + max_scale_size) * fwd_elem_size;
+    const size_t shared_size_mpos = (Cin * max_in_size + max_scale_size) * fwd_elem_size;
 
 #if USE_TEXTURE_MEMORY
     // Create texture object for float32 radial table
@@ -1581,19 +1584,18 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
 
     auto grad_features = torch::zeros({B, Cin, Din}, features.options());
     auto grad_radial_table = torch::zeros({num_bins_plus_1, Cout, Cin, Wdim},
-                                           radial_table.options().dtype(torch::kFloat32));
-    auto grad_distances = torch::zeros({B}, distances.options().dtype(torch::kFloat32));
+                                           radial_table.options());
+    auto grad_distances = torch::zeros({B}, distances.options());
 
     // Shared memory sizes: data + scale_factors + l_totals (for backward_table)
-    // Scale factors size: max n_in * n_out = num_lvals_in * num_lvals_out
     const size_t max_scale_size = num_lvals_in * num_lvals_out;
-    // l_totals need int storage, but we account for it in float units for simplicity
-    const size_t l_total_size = (max_scale_size * sizeof(int) + sizeof(float) - 1) / sizeof(float);
+    const size_t elem_size = features.element_size();
+    const size_t l_total_bytes = max_scale_size * sizeof(int);
 
-    const size_t shared_size_feat_m0 = (Cout * num_lvals_out + max_scale_size) * sizeof(float);
-    const size_t shared_size_table_m0 = (Cin * num_lvals_in + Cout * num_lvals_out + max_scale_size + l_total_size) * sizeof(float);
-    const size_t shared_size_feat_mpos = (Cout * max_out_size + max_scale_size) * sizeof(float);
-    const size_t shared_size_table_mpos = (Cin * max_in_size + Cout * max_out_size + max_scale_size + l_total_size) * sizeof(float);
+    const size_t shared_size_feat_m0 = (Cout * num_lvals_out + max_scale_size) * elem_size;
+    const size_t shared_size_table_m0 = (Cin * num_lvals_in + Cout * num_lvals_out + max_scale_size) * elem_size + l_total_bytes;
+    const size_t shared_size_feat_mpos = (Cout * max_out_size + max_scale_size) * elem_size;
+    const size_t shared_size_table_mpos = (Cin * max_in_size + Cout * max_out_size + max_scale_size) * elem_size + l_total_bytes;
 
     // Launch m=0 backward_features
     if (log_bins) {
@@ -1639,8 +1641,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 distances.data_ptr<scalar_t>(),
                 sh_scale,
                 bin_params,
-                grad_radial_table.data_ptr<float>(),
-                grad_distances.data_ptr<float>(),
+                grad_radial_table.data_ptr<scalar_t>(),
+                grad_distances.data_ptr<scalar_t>(),
                 block_params_flat.data_ptr<int>(),
                 l_lookup_in.data_ptr<int>(),
                 l_lookup_out.data_ptr<int>(),
@@ -1656,8 +1658,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                 distances.data_ptr<scalar_t>(),
                 sh_scale,
                 bin_params,
-                grad_radial_table.data_ptr<float>(),
-                grad_distances.data_ptr<float>(),
+                grad_radial_table.data_ptr<scalar_t>(),
+                grad_distances.data_ptr<scalar_t>(),
                 block_params_flat.data_ptr<int>(),
                 l_lookup_in.data_ptr<int>(),
                 l_lookup_out.data_ptr<int>(),
@@ -1715,8 +1717,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                     distances.data_ptr<scalar_t>(),
                     sh_scale,
                     bin_params,
-                    grad_radial_table.data_ptr<float>(),
-                    grad_distances.data_ptr<float>(),
+                    grad_radial_table.data_ptr<scalar_t>(),
+                    grad_distances.data_ptr<scalar_t>(),
                     block_params_flat.data_ptr<int>(),
                     l_lookup_in.data_ptr<int>(),
                     l_lookup_out.data_ptr<int>(),
@@ -1733,8 +1735,8 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
                     distances.data_ptr<scalar_t>(),
                     sh_scale,
                     bin_params,
-                    grad_radial_table.data_ptr<float>(),
-                    grad_distances.data_ptr<float>(),
+                    grad_radial_table.data_ptr<scalar_t>(),
+                    grad_distances.data_ptr<scalar_t>(),
                     block_params_flat.data_ptr<int>(),
                     l_lookup_in.data_ptr<int>(),
                     l_lookup_out.data_ptr<int>(),
@@ -1744,13 +1746,6 @@ std::vector<torch::Tensor> block_diagonal_backward_cuda(
             }));
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
-
-    if (radial_table.scalar_type() != torch::kFloat32) {
-        grad_radial_table = grad_radial_table.to(radial_table.scalar_type());
-    }
-    if (distances.scalar_type() != torch::kFloat32) {
-        grad_distances = grad_distances.to(distances.scalar_type());
     }
 
     return {grad_features, grad_radial_table, grad_distances};

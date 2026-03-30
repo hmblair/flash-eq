@@ -13,11 +13,13 @@ The custom CUDA kernel underperforms cuBLAS-based approaches (e.g., SE3-Transfor
 | 4 | 0.93x | 0.64x |
 | 6 | 1.67x | 1.88x |
 
-**Root cause:** The kernel performs all computation in float32, converting half inputs at load time and back at store time. This means we don't benefit from:
+**Root cause:** The kernel performs all computation in the input dtype (float32/float64), converting half inputs to float32 at load time and back at store time. This means we don't benefit from:
 - Half-precision compute units (2x throughput vs FP32)
 - Tensor Cores (16x+ throughput for matrix ops)
 
 cuBLAS GEMMs with AMP use Tensor Cores efficiently, giving SE3-Transformer a significant advantage at low L where the O(L^2) vs O(L^4) scaling hasn't yet favored our approach.
+
+**Note:** The kernel now uses `scalar_t` precision throughout (shared memory, accumulation, gradients), so float32 and float64 inputs are handled at full precision. The half-precision issue is specifically about not using native FP16 compute units or Tensor Cores.
 
 **Attempted optimizations that didn't help:**
 - Storing shared memory in native half instead of float: No improvement because the conversion still happens in the inner loop, and the bottleneck is global memory access for weight interpolation.
@@ -57,39 +59,9 @@ The current `EquivariantTransformerBlock` uses `EquivariantGating` for nonlinear
 - EquiformerV2 (ICLR 2024), Section 3.3: https://arxiv.org/abs/2306.12059
 - Complete Guide to Spherical Equivariant Graph Transformers: https://arxiv.org/abs/2512.13927
 
-## Add Stochastic Depth Regularization
+## ~~Add Stochastic Depth Regularization~~ (DONE)
 
-EquiformerV2 uses stochastic depth (drop path) for regularization, which is standard in modern vision transformers but missing from the current implementation.
-
-**What it does:** Randomly drops entire residual blocks during training with probability p, scaling surviving paths by 1/(1-p). At inference, all paths are active.
-
-**EquiformerV2 settings:**
-- Drop rate: 0.05-0.1 (increases linearly with depth)
-- Applied to both attention and MLP residual paths
-
-**Implementation:**
-```python
-class StochasticDepth(nn.Module):
-    def __init__(self, drop_prob: float = 0.1):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x + residual
-        keep_prob = 1.0 - self.drop_prob
-        mask = torch.rand(x.shape[0], 1, 1, device=x.device) < keep_prob
-        return x + residual * mask / keep_prob
-```
-
-**In EquivariantTransformerBlock:**
-- Add `drop_path` parameter (default 0.0 for backward compatibility)
-- Apply to `h = h + attn_out` and `h = h + mlp_out` lines
-- In `EquivariantTransformer`, compute drop rates per layer: `[drop_path * i / (num_layers - 1) for i in range(num_layers)]`
-
-**Sources:**
-- EquiformerV2 (ICLR 2024): https://arxiv.org/abs/2306.12059
-- Deep Networks with Stochastic Depth (Huang et al., 2016): https://arxiv.org/abs/1603.09382
+Implemented as `DropPath` in `flash_eq/layers/transformer.py`. Applied to both attention and MLP residual paths in `EquivariantTransformerBlock` via `drop_path` parameter (default 0.0).
 
 ## Redesign FFN with Separable Pattern
 

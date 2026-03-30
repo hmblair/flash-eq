@@ -52,7 +52,7 @@ class EquivariantEdgeAttention(nn.Module):
         qk_dim: int,
         dropout: float = 0.0,
         distance_decay_scale: float | None = None,
-    ):
+    ) -> None:
         super().__init__()
 
         self.num_heads = num_heads
@@ -225,7 +225,7 @@ class EquivariantAttention(nn.Module):
         dropout: float = 0.0,
         reduce: str = 'sum',
         distance_decay_scale: float | None = None,
-    ):
+    ) -> None:
         super().__init__()
 
         if in_repr.mult % num_heads != 0:

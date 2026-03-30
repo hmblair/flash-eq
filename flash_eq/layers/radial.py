@@ -244,7 +244,9 @@ class SeparableRadialNet(nn.Module):
         normalized = (r - self.min_val) / (self.max_val - self.min_val)
         normalized = normalized.clamp(0.0, 1.0)
 
-        # Polynomial envelope for smooth cutoff
+        # p=5 polynomial envelope: e(x) = 1 - 10x³ + 15x⁴ - 6x⁵
+        # Satisfies e(0)=1, e(1)=0, e'(0)=e'(1)=e''(0)=e''(1)=0
+        # From Klicpera et al., DimeNet (ICLR 2020), Eq. 6
         x = normalized
         envelope = 1.0 - 10.0 * x**3 + 15.0 * x**4 - 6.0 * x**5
 

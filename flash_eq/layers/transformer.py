@@ -30,7 +30,7 @@ class LayerScale(nn.Module):
         init_value: Initial scale value (default 1e-4 for deep networks).
     """
 
-    def __init__(self, init_value: float = 1e-4):
+    def __init__(self, init_value: float = 1e-4) -> None:
         super().__init__()
         self.gamma = nn.Parameter(torch.tensor(init_value))
 
@@ -49,7 +49,7 @@ class DropPath(nn.Module):
         drop_prob: Probability of dropping the path (default 0.0).
     """
 
-    def __init__(self, drop_prob: float = 0.0):
+    def __init__(self, drop_prob: float = 0.0) -> None:
         super().__init__()
         self.drop_prob = drop_prob
 

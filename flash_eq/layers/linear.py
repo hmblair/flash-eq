@@ -70,7 +70,7 @@ class EquivariantEdgewiseLinear(nn.Module):
         max_dist: float = 10.0,
         log_bins: bool = False,
         solid_harmonic_scale: float = 0.1,
-    ):
+    ) -> None:
         super().__init__()
 
         self.in_repr = in_repr

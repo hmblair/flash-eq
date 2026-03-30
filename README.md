@@ -8,7 +8,7 @@ Fast, memory-efficient SO(3)-equivariant graph neural networks using Wigner-D di
 pip install flash-eq
 ```
 
-Requires PyTorch >= 2.0 with CUDA support. The CUDA kernel is JIT-compiled on first use.
+Requires PyTorch >= 2.0 with CUDA support.
 
 ## Quick Start
 

@@ -368,6 +368,3 @@ Single `ConvSE3` layer (FULL fuse, C=32, 500 bins) on NVIDIA H100. Max interpola
 
 Memory savings grow with edge count and angular momentum. Runtime improves at larger scales where the custom kernel's O(L^2) complexity outweighs cuBLAS overhead.
 
-## Theory
-
-See [`docs/theory.tex`](docs/theory.tex) for the mathematical details.

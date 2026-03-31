@@ -53,6 +53,28 @@ jobs:
             deactivate
             echo "::endgroup::"
           done
+      - name: Test wheel imports
+        run: |
+          for pyver in 3.10 3.11 3.12 3.13 3.14; do
+            echo "::group::Testing wheel for Python $pyver"
+            . /opt/venv-$pyver/bin/activate
+            whl=$(ls dist/*cp${pyver/./}*.whl)
+            pip install "$whl"
+            python -c "
+import flash_eq
+print('Version:', flash_eq.__version__)
+from flash_eq import Repr, EquivariantLinear, EquivariantEdgewiseLinear
+from flash_eq import WignerDBasis, EquivariantTransformer, Graph
+print('All public imports OK')
+# Verify CUDA extension is loadable (without requiring GPU)
+import importlib
+spec = importlib.util.find_spec('flash_eq._block_diagonal_cuda')
+assert spec is not None, 'CUDA extension not found in wheel'
+print('CUDA extension found:', spec.origin)
+"
+            deactivate
+            echo "::endgroup::"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels

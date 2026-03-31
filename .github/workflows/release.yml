@@ -47,12 +47,26 @@ jobs:
             echo "::group::Building wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
             python setup.py bdist_wheel
-            # Verify the wheel contains the compiled .so
             whl=$(ls -t dist/*.whl | head -1)
             python -c "import zipfile; z=zipfile.ZipFile('$whl'); sos=[f for f in z.namelist() if f.endswith('.so')]; print('Extensions:', sos); assert sos, 'No .so in wheel — CUDA extension was not compiled'"
             deactivate
             echo "::endgroup::"
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/*.whl
+
+  test-wheels:
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/hmblair/flash-eq-builder:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
       - name: Test wheel imports
         shell: bash
         run: |
@@ -65,13 +79,9 @@ jobs:
             deactivate
             echo "::endgroup::"
           done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels
-          path: dist/*.whl
 
   github-release:
-    needs: [build-sdist, build-wheels]
+    needs: [build-sdist, build-wheels, test-wheels]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

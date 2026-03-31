@@ -74,7 +74,7 @@ jobs:
             echo "::group::Testing wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
             whl=$(ls dist/*cp${pyver/./}*.whl)
-            pip install "$whl"
+            pip install "$whl" numpy
             python -c "import flash_eq; print('Version:', flash_eq.__version__); from flash_eq import Repr, EquivariantLinear, EquivariantEdgewiseLinear, WignerDBasis, EquivariantTransformer, Graph; print('All public imports OK'); import importlib; spec = importlib.util.find_spec('flash_eq._block_diagonal_cuda'); assert spec is not None, 'CUDA extension not found in wheel'; print('CUDA extension found:', spec.origin)"
             deactivate
             echo "::endgroup::"

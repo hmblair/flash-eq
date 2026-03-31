@@ -54,6 +54,7 @@ jobs:
             echo "::endgroup::"
           done
       - name: Test wheel imports
+        shell: bash
         run: |
           for pyver in 3.10 3.11 3.12 3.13; do
             echo "::group::Testing wheel for Python $pyver"

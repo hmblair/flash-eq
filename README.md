@@ -4,13 +4,19 @@ Fast, memory-efficient SO(3)-equivariant graph neural networks using Wigner-D di
 
 ## Installation
 
+Pre-built wheels (Python 3.10-3.13, CUDA 12.4+):
+
+```bash
+pip install flash-eq --extra-index-url https://hmblair.github.io/flash-eq/
+```
+
+Or install from source (requires CUDA toolkit):
+
 ```bash
 pip install git+https://github.com/hmblair/flash-eq.git
 ```
 
-Requires PyTorch >= 2.0 with CUDA support. This builds the CUDA extension from source.
-
-Pre-built wheels (Python 3.10-3.13, CUDA 12.4+) are also available from [GitHub Releases](https://github.com/hmblair/flash-eq/releases).
+Requires PyTorch >= 2.0 with CUDA support.
 
 ## Quick Start
 

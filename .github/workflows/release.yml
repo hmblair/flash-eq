@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build-sdist:
@@ -93,3 +95,29 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  update-pip-index:
+    needs: [github-release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Generate PEP 503 index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/flash-eq
+          # List all wheel/sdist assets across all releases
+          gh api repos/${{ github.repository }}/releases --paginate --jq '
+            .[].assets[] | select(.name | test("\\.(whl|tar\\.gz)$")) |
+            "<a href=\"\(.browser_download_url)\">\(.name)</a><br/>"
+          ' > site/flash-eq/index.html
+          # Root index
+          echo '<a href="flash-eq/">flash-eq</a>' > site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        id: deployment

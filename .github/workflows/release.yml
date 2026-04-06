@@ -40,27 +40,24 @@ jobs:
         run: |
           VERSION=$(/opt/venv-3.12/bin/python -c "from setuptools_scm import get_version; print(get_version())")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - name: Build and repair wheels
+      - name: Build wheels for all Python versions
         env:
           TORCH_CUDA_ARCH_LIST: "8.0;8.9;9.0+PTX"
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
         run: |
-          mkdir -p wheelhouse
           for pyver in 3.10 3.11 3.12 3.13; do
             echo "::group::Building wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
             python setup.py bdist_wheel
             whl=$(ls -t dist/*.whl | head -1)
-            python -c "import zipfile; z=zipfile.ZipFile('$whl'); sos=[f for f in z.namelist() if f.endswith('.so')]; print('Extensions:', sos); assert sos, 'No .so in wheel'"
-            auditwheel repair "$whl" --plat manylinux_2_17_x86_64 -w wheelhouse/
+            python -c "import zipfile; z=zipfile.ZipFile('$whl'); sos=[f for f in z.namelist() if f.endswith('.so')]; print('Extensions:', sos); assert sos, 'No .so in wheel — CUDA extension was not compiled'"
             deactivate
             echo "::endgroup::"
           done
       - uses: actions/upload-artifact@v4
         with:
           name: wheels
-          path: wheelhouse/*.whl
+          path: dist/*.whl
 
   test-wheels:
     needs: [build-wheels]
@@ -78,9 +75,9 @@ jobs:
           for pyver in 3.10 3.11 3.12 3.13; do
             echo "::group::Testing wheel for Python $pyver"
             . /opt/venv-$pyver/bin/activate
-            cpver="cp${pyver//./}"
-            pip install dist/*${cpver}*.whl
-            python -c "import flash_eq; print('Version:', flash_eq.__version__); from flash_eq import Repr, EquivariantLinear, EquivariantEdgewiseLinear, WignerDBasis, EquivariantTransformer, Graph; print('All public imports OK'); import importlib; spec = importlib.util.find_spec('flash_eq._block_diagonal_cuda'); assert spec is not None, 'CUDA extension not found'; print('CUDA extension found:', spec.origin)"
+            whl=$(ls dist/*cp${pyver/./}*.whl)
+            pip install "$whl"
+            python -c "import flash_eq; print('Version:', flash_eq.__version__); from flash_eq import Repr, EquivariantLinear, EquivariantEdgewiseLinear, WignerDBasis, EquivariantTransformer, Graph; print('All public imports OK'); import importlib; spec = importlib.util.find_spec('flash_eq._block_diagonal_cuda'); assert spec is not None, 'CUDA extension not found in wheel'; print('CUDA extension found:', spec.origin)"
             deactivate
             echo "::endgroup::"
           done

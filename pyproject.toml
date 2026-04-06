@@ -44,6 +44,7 @@ testpaths = ["tests"]
 
 [tool.setuptools_scm]
 version_file = "flash_eq/_version.py"
+fallback_version = "0.0.0"
 
 [tool.ruff.lint]
 ignore = ["E741"]  # Allow 'l' as variable name (standard physics notation for angular momentum)

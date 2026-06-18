@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from flash_eq import (
-    Graph,
     Repr,
     WignerD,
     WignerDBasis,

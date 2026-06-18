@@ -106,7 +106,7 @@ degree_to_dim = _runtime_utils.degree_to_dim
 unfuse_features = _runtime_utils.unfuse_features
 
 # Flash-eq
-from flash_eq import Repr, WignerD, WignerDBasis, ProductRepr  # noqa: E402
+from flash_eq import Repr, WignerDBasis  # noqa: E402
 from flash_eq.patch import patch  # noqa: E402
 from flash_eq.patch._convention import apply_convention_patches  # noqa: E402
 

@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from flash_eq import (
-    Graph,
     Repr,
     WignerD,
     WignerDBasis,
@@ -79,8 +78,6 @@ class TestEquivariantEdgeAttention:
         """Test that attention weights sum to 1 per destination node."""
         num_heads = 2
         qk_dim = 36
-        mult = 8
-        dim = 9
         num_nodes, num_edges = 20, 100
 
         attn = EquivariantEdgeAttention(num_heads=num_heads, qk_dim=qk_dim, dropout=0.0).to(device)

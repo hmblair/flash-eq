@@ -10,11 +10,16 @@ Pre-built wheels (Python 3.10-3.13, CUDA 12.4+):
 pip install flash-eq --extra-index-url https://hmblair.github.io/flash-eq/
 ```
 
-Or install from source (requires CUDA toolkit):
+Or install from source (requires the CUDA toolkit with `nvcc` on `PATH`, or
+`CUDA_HOME` set to the toolkit root):
 
 ```bash
 pip install git+https://github.com/hmblair/flash-eq.git
 ```
+
+If you pass `--no-build-isolation`, PyTorch must already be installed in the
+build environment — the source build imports `torch` to register the CUDA
+extension and will fail fast otherwise.
 
 Requires PyTorch >= 2.0 with CUDA support.
 
